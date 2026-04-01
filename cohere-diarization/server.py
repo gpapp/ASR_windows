@@ -979,121 +979,179 @@ async def diarize_path_endpoint(
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-    def progress_hook(step_name, step_artefact, file=None, completed=None, total=None):
-        """Callback fired by Pyannote during processing."""
-        # Convert internal pyannote hook names to user-friendly ones
-        if completed is not None and total is not None:
-            msg = {
-                "type": "progress",
-                "step": step_name,
-                "completed": int(completed),  # Fix int64 json serialization
-                "total": int(total)
-            }
-            loop.call_soon_threadsafe(queue.put_nowait, json.dumps(msg))
-
     def run_diarization_thread():
         try:
-            # 1. Load audio (doing this inside the thread now so we can stream load progress if needed)
             waveform, sr = librosa.load(str(resolved), sr=16000, mono=True)
             waveform_tensor = torch.from_numpy(waveform).unsqueeze(0).float()
 
-            if not state.vad_model or not state.get_speech_timestamps:
-                log.warning("vad_not_loaded_falling_back_to_full_audio")
-                annotation = state.diarization_pipeline(
-                    {"waveform": waveform_tensor, "sample_rate": 16000},
-                    hook=progress_hook
-                ).exclusive_speaker_diarization
-            else:
-                # Run VAD
+            if not state.vad_model or not state.get_speech_timestamps or not state.embedding_session:
+                log.error("diarization_models_missing")
                 loop.call_soon_threadsafe(queue.put_nowait, json.dumps({
-                    "type": "progress", "step": "Voice Activity Detection", "completed": 0, "total": 1
+                    "error": "Diarization models not fully loaded"
+                }))
+                return
+
+            # 1. Run VAD
+            loop.call_soon_threadsafe(queue.put_nowait, json.dumps({
+                "type": "progress", "step": "Voice Activity Detection", "completed": 0, "total": 1
+            }))
+
+            speech_ts = state.get_speech_timestamps(
+                waveform_tensor,
+                state.vad_model,
+                sampling_rate=16000,
+                return_seconds=True
+            )
+
+            if not speech_ts:
+                log.info("vad_found_no_speech", path=req.wav_path)
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+                return
+
+            loop.call_soon_threadsafe(queue.put_nowait, json.dumps({
+                "type": "progress", "step": "Voice Activity Detection", "completed": 1, "total": 1
+            }))
+
+            # 2. Extract chunks and features
+            loop.call_soon_threadsafe(queue.put_nowait, json.dumps({
+                "type": "progress", "step": "Feature Extraction", "completed": 0, "total": len(speech_ts)
+            }))
+
+            all_fbanks = []
+            all_segments_meta = [] # Store global start/end for each chunk
+
+            for i, ts in enumerate(speech_ts):
+                start_sample = int(ts['start'] * 16000)
+                end_sample = int(ts['end'] * 16000)
+                segment_wav = waveform_tensor[:, start_sample:end_sample]
+
+                windows, start_times = generate_sliding_windows(segment_wav, 16000)
+
+                for w, rel_start in zip(windows, start_times):
+                    # WeSpeaker expects at least a few frames. Pad if too short.
+                    if w.shape[-1] < 1600: # less than 0.1s
+                        w = torch.nn.functional.pad(w, (0, 1600 - w.shape[-1]))
+
+                    fbank = extract_fbank(w, 16000)
+                    all_fbanks.append(fbank)
+
+                    chunk_duration = w.shape[-1] / 16000
+                    global_start = ts['start'] + rel_start
+                    global_end = global_start + chunk_duration
+                    all_segments_meta.append({"start": global_start, "end": global_end})
+
+                loop.call_soon_threadsafe(queue.put_nowait, json.dumps({
+                    "type": "progress", "step": "Feature Extraction", "completed": i + 1, "total": len(speech_ts)
                 }))
 
-                speech_ts = state.get_speech_timestamps(
-                    waveform_tensor,
-                    state.vad_model,
-                    sampling_rate=16000,
-                    return_seconds=True
-                )
+            if not all_fbanks:
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+                return
 
-                if not speech_ts:
-                    log.info("vad_found_no_speech", path=req.wav_path)
-                    annotation = Annotation()
+            # 3. ONNX Embedding Extraction (Batched)
+            loop.call_soon_threadsafe(queue.put_nowait, json.dumps({
+                "type": "progress", "step": "Embedding Extraction", "completed": 0, "total": 1
+            }))
+
+            # Note: Filterbanks might have slightly different lengths due to the last chunk.
+            # We must pad them to the max length in the batch.
+            max_len = max(fb.shape[1] for fb in all_fbanks)
+            padded_fbanks = []
+            for fb in all_fbanks:
+                if fb.shape[1] < max_len:
+                    pad_amount = max_len - fb.shape[1]
+                    fb = torch.nn.functional.pad(fb, (0, 0, 0, pad_amount))
+                padded_fbanks.append(fb)
+
+            batch_fbanks = torch.cat(padded_fbanks, dim=0).numpy() # shape: [B, T, 80]
+
+            embeddings = []
+            batch_size = 32
+            for i in range(0, len(batch_fbanks), batch_size):
+                batch = batch_fbanks[i:i+batch_size]
+                out = state.embedding_session.run(None, {"input_features": batch})
+                embeddings.append(out[0]) # last_hidden_state output
+
+            embeddings = np.concatenate(embeddings, axis=0) # shape: [B, 256]
+
+            # L2 Normalize
+            norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+            embeddings = embeddings / np.maximum(norms, 1e-12)
+
+            loop.call_soon_threadsafe(queue.put_nowait, json.dumps({
+                "type": "progress", "step": "Embedding Extraction", "completed": 1, "total": 1
+            }))
+
+            # 4. Clustering
+            loop.call_soon_threadsafe(queue.put_nowait, json.dumps({
+                "type": "progress", "step": "Clustering", "completed": 0, "total": 1
+            }))
+
+            clusterer = AgglomerativeClustering(
+                n_clusters=None,
+                metric="cosine",
+                linkage="average",
+                distance_threshold=settings.diarization_threshold
+            )
+
+            if len(embeddings) > 1:
+                labels = clusterer.fit_predict(embeddings)
+            else:
+                labels = [0]
+
+            # Assign labels to meta
+            for meta, label in zip(all_segments_meta, labels):
+                meta["speaker"] = f"SPEAKER_{int(label):02d}"
+
+            # 5. Merge contiguous chunks
+            merged_segments = []
+            current_segment = None
+
+            # We sort by start time just to be safe, though they should be sequential
+            all_segments_meta.sort(key=lambda x: x["start"])
+
+            for seg in all_segments_meta:
+                if current_segment is None:
+                    current_segment = seg.copy()
+                elif current_segment["speaker"] == seg["speaker"] and seg["start"] <= current_segment["end"] + 0.1: # Allow tiny gap
+                    # Merge
+                    current_segment["end"] = max(current_segment["end"], seg["end"])
                 else:
-                    # Build dense waveform
-                    dense_parts = []
-                    mapping = []
-                    current_dense_start = 0.0
+                    # Resolve overlaps between different speakers by truncating the previous one
+                    if seg["start"] < current_segment["end"]:
+                        midpoint = (seg["start"] + current_segment["end"]) / 2
+                        current_segment["end"] = midpoint
+                        seg["start"] = midpoint
 
-                    for ts in speech_ts:
-                        orig_start, orig_end = ts['start'], ts['end']
-                        start_sample = int(orig_start * 16000)
-                        end_sample = int(orig_end * 16000)
+                    merged_segments.append(current_segment)
+                    current_segment = seg.copy()
 
-                        segment = waveform_tensor[:, start_sample:end_sample]
-                        dense_parts.append(segment)
+            if current_segment:
+                merged_segments.append(current_segment)
 
-                        duration = (end_sample - start_sample) / 16000.0
-                        current_dense_end = current_dense_start + duration
+            loop.call_soon_threadsafe(queue.put_nowait, json.dumps({
+                "type": "progress", "step": "Clustering", "completed": 1, "total": 1
+            }))
 
-                        mapping.append({
-                            'dense_start': current_dense_start,
-                            'dense_end': current_dense_end,
-                            'orig_start': orig_start,
-                            'orig_end': orig_end
-                        })
-                        current_dense_start = current_dense_end
+            # Format final response
+            final_data = [
+                {
+                    "start": round(float(seg["start"]), 3),
+                    "end": round(float(seg["end"]), 3),
+                    "speaker": seg["speaker"]
+                }
+                for seg in merged_segments if seg["end"] > seg["start"]
+            ]
 
-                    # Concatenate and run Pyannote
-                    dense_waveform = torch.cat(dense_parts, dim=1)
-
-                    dense_diarization = state.diarization_pipeline(
-                        {"waveform": dense_waveform, "sample_rate": 16000},
-                        hook=progress_hook
-                    )
-
-                    # Remap timestamps
-                    annotation = Annotation()
-                    dense_exclusive = dense_diarization.exclusive_speaker_diarization
-
-                    for turn, _, speaker in dense_exclusive.itertracks(yield_label=True):
-                        dense_turn_start = turn.start
-                        dense_turn_end = turn.end
-
-                        for m in mapping:
-                            overlap_start = max(dense_turn_start, m['dense_start'])
-                            overlap_end = min(dense_turn_end, m['dense_end'])
-
-                            if overlap_start < overlap_end:
-                                rel_start = overlap_start - m['dense_start']
-                                rel_end = overlap_end - m['dense_start']
-
-                                orig_turn_start = m['orig_start'] + rel_start
-                                orig_turn_end = m['orig_start'] + rel_end
-
-                                annotation[Segment(orig_turn_start, orig_turn_end)] = speaker
-
-            # Extract segments
-            segments = []
-            for turn, _, speaker in annotation.itertracks(yield_label=True):
-                segments.append({
-                    "start": float(turn.start),
-                    "end": float(turn.end),
-                    "speaker": str(speaker)
-                })
-
-            # Send final result
-            msg = {
-                "type": "result",
-                "segments": segments,
-                "total_time_sec": time.perf_counter() - start_time
-            }
+            msg = {"type": "result", "segments": final_data}
             loop.call_soon_threadsafe(queue.put_nowait, json.dumps(msg))
+            loop.call_soon_threadsafe(queue.put_nowait, None)
 
         except Exception as e:
-            log.error("diarization_failed", path=req.wav_path, error=str(e))
-            msg = {"type": "error", "error": str(e)}
-            loop.call_soon_threadsafe(queue.put_nowait, json.dumps(msg))
+            log.error("diarization_failed", error=str(e), exc_info=True)
+            err_msg = {"error": f"Diarization processing failed: {str(e)}"}
+            loop.call_soon_threadsafe(queue.put_nowait, json.dumps(err_msg))
+            loop.call_soon_threadsafe(queue.put_nowait, None)
 
     # Start thread
     task = asyncio.create_task(asyncio.to_thread(run_diarization_thread))
