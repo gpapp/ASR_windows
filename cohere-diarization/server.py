@@ -910,6 +910,48 @@ def get_rate_limit_decorator():
     return lambda f: f  # No-op decorator
 
 
+def extract_fbank(waveform: torch.Tensor, sample_rate: int = 16000) -> torch.Tensor:
+    """Extracts 80-dim log-mel filterbanks from waveform matching WeSpeaker expectations."""
+    # Ensure waveform is 2D: [1, T]
+    if waveform.dim() == 1:
+        waveform = waveform.unsqueeze(0)
+
+    # torchaudio.compliance.kaldi.fbank expects [B, T]
+    # Default Kaldi settings: frame_length=25, frame_shift=10, num_mel_bins=80
+    fbank = torchaudio.compliance.kaldi.fbank(
+        waveform,
+        num_mel_bins=80,
+        frame_length=25,
+        frame_shift=10,
+        sample_frequency=sample_rate
+    )
+    # fbank shape is [frames, 80], we want to return [1, frames, 80] for batching
+    return fbank.unsqueeze(0)
+
+def generate_sliding_windows(waveform: torch.Tensor, sample_rate: int, window_sec: float = 1.5, stride_sec: float = 0.75):
+    """Generates overlapping sliding windows from a continuous waveform."""
+    window_samples = int(window_sec * sample_rate)
+    stride_samples = int(stride_sec * sample_rate)
+    total_samples = waveform.shape[-1]
+
+    windows = []
+    start_times = []
+
+    if total_samples < window_samples:
+        return [waveform], [0.0]
+
+    for start in range(0, total_samples - window_samples + 1, stride_samples):
+        windows.append(waveform[:, start:start + window_samples])
+        start_times.append(start / sample_rate)
+
+    # Handle the last remaining chunk if it doesn't align perfectly
+    last_start = len(windows) * stride_samples if windows else 0
+    if last_start < total_samples and (total_samples - last_start) > (sample_rate * 0.1): # min 0.1s
+        windows.append(waveform[:, last_start:])
+        start_times.append(last_start / sample_rate)
+
+    return windows, start_times
+
 
 @app.post("/diarize/path")
 async def diarize_path_endpoint(
