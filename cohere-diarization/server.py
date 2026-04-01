@@ -30,10 +30,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import torch
+import torchaudio
 import numpy as np
 import json
 import librosa
 import onnxruntime as ort
+from sklearn.cluster import AgglomerativeClustering
 from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, Request, Security
 from fastapi.security import APIKeyHeader
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
@@ -98,8 +100,8 @@ class Settings(BaseSettings):
     rate_limit: str = "30/minute"
 
     # Diarization settings
-    embedding_model_repo: str = Field(default="pyannote/wespeaker-voxceleb-resnet34-LM", description="HuggingFace repo for the embedding ONNX model")
-    embedding_model_filename: str = Field(default="pytorch_model.onnx", description="Filename of the ONNX embedding model")
+    embedding_model_repo: str = Field(default="onnx-community/wespeaker-voxceleb-resnet34-LM", description="HuggingFace repo for the embedding ONNX model")
+    embedding_model_filename: str = Field(default="onnx/model.onnx", description="Filename of the ONNX embedding model")
     diarization_threshold: float = Field(default=0.5, description="Distance threshold for AgglomerativeClustering (cosine metric)")
     
     # Cache settings
