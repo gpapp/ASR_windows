@@ -9,10 +9,9 @@ onnxruntime>=1.16.0
 huggingface-hub>=0.23.0
 
 # Diarization
-scikit-learn==1.4.2
-huggingface-hub>=0.20.0
-torch
-torchaudio
+scikit-learn>=1.4.2
+torchaudio>=2.4.1
+torch>=2.4.1
 
 # Async HTTP client
 python-multipart
