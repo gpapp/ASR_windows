@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir:*)",
+      "Bash(cmd /c \"DropToTranscribe.bat\" \"C:\\\\Users\\\\Gergely_Papp\\\\Videos\\\\2026-03-27 12-31-21.mkv\")",
+      "Bash(powershell -Command \"Test-Path 'C:\\\\Users\\\\Gergely_Papp\\\\source\\\\cohere\\\\.venv\\\\Scripts\\\\python.exe'\")",
+      "Bash(.venvScriptspython.exe -c \"import onnxruntime, librosa, fastapi, uvicorn, requests, huggingface_hub; print\\(''All packages OK''\\)\")",
+      "Bash(powershell -Command \"& 'C:\\\\Users\\\\Gergely_Papp\\\\source\\\\cohere\\\\.venv\\\\Scripts\\\\python.exe' -c \\\\\"import onnxruntime, librosa, fastapi, uvicorn, requests, huggingface_hub; print\\('All packages OK'\\)\\\\\"\" 2>&1)",
+      "Bash(powershell -Command \"Start-Process -WindowStyle Minimized -FilePath 'C:\\\\Users\\\\Gergely_Papp\\\\source\\\\cohere\\\\.venv\\\\Scripts\\\\python.exe' -ArgumentList 'server.py' -WorkingDirectory 'C:\\\\Users\\\\Gergely_Papp\\\\source\\\\cohere'\" 2>&1)",
+      "Bash(powershell -Command \"& 'C:\\\\Users\\\\Gergely_Papp\\\\source\\\\cohere\\\\.venv\\\\Scripts\\\\python.exe' 'C:\\\\Users\\\\Gergely_Papp\\\\source\\\\cohere\\\\transcribe.py' 'C:\\\\Users\\\\Gergely_Papp\\\\Videos\\\\2026-03-27 12-31-21.mkv'\" 2>&1)"
+    ]
+  }
+}

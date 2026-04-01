@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "WebSearch",
+      "Bash(curl -s \"https://html.duckduckgo.com/html/?q=pyannote.audio+speechbrain+k2_fsa\")"
+    ]
+  }
+}
