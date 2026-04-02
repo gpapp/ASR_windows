@@ -44,8 +44,8 @@ class Config:
     silence_noise: str = "-35dB"
     silence_duration: float = 2.0
     min_segment_duration: float = 0.5
-    merge_gap: float = 2.5
-    max_chunk_duration: float = 30.0
+    merge_gap: float = 1.5
+    max_chunk_duration: float = 120.0
     rms_silence_threshold: float = 0.005
     
     # Speaker detection
@@ -198,6 +198,8 @@ def group_diarization_segments(
                 final_chunks.append((start + i * step, start + (i + 1) * step, speaker))
         else:
             final_chunks.append((start, end, speaker))
+
+    print(f"[DEBUG] Grouped from {len(segments)} segments to {len(grouped)} groups, and finally {len(final_chunks)} chunks.", flush=True)
 
     return final_chunks
 

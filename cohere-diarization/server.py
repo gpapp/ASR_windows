@@ -102,7 +102,7 @@ class Settings(BaseSettings):
     # Diarization settings
     embedding_model_repo: str = Field(default="onnx-community/wespeaker-voxceleb-resnet34-LM", description="HuggingFace repo for the embedding ONNX model")
     embedding_model_filename: str = Field(default="onnx/model.onnx", description="Filename of the ONNX embedding model")
-    diarization_threshold: float = Field(default=0.5, description="Distance threshold for AgglomerativeClustering (cosine metric)")
+    diarization_threshold: float = Field(default=0.8, description="Distance threshold for AgglomerativeClustering (cosine metric)")
     
     # Cache settings
     kv_cache_pool_size: int = 4
@@ -963,7 +963,7 @@ async def diarize_path_endpoint(
     Streams Pyannote diarization progress as NDJSON, then yields the final segments.
     """
     start_time = time.perf_counter()
-    if not state.diarization_pipeline:
+    if not state.vad_model or not state.embedding_session:
         return JSONResponse(
             status_code=400,
             content={"error": "Diarization not enabled or pipeline not loaded"}
@@ -1113,7 +1113,9 @@ async def diarize_path_endpoint(
             for seg in all_segments_meta:
                 if current_segment is None:
                     current_segment = seg.copy()
-                elif current_segment["speaker"] == seg["speaker"] and seg["start"] <= current_segment["end"] + 0.1: # Allow tiny gap
+                elif (current_segment["speaker"] == seg["speaker"] and
+                      seg["start"] <= current_segment["end"] + 1.5 and
+                      (current_segment["end"] - current_segment["start"]) < 60.0): # Allow realistic gap, limit length
                     # Merge
                     current_segment["end"] = max(current_segment["end"], seg["end"])
                 else:
@@ -1128,6 +1130,12 @@ async def diarize_path_endpoint(
 
             if current_segment:
                 merged_segments.append(current_segment)
+
+            log.info("diarization_merge_result", original_count=len(all_segments_meta), merged_count=len(merged_segments))
+            print(f"[DEBUG] all_segments_meta count: {len(all_segments_meta)}", flush=True)
+            print(f"[DEBUG] merged_segments count: {len(merged_segments)}", flush=True)
+            for i, ms in enumerate(merged_segments[:10]):
+                print(f"[DEBUG] Merged Segment {i}: Speaker={ms['speaker']}, Start={ms['start']:.2f}, End={ms['end']:.2f}", flush=True)
 
             loop.call_soon_threadsafe(queue.put_nowait, json.dumps({
                 "type": "progress", "step": "Clustering", "completed": 1, "total": 1
