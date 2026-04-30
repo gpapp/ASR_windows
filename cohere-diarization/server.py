@@ -102,7 +102,7 @@ class Settings(BaseSettings):
     # Diarization settings
     embedding_model_repo: str = Field(default="onnx-community/wespeaker-voxceleb-resnet34-LM", description="HuggingFace repo for the embedding ONNX model")
     embedding_model_filename: str = Field(default="onnx/model.onnx", description="Filename of the ONNX embedding model")
-    diarization_threshold: float = Field(default=0.8, description="Distance threshold for AgglomerativeClustering (cosine metric)")
+    diarization_threshold: float = Field(default=0.28, description="Distance threshold for AgglomerativeClustering (cosine metric)")
     
     # Cache settings
     kv_cache_pool_size: int = 4
@@ -916,6 +916,9 @@ def extract_fbank(waveform: torch.Tensor, sample_rate: int = 16000) -> torch.Ten
     if waveform.dim() == 1:
         waveform = waveform.unsqueeze(0)
 
+    # Scale waveform to 16-bit PCM range for kaldi.fbank
+    waveform = waveform * 32768.0
+
     # torchaudio.compliance.kaldi.fbank expects [B, T]
     # Default Kaldi settings: frame_length=25, frame_shift=10, num_mel_bins=80
     fbank = torchaudio.compliance.kaldi.fbank(
@@ -923,12 +926,13 @@ def extract_fbank(waveform: torch.Tensor, sample_rate: int = 16000) -> torch.Ten
         num_mel_bins=80,
         frame_length=25,
         frame_shift=10,
+        energy_floor=0.0,
         sample_frequency=sample_rate
     )
     # fbank shape is [frames, 80], we want to return [1, frames, 80] for batching
     return fbank.unsqueeze(0)
 
-def generate_sliding_windows(waveform: torch.Tensor, sample_rate: int, window_sec: float = 1.5, stride_sec: float = 0.75):
+def generate_sliding_windows(waveform: torch.Tensor, sample_rate: int, window_sec: float = 3.0, stride_sec: float = 1.5):
     """Generates overlapping sliding windows from a continuous waveform."""
     window_samples = int(window_sec * sample_rate)
     stride_samples = int(stride_sec * sample_rate)
@@ -951,6 +955,137 @@ def generate_sliding_windows(waveform: torch.Tensor, sample_rate: int, window_se
         start_times.append(last_start / sample_rate)
 
     return windows, start_times
+
+
+def profile_speakers(
+    waveform: "torch.Tensor",
+    merged_segments: list[dict],
+    sample_rate: int = 16000,
+) -> dict[str, dict]:
+    """
+    Analyse each speaker's audio to extract a voice signature.
+
+    Returns a dict keyed by speaker label, e.g.:
+        {
+          "SPEAKER1": {
+            "pitch_hz": 142.3,
+            "pitch_std": 18.1,
+            "energy_rms": 0.042,
+            "total_speech_sec": 34.2,
+            "gender_hint": "male",
+          }, ...
+        }
+
+    Pitch is estimated via autocorrelation on 30 ms frames.
+    Gender hint: <165 Hz median = male, >=165 Hz = female.
+    """
+    import scipy.signal as _sig
+
+    sr = sample_rate
+    frame_len = int(0.030 * sr)   # 30 ms
+    hop_len   = int(0.010 * sr)   # 10 ms
+    # Fundamental frequency search range
+    f0_min, f0_max = 60, 400      # Hz
+
+    wav_np = waveform.squeeze(0).numpy()  # shape [T]
+
+    profiles: dict[str, dict] = {}
+
+    for spk in set(s["speaker"] for s in merged_segments):
+        pitches, energies, total_sec = [], [], 0.0
+
+        for seg in merged_segments:
+            if seg["speaker"] != spk:
+                continue
+            s_idx = int(seg["start"] * sr)
+            e_idx = int(seg["end"]   * sr)
+            chunk = wav_np[s_idx:e_idx]
+            total_sec += seg["end"] - seg["start"]
+
+            # Slide over frames
+            for start in range(0, len(chunk) - frame_len, hop_len):
+                frame = chunk[start: start + frame_len]
+                frame = frame - frame.mean()
+
+                # RMS energy
+                rms = float(np.sqrt(np.mean(frame ** 2)))
+                if rms < 1e-4:          # silence / near-silence — skip
+                    continue
+                energies.append(rms)
+
+                # Autocorrelation-based pitch
+                corr = np.correlate(frame, frame, mode="full")
+                corr = corr[len(corr) // 2:]   # keep positive lags only
+
+                # Restrict lag range to F0 bounds
+                lag_min = int(sr / f0_max)
+                lag_max = int(sr / f0_min)
+                lag_max = min(lag_max, len(corr) - 1)
+
+                if lag_min >= lag_max:
+                    continue
+
+                sub = corr[lag_min:lag_max]
+                if sub.max() <= 0:
+                    continue
+
+                peak_lag = int(np.argmax(sub)) + lag_min
+                # Voiced confidence: normalised peak height
+                confidence = corr[peak_lag] / (corr[0] + 1e-9)
+                if confidence < 0.25:   # unvoiced frame
+                    continue
+
+                f0 = sr / peak_lag
+                pitches.append(f0)
+
+        if not pitches:
+            profiles[spk] = {
+                "pitch_hz": 0.0, "pitch_std": 0.0,
+                "energy_rms": float(np.mean(energies)) if energies else 0.0,
+                "total_speech_sec": total_sec,
+                "gender_hint": "unknown",
+            }
+            continue
+
+        median_f0  = float(np.median(pitches))
+        std_f0     = float(np.std(pitches))
+        mean_rms   = float(np.mean(energies)) if energies else 0.0
+        gender     = "female" if median_f0 >= 165 else "male"
+
+        profiles[spk] = {
+            "pitch_hz":        round(median_f0, 1),
+            "pitch_std":       round(std_f0, 1),
+            "energy_rms":      round(mean_rms, 4),
+            "total_speech_sec": round(total_sec, 1),
+            "gender_hint":     gender,
+        }
+
+    return profiles
+
+
+def relabel_by_pitch(
+    merged_segments: list[dict],
+    profiles: dict[str, dict],
+) -> tuple[list[dict], dict[str, dict]]:
+    """
+    Re-order speaker labels so SPEAKER1 = lowest pitch (most distinctive anchor),
+    ascending.  Returns updated segments and profiles dicts.
+    """
+    # Sort by pitch ascending; unknowns go last
+    ordered = sorted(
+        profiles.keys(),
+        key=lambda s: profiles[s]["pitch_hz"] if profiles[s]["pitch_hz"] > 0 else 9999,
+    )
+    remap = {old: f"SPEAKER{i+1}" for i, old in enumerate(ordered)}
+
+    new_profiles: dict[str, dict] = {}
+    for old, new in remap.items():
+        new_profiles[new] = profiles[old]
+
+    for seg in merged_segments:
+        seg["speaker"] = remap.get(seg["speaker"], seg["speaker"])
+
+    return merged_segments, new_profiles
 
 
 @app.post("/diarize/path")
@@ -1013,12 +1148,18 @@ async def diarize_path_endpoint(
             }))
 
             # 2. Extract chunks and features
+            # Windows shorter than MIN_EMBED_DURATION produce unreliable embeddings
+            # (backchannels: "Mm-hmm", "Okay", etc.). We cluster only long windows
+            # and assign short ones to their nearest long neighbour by time.
+            MIN_EMBED_DURATION = 1.5  # seconds
+
             loop.call_soon_threadsafe(queue.put_nowait, json.dumps({
                 "type": "progress", "step": "Feature Extraction", "completed": 0, "total": len(speech_ts)
             }))
 
             all_fbanks = []
-            all_segments_meta = [] # Store global start/end for each chunk
+            all_segments_meta = []   # metadata for ALL windows
+            embeddable_indices = []  # indices into all_segments_meta that have an embedding
 
             for i, ts in enumerate(speech_ts):
                 start_sample = int(ts['start'] * 16000)
@@ -1028,61 +1169,57 @@ async def diarize_path_endpoint(
                 windows, start_times = generate_sliding_windows(segment_wav, 16000)
 
                 for w, rel_start in zip(windows, start_times):
-                    # WeSpeaker expects at least a few frames. Pad if too short.
-                    if w.shape[-1] < 1600: # less than 0.1s
-                        w = torch.nn.functional.pad(w, (0, 1600 - w.shape[-1]))
-
-                    fbank = extract_fbank(w, 16000)
-                    all_fbanks.append(fbank)
-
                     chunk_duration = w.shape[-1] / 16000
                     global_start = ts['start'] + rel_start
                     global_end = global_start + chunk_duration
+                    meta_idx = len(all_segments_meta)
                     all_segments_meta.append({"start": global_start, "end": global_end})
+
+                    if chunk_duration >= MIN_EMBED_DURATION:
+                        if w.shape[-1] < 1600:
+                            w = torch.nn.functional.pad(w, (0, 1600 - w.shape[-1]))
+                        all_fbanks.append(extract_fbank(w, 16000))
+                        embeddable_indices.append(meta_idx)
 
                 loop.call_soon_threadsafe(queue.put_nowait, json.dumps({
                     "type": "progress", "step": "Feature Extraction", "completed": i + 1, "total": len(speech_ts)
                 }))
 
+            print(f"[DEBUG] Total windows: {len(all_segments_meta)}, embeddable (>={MIN_EMBED_DURATION}s): {len(all_fbanks)}", flush=True)
+
             if not all_fbanks:
                 loop.call_soon_threadsafe(queue.put_nowait, None)
                 return
 
-            # 3. ONNX Embedding Extraction (Batched)
+            # 3. ONNX Embedding Extraction (Batched) — long windows only
             loop.call_soon_threadsafe(queue.put_nowait, json.dumps({
                 "type": "progress", "step": "Embedding Extraction", "completed": 0, "total": 1
             }))
 
-            # Note: Filterbanks might have slightly different lengths due to the last chunk.
-            # We must pad them to the max length in the batch.
             max_len = max(fb.shape[1] for fb in all_fbanks)
             padded_fbanks = []
             for fb in all_fbanks:
                 if fb.shape[1] < max_len:
-                    pad_amount = max_len - fb.shape[1]
-                    fb = torch.nn.functional.pad(fb, (0, 0, 0, pad_amount))
+                    fb = torch.nn.functional.pad(fb, (0, 0, 0, max_len - fb.shape[1]))
                 padded_fbanks.append(fb)
 
-            batch_fbanks = torch.cat(padded_fbanks, dim=0).numpy() # shape: [B, T, 80]
+            batch_fbanks = torch.cat(padded_fbanks, dim=0).numpy()
 
-            embeddings = []
+            raw_embeddings = []
             batch_size = 32
             for i in range(0, len(batch_fbanks), batch_size):
-                batch = batch_fbanks[i:i+batch_size]
-                out = state.embedding_session.run(None, {"input_features": batch})
-                embeddings.append(out[0]) # last_hidden_state output
+                out = state.embedding_session.run(None, {"input_features": batch_fbanks[i:i+batch_size]})
+                raw_embeddings.append(out[0])
 
-            embeddings = np.concatenate(embeddings, axis=0) # shape: [B, 256]
-
-            # L2 Normalize
-            norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-            embeddings = embeddings / np.maximum(norms, 1e-12)
+            raw_embeddings = np.concatenate(raw_embeddings, axis=0)  # [N_long, D]
+            norms = np.linalg.norm(raw_embeddings, axis=1, keepdims=True)
+            raw_embeddings = raw_embeddings / np.maximum(norms, 1e-12)
 
             loop.call_soon_threadsafe(queue.put_nowait, json.dumps({
                 "type": "progress", "step": "Embedding Extraction", "completed": 1, "total": 1
             }))
 
-            # 4. Clustering
+            # 4. Clustering on long windows only
             loop.call_soon_threadsafe(queue.put_nowait, json.dumps({
                 "type": "progress", "step": "Clustering", "completed": 0, "total": 1
             }))
@@ -1094,54 +1231,119 @@ async def diarize_path_endpoint(
                 distance_threshold=settings.diarization_threshold
             )
 
-            if len(embeddings) > 1:
-                labels = clusterer.fit_predict(embeddings)
+            if len(raw_embeddings) > 1:
+                long_labels = clusterer.fit_predict(raw_embeddings)
             else:
-                labels = [0]
+                long_labels = np.array([0])
 
-            # Assign labels to meta
-            for meta, label in zip(all_segments_meta, labels):
-                meta["speaker"] = f"SPEAKER_{int(label):02d}"
+            n_clusters = len(set(int(l) for l in long_labels))
+            # Distance diagnostics
+            from sklearn.metrics.pairwise import cosine_distances as _cdist
+            _d = _cdist(raw_embeddings)
+            _u = _d[np.triu_indices_from(_d, k=1)]
+            print(f"[DEBUG] threshold={settings.diarization_threshold} -> {n_clusters} clusters from {len(raw_embeddings)} windows", flush=True)
+            print(f"[DEBUG] cosine dist: min={_u.min():.4f} max={_u.max():.4f} mean={_u.mean():.4f} p25={np.percentile(_u,25):.4f} p75={np.percentile(_u,75):.4f}", flush=True)
 
-            # 5. Merge contiguous chunks
+            # Assign cluster labels to embeddable windows
+            for idx, label in zip(embeddable_indices, long_labels):
+                all_segments_meta[idx]["speaker_raw"] = int(label)
+
+            # Assign short windows to the nearest embeddable window by midpoint
+            emb_mids = np.array([
+                (all_segments_meta[i]["start"] + all_segments_meta[i]["end"]) / 2
+                for i in embeddable_indices
+            ])
+            for i, seg in enumerate(all_segments_meta):
+                if "speaker_raw" not in seg:
+                    mid = (seg["start"] + seg["end"]) / 2
+                    nearest = int(np.argmin(np.abs(emb_mids - mid)))
+                    seg["speaker_raw"] = all_segments_meta[embeddable_indices[nearest]]["speaker_raw"]
+
+            # Map raw cluster int -> SPEAKER1, SPEAKER2, ... in first-appearance order
+            speaker_map: dict[int, str] = {}
+            for seg in sorted(all_segments_meta, key=lambda x: x["start"]):
+                raw = seg["speaker_raw"]
+                if raw not in speaker_map:
+                    speaker_map[raw] = f"SPEAKER{len(speaker_map) + 1}"
+                seg["speaker"] = speaker_map[raw]
+
+            # 5. Merge contiguous same-speaker windows
+            #    Split on speaker change or gap > MAX_SPEAKER_GAP — no hard time cap.
+            MAX_SPEAKER_GAP = 2.0  # seconds
+            all_segments_meta.sort(key=lambda x: x["start"])
             merged_segments = []
             current_segment = None
-
-            # We sort by start time just to be safe, though they should be sequential
-            all_segments_meta.sort(key=lambda x: x["start"])
 
             for seg in all_segments_meta:
                 if current_segment is None:
                     current_segment = seg.copy()
                 elif (current_segment["speaker"] == seg["speaker"] and
-                      seg["start"] <= current_segment["end"] + 1.5 and
-                      (current_segment["end"] - current_segment["start"]) < 60.0): # Allow realistic gap, limit length
-                    # Merge
+                      seg["start"] <= current_segment["end"] + MAX_SPEAKER_GAP):
                     current_segment["end"] = max(current_segment["end"], seg["end"])
                 else:
-                    # Resolve overlaps between different speakers by truncating the previous one
                     if seg["start"] < current_segment["end"]:
-                        midpoint = (seg["start"] + current_segment["end"]) / 2
-                        current_segment["end"] = midpoint
-                        seg["start"] = midpoint
-
+                        mid = (seg["start"] + current_segment["end"]) / 2
+                        current_segment["end"] = mid
+                        seg = dict(seg, start=mid)
                     merged_segments.append(current_segment)
                     current_segment = seg.copy()
 
             if current_segment:
                 merged_segments.append(current_segment)
 
-            log.info("diarization_merge_result", original_count=len(all_segments_meta), merged_count=len(merged_segments))
-            print(f"[DEBUG] all_segments_meta count: {len(all_segments_meta)}", flush=True)
-            print(f"[DEBUG] merged_segments count: {len(merged_segments)}", flush=True)
-            for i, ms in enumerate(merged_segments[:10]):
-                print(f"[DEBUG] Merged Segment {i}: Speaker={ms['speaker']}, Start={ms['start']:.2f}, End={ms['end']:.2f}", flush=True)
+            # 6. Post-merge: absorb short isolated segments into surrounding speaker
+            #    If a segment is < MIN_ISLAND_DUR and is surrounded on both sides by the
+            #    same speaker, reassign it to that speaker and re-merge.
+            MIN_ISLAND_DUR = 2.1  # seconds — only absorb very brief islands
+            changed = True
+            while changed:
+                changed = False
+                for i in range(1, len(merged_segments) - 1):
+                    seg = merged_segments[i]
+                    prev_spk = merged_segments[i-1]["speaker"]
+                    next_spk = merged_segments[i+1]["speaker"]
+                    dur = seg["end"] - seg["start"]
+                    if dur < MIN_ISLAND_DUR and prev_spk == next_spk and seg["speaker"] != prev_spk:
+                        seg["speaker"] = prev_spk
+                        changed = True
+                if changed:
+                    new_merged = []
+                    cur = None
+                    for seg in merged_segments:
+                        if cur is None:
+                            cur = seg.copy()
+                        elif cur["speaker"] == seg["speaker"]:
+                            cur["end"] = max(cur["end"], seg["end"])
+                        else:
+                            new_merged.append(cur)
+                            cur = seg.copy()
+                    if cur:
+                        new_merged.append(cur)
+                    merged_segments = new_merged
+
+            # 7. Speaker profiling — extract voice signatures per cluster
+            profiles = profile_speakers(waveform_tensor, merged_segments, sample_rate=16000)
+
+            # Re-label by pitch so SPEAKER1 = lowest pitch (stable across runs)
+            merged_segments, profiles = relabel_by_pitch(merged_segments, profiles)
+
+            for spk, p in sorted(profiles.items()):
+                print(
+                    f"[PROFILE] {spk}: pitch={p['pitch_hz']}Hz±{p['pitch_std']}Hz  "
+                    f"energy={p['energy_rms']}  speech={p['total_speech_sec']}s  "
+                    f"gender={p['gender_hint']}",
+                    flush=True
+                )
+
+            print(f"[DEBUG] merged: {len(all_segments_meta)} windows -> {len(merged_segments)} segments", flush=True)
+            for i, ms in enumerate(merged_segments[:30]):
+                print(f"[DEBUG]   seg{i:02d} {ms['speaker']:12s} {ms['start']:7.2f}s - {ms['end']:7.2f}s", flush=True)
 
             loop.call_soon_threadsafe(queue.put_nowait, json.dumps({
                 "type": "progress", "step": "Clustering", "completed": 1, "total": 1
             }))
 
-            # Format final response
+            # Format final response — include profiles so client can write a header
             final_data = [
                 {
                     "start": round(float(seg["start"]), 3),
@@ -1151,7 +1353,7 @@ async def diarize_path_endpoint(
                 for seg in merged_segments if seg["end"] > seg["start"]
             ]
 
-            msg = {"type": "result", "segments": final_data}
+            msg = {"type": "result", "segments": final_data, "profiles": profiles}
             loop.call_soon_threadsafe(queue.put_nowait, json.dumps(msg))
             loop.call_soon_threadsafe(queue.put_nowait, None)
 

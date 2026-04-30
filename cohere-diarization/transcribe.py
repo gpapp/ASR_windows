@@ -302,16 +302,14 @@ class TranscriptionClient:
             log.error(f"Health check failed: {e}")
             return False
 
-    async def diarize_path(self, wav_path: str) -> list[dict]:
-        """Get diarization segments from server with real-time progress."""
+    async def diarize_path(self, wav_path: str) -> tuple[list[dict], dict]:
+        """Get diarization segments and speaker profiles from server."""
         try:
             headers = {}
             if self.config.api_key:
                 headers["X-API-Key"] = self.config.api_key
 
-            # Diarization can take a long time even with VAD, especially on CPU.
-            # We bypass the shared session here to use a massively extended timeout
-            extended_timeout = aiohttp.ClientTimeout(total=1800)  # 30 minutes for diarization
+            extended_timeout = aiohttp.ClientTimeout(total=1800)
 
             async with aiohttp.ClientSession(headers=headers, timeout=extended_timeout) as session:
                 async with session.post(
@@ -320,7 +318,6 @@ class TranscriptionClient:
                 ) as resp:
                     resp.raise_for_status()
 
-                    # Handle streaming NDJSON response
                     pbar = None
                     current_step = None
 
@@ -338,7 +335,6 @@ class TranscriptionClient:
                                 completed = data.get("completed", 0)
                                 total = data.get("total", 1)
 
-                                # Create or update progress bar based on step
                                 if current_step != step:
                                     if pbar:
                                         pbar.close()
@@ -346,19 +342,18 @@ class TranscriptionClient:
                                     current_step = step
 
                                 if pbar:
-                                    # Update by delta
                                     pbar.update(completed - pbar.n)
 
                             elif msg_type == "result":
                                 if pbar:
                                     pbar.close()
-                                return data.get("segments", [])
+                                return data.get("segments", []), data.get("profiles", {})
 
                             elif msg_type == "error":
                                 if pbar:
                                     pbar.close()
                                 log.warn(f"Server diarization error: {data.get('error', 'Unknown error')}")
-                                return []
+                                return [], {}
                     finally:
                         if pbar:
                             pbar.close()
@@ -368,7 +363,7 @@ class TranscriptionClient:
 
         except asyncio.TimeoutError:
             log.warn("Failed to get diarization: Connection timed out after 30 minutes")
-            return []
+            return [], {}
         except aiohttp.ClientResponseError as e:
             text = "Unknown error"
             if 'resp' in locals():
@@ -377,10 +372,10 @@ class TranscriptionClient:
                 except Exception:
                     pass
             log.warn(f"Failed to get diarization: {e} - Response: {text[:200]}")
-            return []
+            return [], {}
         except Exception as e:
             log.warn(f"Failed to get diarization: {e}")
-            return []
+            return [], {}
     
     async def transcribe_batch(
         self, 
@@ -494,7 +489,8 @@ class TranscriptWriter:
         """Append a single segment directly to the file."""
         with open(self.output_path, "a", encoding="utf-8") as f:
             if seg["new_speaker"]:
-                f.write(f"\n[{format_timestamp(seg['start'])}] SPEAKER:\n")
+                speaker_name = seg.get("speaker", "SPEAKER")
+                f.write(f"\n[{format_timestamp(seg['start'])}] {speaker_name}:\n")
             f.write(seg["text"] + " ")
     
     def write(self):
@@ -504,7 +500,7 @@ class TranscriptWriter:
             try:
                 with open(self.output_path, "r", encoding="utf-8") as f:
                     content = f.read()
-                content = re.sub(r"\[\d{2}:\d{2}:\d{2}\] SPEAKER:\s*$", "", content.rstrip()).rstrip()
+                content = re.sub(r"\[\d{2}:\d{2}:\d{2}\] SPEAKER\w*:\s*$", "", content.rstrip()).rstrip()
                 with open(self.output_path, "w", encoding="utf-8") as f:
                     f.write(content + "\n")
             except FileNotFoundError:
@@ -515,21 +511,22 @@ class TranscriptWriter:
             self._write_json()
         else:
             self._write_txt()
-    
+
     def _write_txt(self):
         """Write plain text format."""
         with open(self.output_path, "w", encoding="utf-8") as f:
             for seg in self.segments:
                 if seg["new_speaker"]:
-                    f.write(f"\n[{format_timestamp(seg['start'])}] SPEAKER:\n")
+                    speaker_name = seg.get("speaker", "SPEAKER")
+                    f.write(f"\n[{format_timestamp(seg['start'])}] {speaker_name}:\n")
                 f.write(seg["text"] + " ")
-        
+
         # Clean up trailing whitespace
         with open(self.output_path, "r", encoding="utf-8") as f:
             content = f.read()
-        
-        content = re.sub(r"\[\d{2}:\d{2}:\d{2}\] SPEAKER:\s*$", "", content.rstrip()).rstrip()
-        
+
+        content = re.sub(r"\[\d{2}:\d{2}:\d{2}\] SPEAKER\w*:\s*$", "", content.rstrip()).rstrip()
+
         with open(self.output_path, "w", encoding="utf-8") as f:
             f.write(content + "\n")
     
@@ -592,12 +589,13 @@ async def transcribe_file(
         
         # Detect speech segments via Diarization endpoint
         log.info("Running diarization on the full audio...")
-        diarize_segments = await client.diarize_path(temp_wav)
+        diarize_segments, speaker_profiles = await client.diarize_path(temp_wav)
 
         if not diarize_segments:
             log.warn("Diarization returned no segments. Falling back to entire file as one speaker.", file=p.name)
             total_dur = get_total_duration(temp_wav)
             diarize_segments = [{"start": 0.0, "end": total_dur, "speaker": "SPEAKER"}]
+            speaker_profiles = {}
 
         # Group segments to avoid tiny chunks
         segments = group_diarization_segments(diarize_segments, config.max_chunk_duration, config.merge_gap)
@@ -606,10 +604,10 @@ async def transcribe_file(
         if not segments:
             log.warn("No valid segments left after grouping", file=p.name)
             return None
-        
+
         # Initialize writer
         writer = TranscriptWriter(output_path, config.output_format)
-        
+
         # Process in batches
         total_batches = (len(segments) + config.batch_size - 1) // config.batch_size
 
@@ -617,9 +615,22 @@ async def transcribe_file(
             progress_bar.total = len(segments)
             progress_bar.set_description(p.name[:30])
 
-        # Clear output file if it exists and write format header if necessary
+        # Clear output file and write speaker legend header if profiles available
         with open(output_path, "w", encoding="utf-8") as f:
-            pass
+            if speaker_profiles and config.output_format == "txt":
+                f.write("=" * 60 + "\n")
+                f.write("SPEAKER VOICE PROFILES\n")
+                f.write("=" * 60 + "\n")
+                for spk in sorted(speaker_profiles.keys()):
+                    p_info = speaker_profiles[spk]
+                    f.write(
+                        f"  {spk}: pitch={p_info.get('pitch_hz', 0):.0f}Hz "
+                        f"(±{p_info.get('pitch_std', 0):.0f}Hz)  "
+                        f"energy={p_info.get('energy_rms', 0):.4f}  "
+                        f"speech={p_info.get('total_speech_sec', 0):.0f}s  "
+                        f"gender={p_info.get('gender_hint', '?')}\n"
+                    )
+                f.write("=" * 60 + "\n\n")
 
         for batch_idx in range(0, len(segments), config.batch_size):
             batch = segments[batch_idx:batch_idx + config.batch_size]
