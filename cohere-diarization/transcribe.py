@@ -50,6 +50,8 @@ class Config:
     
     # Speaker detection
     speaker_turn_gap: float = 1.5
+    num_speakers: Optional[int] = None
+    diarization_threshold: Optional[float] = None
     
     # Batch settings
     batch_size: int = 4
@@ -72,12 +74,17 @@ class Config:
     @classmethod
     def from_env(cls) -> "Config":
         """Load configuration from environment variables."""
+        num_speakers_env = os.getenv("TRANSCRIBE_NUM_SPEAKERS")
+        threshold_env = os.getenv("TRANSCRIBE_DIARIZATION_THRESHOLD")
+
         return cls(
             server_url=os.getenv("TRANSCRIBE_SERVER_URL", cls.server_url),
             api_key=os.getenv("TRANSCRIBE_API_KEY"),
             request_timeout=int(os.getenv("TRANSCRIBE_TIMEOUT", cls.request_timeout)),
             batch_size=int(os.getenv("TRANSCRIBE_BATCH_SIZE", cls.batch_size)),
             max_concurrent_requests=int(os.getenv("TRANSCRIBE_MAX_CONCURRENT", cls.max_concurrent_requests)),
+            num_speakers=int(num_speakers_env) if num_speakers_env else None,
+            diarization_threshold=float(threshold_env) if threshold_env else None,
         )
 
 
@@ -312,9 +319,15 @@ class TranscriptionClient:
             extended_timeout = aiohttp.ClientTimeout(total=1800)
 
             async with aiohttp.ClientSession(headers=headers, timeout=extended_timeout) as session:
+                payload = {"wav_path": str(Path(wav_path).resolve())}
+                if self.config.num_speakers is not None:
+                    payload["num_speakers"] = self.config.num_speakers
+                if self.config.diarization_threshold is not None:
+                    payload["diarization_threshold"] = self.config.diarization_threshold
+
                 async with session.post(
                     f"{self.config.server_url}/diarize/path",
-                    json={"wav_path": str(Path(wav_path).resolve())}
+                    json=payload
                 ) as resp:
                     resp.raise_for_status()
 
@@ -781,12 +794,14 @@ Examples:
   %(prog)s *.wav --format srt
   %(prog)s meeting.mp4 --server http://localhost:8000
   
-Environment variables:
-  TRANSCRIBE_SERVER_URL  - Server URL (default: http://127.0.0.1:8000)
-  TRANSCRIBE_API_KEY     - API key for authentication
-  TRANSCRIBE_TIMEOUT     - Request timeout in seconds
-  TRANSCRIBE_BATCH_SIZE  - Batch size for requests
-        """
+  Environment variables:
+    TRANSCRIBE_SERVER_URL  - Server URL (default: http://127.0.0.1:8000)
+    TRANSCRIBE_API_KEY     - API key for authentication
+    TRANSCRIBE_TIMEOUT     - Request timeout in seconds
+    TRANSCRIBE_BATCH_SIZE  - Batch size for requests
+    TRANSCRIBE_NUM_SPEAKERS - Exact number of speakers
+    TRANSCRIBE_DIARIZATION_THRESHOLD - Threshold for clustering
+          """
     )
     
     parser.add_argument(
@@ -827,7 +842,19 @@ Environment variables:
         default=None,
         help="Request timeout in seconds"
     )
-    
+    parser.add_argument(
+        "--num-speakers",
+        type=int,
+        default=None,
+        help="Exact number of speakers (improves diarization if known)"
+    )
+    parser.add_argument(
+        "--diarization-threshold",
+        type=float,
+        default=None,
+        help="Distance threshold for clustering (overrides server default)"
+    )
+
     args = parser.parse_args()
     
     # Build config
@@ -843,7 +870,11 @@ Environment variables:
         config.api_key = args.api_key
     if args.timeout:
         config.request_timeout = args.timeout
-    
+    if args.num_speakers is not None:
+        config.num_speakers = args.num_speakers
+    if args.diarization_threshold is not None:
+        config.diarization_threshold = args.diarization_threshold
+
     # Expand globs and validate files
     input_files = []
     for pattern in args.files:

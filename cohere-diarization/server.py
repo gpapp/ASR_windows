@@ -648,6 +648,8 @@ class DiarizeResponse(BaseModel):
 
 class DiarizePathsRequest(BaseModel):
     wav_path: str = Field(..., description="Audio file path")
+    num_speakers: Optional[int] = Field(None, description="Exact number of speakers (if known)")
+    diarization_threshold: Optional[float] = Field(None, description="Distance threshold for clustering (overrides server default)")
 
 class TranscribePathsRequest(BaseModel):
     """Request model for path-based transcription."""
@@ -1224,11 +1226,14 @@ async def diarize_path_endpoint(
                 "type": "progress", "step": "Clustering", "completed": 0, "total": 1
             }))
 
+            n_clusters_val = req.num_speakers
+            dist_thresh_val = None if req.num_speakers is not None else (req.diarization_threshold if req.diarization_threshold is not None else settings.diarization_threshold)
+
             clusterer = AgglomerativeClustering(
-                n_clusters=None,
+                n_clusters=n_clusters_val,
                 metric="cosine",
                 linkage="average",
-                distance_threshold=settings.diarization_threshold
+                distance_threshold=dist_thresh_val
             )
 
             if len(raw_embeddings) > 1:
@@ -1241,7 +1246,7 @@ async def diarize_path_endpoint(
             from sklearn.metrics.pairwise import cosine_distances as _cdist
             _d = _cdist(raw_embeddings)
             _u = _d[np.triu_indices_from(_d, k=1)]
-            print(f"[DEBUG] threshold={settings.diarization_threshold} -> {n_clusters} clusters from {len(raw_embeddings)} windows", flush=True)
+            print(f"[DEBUG] threshold={dist_thresh_val} (num_speakers={n_clusters_val}) -> {n_clusters} clusters from {len(raw_embeddings)} windows", flush=True)
             print(f"[DEBUG] cosine dist: min={_u.min():.4f} max={_u.max():.4f} mean={_u.mean():.4f} p25={np.percentile(_u,25):.4f} p75={np.percentile(_u,75):.4f}", flush=True)
 
             # Assign cluster labels to embeddable windows
