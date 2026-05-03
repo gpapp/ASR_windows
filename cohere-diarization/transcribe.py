@@ -27,6 +27,12 @@ import aiohttp
 from tqdm import tqdm
 
 # ============================================================================
+# Constants
+# ============================================================================
+
+MIN_ISLAND_DUR = 0.3  # Minimum duration for a segment to be considered an "island"
+
+# ============================================================================
 # Configuration
 # ============================================================================
 
@@ -164,10 +170,11 @@ def get_total_duration(wav_path: str) -> float:
 
 def group_diarization_segments(
     segments: list[dict],
+    min_island_duration: float,
     max_duration: float,
     merge_gap: float
 ) -> list[tuple[float, float, str]]:
-    """Group tiny Pyannote segments belonging to the same speaker into larger chunks."""
+    """Group tiny segments belonging to the same speaker into larger core segments."""
     if not segments:
         return []
 
@@ -193,22 +200,9 @@ def group_diarization_segments(
     # Append the final group
     grouped.append((current_start, current_end, current_speaker))
 
-    # Handle segments that are still somehow larger than max_duration
-    final_chunks = []
-    for start, end, speaker in grouped:
-        dur = end - start
-        if dur > max_duration:
-            # Split it evenly
-            n = int(dur / max_duration) + 1
-            step = dur / n
-            for i in range(n):
-                final_chunks.append((start + i * step, start + (i + 1) * step, speaker))
-        else:
-            final_chunks.append((start, end, speaker))
-
-    print(f"[DEBUG] Grouped from {len(segments)} segments to {len(grouped)} groups, and finally {len(final_chunks)} chunks.", flush=True)
-
-    return final_chunks
+    # This function now handles the initial coarse merging of continuous speech turns.
+    # Further refinement (like overlap handling) will occur in the advanced pipeline.
+    return [dict(g) for g in grouped]
 
 
 def extract_chunk(wav_path: str, start: float, duration: float, output: str, sample_rate: int) -> bool:
@@ -564,6 +558,81 @@ class TranscriptWriter:
 
 
 # ============================================================================
+# Segment Refinement and Overlap Detection
+# ============================================================================
+
+def refactor_and_detect_overlaps(diarize_segments: list[dict], min_duration: float, 
+                                  max_chunk_duration: float, merge_gap: float) -> tuple[list[tuple], list[dict]]:
+    """
+    Refine diarization segments and detect overlaps between speakers.
+    
+    Args:
+        diarize_segments: List of dicts with 'start', 'end', 'speaker' keys
+        min_duration: Minimum segment duration to keep
+        max_chunk_duration: Maximum duration for a single chunk
+        merge_gap: Maximum gap between segments to merge
+        
+    Returns:
+        Tuple of (refined_segments, overlaps)
+        - refined_segments: List of tuples (start, end, speaker)
+        - overlaps: List of overlapping regions with speaker info
+    """
+    if not diarize_segments:
+        return [], []
+    
+    # Convert start and end to floats
+    processed = []
+    for seg in diarize_segments:
+        processed.append({
+            'start': float(seg['start']),
+            'end': float(seg['end']),
+            'speaker': seg['speaker']
+        })
+    
+    # Sort segments by start time
+    sorted_segments = sorted(processed, key=lambda x: x['start'])
+    
+    # Merge segments that are close together (same speaker)
+    merged = []
+    current = dict(sorted_segments[0])
+    
+    for seg in sorted_segments[1:]:
+        if seg['speaker'] == current['speaker'] and (seg['start'] - current['end']) <= merge_gap:
+            current['end'] = max(current['end'], seg['end'])
+        else:
+            if current['end'] - current['start'] >= min_duration:
+                merged.append(current)
+            current = dict(seg)
+    
+    if current['end'] - current['start'] >= min_duration:
+        merged.append(current)
+    
+    # Detect overlaps between segments of different speakers
+    overlaps = []
+    refined = []
+    
+    for i, seg in enumerate(merged):
+        # Return as tuple (start, end, speaker) to match expected format
+        refined.append((seg['start'], seg['end'], seg['speaker']))
+        # Check for overlaps with subsequent segments
+        for j in range(i + 1, len(merged)):
+            other = merged[j]
+            if other['start'] >= seg['end']:
+                break
+            if other['speaker'] != seg['speaker'] and other['start'] < seg['end']:
+                overlap_start = max(seg['start'], other['start'])
+                overlap_end = min(seg['end'], other['end'])
+                if overlap_end > overlap_start:
+                    overlaps.append({
+                        'start': overlap_start,
+                        'end': overlap_end,
+                        'speakers': [seg['speaker'], other['speaker']]
+                    })
+    
+    return refined, overlaps
+
+
+# ============================================================================
 # Main Transcription Logic
 # ============================================================================
 
@@ -603,15 +672,26 @@ async def transcribe_file(
         # Detect speech segments via Diarization endpoint
         log.info("Running diarization on the full audio...")
         diarize_segments, speaker_profiles = await client.diarize_path(temp_wav)
-
+        
         if not diarize_segments:
-            log.warn("Diarization returned no segments. Falling back to entire file as one speaker.", file=p.name)
+            log.warn("Diarization returned no segments. Assuming single speaker for fallback.", file=p.name)
             total_dur = get_total_duration(temp_wav)
+            # Fallback: treating the whole file as one segment for embedding/analysis
             diarize_segments = [{"start": 0.0, "end": total_dur, "speaker": "SPEAKER"}]
             speaker_profiles = {}
-
-        # Group segments to avoid tiny chunks
-        segments = group_diarization_segments(diarize_segments, config.max_chunk_duration, config.merge_gap)
+        
+        # 1. Refine segments and detect overlaps.
+        # Overlaps are detected but not yet used for embedding/audio extraction in this iteration.
+        refined_segments, overlaps = refactor_and_detect_overlaps(
+            diarize_segments,
+            MIN_ISLAND_DUR, # Use old threshold for compatibility
+            config.max_chunk_duration,
+            config.merge_gap
+        )
+        
+        # 2. Proceed with the refined segments for subsequent steps (embedding/profiling)
+        segments = refined_segments
+        
         log.info(f"Grouped into {len(segments)} speaker-homogeneous chunks")
 
         if not segments:

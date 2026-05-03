@@ -98,11 +98,13 @@ class Settings(BaseSettings):
     enable_diarization: bool = True
     hf_token: Optional[str] = None
     rate_limit: str = "30/minute"
-
+    
     # Diarization settings
+    diarization_threshold: float = Field(default=0.20, description="Distance threshold for AgglomerativeClustering (cosine metric) - P75 of earnings22 distances")
+    
+    # Embedding model settings
     embedding_model_repo: str = Field(default="onnx-community/wespeaker-voxceleb-resnet34-LM", description="HuggingFace repo for the embedding ONNX model")
     embedding_model_filename: str = Field(default="onnx/model.onnx", description="Filename of the ONNX embedding model")
-    diarization_threshold: float = Field(default=0.28, description="Distance threshold for AgglomerativeClustering (cosine metric)")
     
     # Cache settings
     kv_cache_pool_size: int = 4
@@ -1227,7 +1229,11 @@ async def diarize_path_endpoint(
             }))
 
             n_clusters_val = req.num_speakers
-            dist_thresh_val = None if req.num_speakers is not None else (req.diarization_threshold if req.diarization_threshold is not None else settings.diarization_threshold)
+            # Only use threshold if num_speakers is not specified
+            if n_clusters_val is not None:
+                dist_thresh_val = None  # Force exact number of clusters
+            else:
+                dist_thresh_val = req.diarization_threshold if req.diarization_threshold is not None else settings.diarization_threshold
 
             clusterer = AgglomerativeClustering(
                 n_clusters=n_clusters_val,
@@ -1240,7 +1246,7 @@ async def diarize_path_endpoint(
                 long_labels = clusterer.fit_predict(raw_embeddings)
             else:
                 long_labels = np.array([0])
-
+            
             n_clusters = len(set(int(l) for l in long_labels))
             # Distance diagnostics
             from sklearn.metrics.pairwise import cosine_distances as _cdist
@@ -1248,7 +1254,71 @@ async def diarize_path_endpoint(
             _u = _d[np.triu_indices_from(_d, k=1)]
             print(f"[DEBUG] threshold={dist_thresh_val} (num_speakers={n_clusters_val}) -> {n_clusters} clusters from {len(raw_embeddings)} windows", flush=True)
             print(f"[DEBUG] cosine dist: min={_u.min():.4f} max={_u.max():.4f} mean={_u.mean():.4f} p25={np.percentile(_u,25):.4f} p75={np.percentile(_u,75):.4f}", flush=True)
-
+            print(f"[DEBUG] Cluster distribution: {dict((int(l), list(long_labels).count(l)) for l in set(long_labels))}", flush=True)
+            
+            # Store for analysis
+            import pickle
+            pickle.dump({
+                'embeddings': raw_embeddings,
+                'labels': long_labels,
+                'distances': _u
+            }, open('debug_diarization.pkl', 'wb'))
+            print("[DEBUG] Saved debug_diarization.pkl", flush=True)
+            
+            # Voiceprint-based speaker merging
+            # SKIP if user forced exact speaker count
+            if n_clusters > 1 and n_clusters_val is None:
+                from sklearn.metrics.pairwise import cosine_distances
+                
+                cluster_ids = sorted(set(int(l) for l in long_labels))
+                print(f"[DEBUG] Checking voiceprint merge for {len(cluster_ids)} clusters", flush=True)
+                cluster_avgs = {}
+                for cid in cluster_ids:
+                    mask = long_labels == cid
+                    cluster_avgs[cid] = np.mean(raw_embeddings[mask], axis=0)
+                
+                # Greedy merge: merge closest pairs below threshold
+                merge_threshold = 0.25  # Cosine distance threshold for voiceprint merging - P90 of earnings22 distances
+            
+                # Debug: print pairwise distances
+                ids = sorted(cluster_avgs.keys())
+                print(f"[DEBUG] Cluster IDs: {ids}", flush=True)
+                for i_idx in range(len(ids)):
+                    for j_idx in range(i_idx + 1, len(ids)):
+                        id_i, id_j = ids[i_idx], ids[j_idx]
+                        dist = cosine_distances(
+                            [cluster_avgs[id_i]], [cluster_avgs[id_j]]
+                        )[0][0]
+                        print(f"[DEBUG] Dist between {id_i} and {id_j}: {dist:.4f}", flush=True)
+            
+                changed = True
+                while changed:
+                    changed = False
+                    ids = sorted(cluster_avgs.keys())
+                    for i_idx in range(len(ids)):
+                        for j_idx in range(i_idx + 1, len(ids)):
+                            id_i, id_j = ids[i_idx], ids[j_idx]
+                            if id_j not in cluster_avgs:  # Already merged
+                                continue
+                            dist = cosine_distances(
+                                [cluster_avgs[id_i]], [cluster_avgs[id_j]]
+                            )[0][0]
+                            if dist < merge_threshold:
+                                # Merge j into i
+                                long_labels[long_labels == id_j] = id_i
+                                # Update average embedding
+                                mask_i = long_labels == id_i
+                                cluster_avgs[id_i] = np.mean(raw_embeddings[mask_i], axis=0)
+                                del cluster_avgs[id_j]
+                                changed = True
+                                print(f"[DEBUG] Merged cluster {id_j} into {id_i} (dist={dist:.3f})", flush=True)
+                                break
+                    if changed:
+                        break
+            
+                n_clusters = len(set(int(l) for l in long_labels))
+                print(f"[DEBUG] After voiceprint merge: {n_clusters} clusters", flush=True)
+             
             # Assign cluster labels to embeddable windows
             for idx, label in zip(embeddable_indices, long_labels):
                 all_segments_meta[idx]["speaker_raw"] = int(label)
