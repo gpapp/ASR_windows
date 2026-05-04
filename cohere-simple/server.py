@@ -19,6 +19,7 @@ HEADS = 8
 HEAD_DIM = 128
 MAX_CTX = 1024
 MAX_NEW_TOKENS = 448
+TARGET_SAMPLES = 480000  # 30 seconds at 16kHz
 
 state = {}
 
@@ -181,6 +182,13 @@ def transcribe(req: TranscribeRequest):
     for path in req.wav_paths:
         try:
             audio, _ = librosa.load(path, sr=16000, mono=True)
+            
+            # Normalize to exactly 30 seconds (model expects fixed-length input)
+            if len(audio) < TARGET_SAMPLES:
+                audio = np.pad(audio, (0, TARGET_SAMPLES - len(audio)), mode='constant')
+            else:
+                audio = audio[:TARGET_SAMPLES]
+            
             text = transcribe_audio(audio, req.language)
             results.append(text)
         except Exception as e:
