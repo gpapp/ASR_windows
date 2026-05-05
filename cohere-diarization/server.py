@@ -36,6 +36,8 @@ import json
 import librosa
 import onnxruntime as ort
 from sklearn.cluster import AgglomerativeClustering
+
+TARGET_SAMPLES = 480000  # 30 seconds at 16kHz
 from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, Request, Security
 from fastapi.security import APIKeyHeader
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
@@ -101,6 +103,8 @@ class Settings(BaseSettings):
     
     # Diarization settings
     diarization_threshold: float = Field(default=0.20, description="Distance threshold for AgglomerativeClustering (cosine metric) - P75 of earnings22 distances")
+    vad_threshold: float = Field(default=0.5, description="Speech probability cutoff (0.0 to 1.0) for Silero VAD")
+    vad_min_speech_duration_ms: int = Field(default=250, description="Minimum speech chunk length (ms) for Silero VAD")
     
     # Embedding model settings
     embedding_model_repo: str = Field(default="onnx-community/wespeaker-voxceleb-resnet34-LM", description="HuggingFace repo for the embedding ONNX model")
@@ -652,6 +656,9 @@ class DiarizePathsRequest(BaseModel):
     wav_path: str = Field(..., description="Audio file path")
     num_speakers: Optional[int] = Field(None, description="Exact number of speakers (if known)")
     diarization_threshold: Optional[float] = Field(None, description="Distance threshold for clustering (overrides server default)")
+    vad_threshold: Optional[float] = Field(None, description="VAD speech probability cutoff (0.0-1.0)")
+    vad_min_speech_duration_ms: Optional[int] = Field(None, description="VAD minimum speech chunk length (ms)")
+    known_speakers: Optional[dict[str, dict]] = Field(None, description="Map of known speaker names to their profiles")
 
 class TranscribePathsRequest(BaseModel):
     """Request model for path-based transcription."""
@@ -898,6 +905,19 @@ async def health():
     )
 
 
+async def delayed_shutdown():
+    await asyncio.sleep(1.0)
+    os._exit(0)
+
+
+@app.post("/shutdown")
+async def shutdown(_: str = Depends(verify_api_key)):
+    """Shutdown the server."""
+    log.info("shutdown_requested")
+    asyncio.create_task(delayed_shutdown())
+    return {"status": "shutting down"}
+
+
 @app.get("/metrics")
 async def prometheus_metrics():
     """Prometheus metrics endpoint."""
@@ -935,6 +955,50 @@ def extract_fbank(waveform: torch.Tensor, sample_rate: int = 16000) -> torch.Ten
     )
     # fbank shape is [frames, 80], we want to return [1, frames, 80] for batching
     return fbank.unsqueeze(0)
+
+
+def run_vad_chunked(waveform_tensor, vad_model, get_speech_timestamps, sample_rate=16000, 
+                   chunk_duration=30, overlap=5, threshold=0.5, min_speech_duration_ms=250):
+    """Run VAD on audio in chunks for better performance on long audio."""
+    total_samples = waveform_tensor.shape[-1]
+    chunk_samples = int(chunk_duration * sample_rate)
+    stride_samples = int((chunk_duration - overlap) * sample_rate)
+    
+    all_speech_ts = []
+    
+    for start in range(0, total_samples, stride_samples):
+        end = min(start + chunk_samples, total_samples)
+        chunk = waveform_tensor[..., start:end]
+        
+        ts = get_speech_timestamps(
+            chunk,
+            vad_model,
+            sampling_rate=sample_rate,
+            return_seconds=True,
+            threshold=threshold,
+            min_speech_duration_ms=min_speech_duration_ms
+        )
+        
+        for t in ts:
+            all_speech_ts.append({
+                "start": t["start"] + start / sample_rate,
+                "end": t["end"] + start / sample_rate
+            })
+    
+    if not all_speech_ts:
+        return []
+    
+    # Merge overlapping segments
+    all_speech_ts.sort(key=lambda x: x["start"])
+    merged = [all_speech_ts[0]]
+    for seg in all_speech_ts[1:]:
+        if seg["start"] <= merged[-1]["end"] + 0.1:
+            merged[-1]["end"] = max(merged[-1]["end"], seg["end"])
+        else:
+            merged.append(seg)
+    
+    return merged
+
 
 def generate_sliding_windows(waveform: torch.Tensor, sample_rate: int, window_sec: float = 3.0, stride_sec: float = 1.5):
     """Generates overlapping sliding windows from a continuous waveform."""
@@ -1135,15 +1199,37 @@ async def diarize_path_endpoint(
                 "type": "progress", "step": "Voice Activity Detection", "completed": 0, "total": 1
             }))
 
-            speech_ts = state.get_speech_timestamps(
-                waveform_tensor,
-                state.vad_model,
-                sampling_rate=16000,
-                return_seconds=True
-            )
+            vad_thresh_val = req.vad_threshold if req.vad_threshold is not None else settings.vad_threshold
+            vad_min_dur_val = req.vad_min_speech_duration_ms if req.vad_min_speech_duration_ms is not None else settings.vad_min_speech_duration_ms
+
+            audio_duration = waveform_tensor.shape[-1] / 16000
+            if audio_duration > 60:
+                log.info("vad_using_chunked", duration=audio_duration)
+                speech_ts = run_vad_chunked(
+                    waveform_tensor,
+                    state.vad_model,
+                    state.get_speech_timestamps,
+                    sample_rate=16000,
+                    chunk_duration=30,
+                    overlap=5,
+                    threshold=vad_thresh_val,
+                    min_speech_duration_ms=vad_min_dur_val
+                )
+            else:
+                speech_ts = state.get_speech_timestamps(
+                    waveform_tensor,
+                    state.vad_model,
+                    sampling_rate=16000,
+                    return_seconds=True,
+                    threshold=vad_thresh_val,
+                    min_speech_duration_ms=vad_min_dur_val
+                )
 
             if not speech_ts:
                 log.info("vad_found_no_speech", path=req.wav_path)
+                loop.call_soon_threadsafe(queue.put_nowait, json.dumps({
+                    "type": "result", "segments": [], "profiles": {}
+                }))
                 loop.call_soon_threadsafe(queue.put_nowait, None)
                 return
 
@@ -1192,6 +1278,16 @@ async def diarize_path_endpoint(
             print(f"[DEBUG] Total windows: {len(all_segments_meta)}, embeddable (>={MIN_EMBED_DURATION}s): {len(all_fbanks)}", flush=True)
 
             if not all_fbanks:
+                fallback_segments = []
+                for ts in speech_ts:
+                    fallback_segments.append({
+                        "start": ts["start"],
+                        "end": ts["end"],
+                        "speaker": "SPEAKER1"
+                    })
+                loop.call_soon_threadsafe(queue.put_nowait, json.dumps({
+                    "type": "result", "segments": fallback_segments, "profiles": {}
+                }))
                 loop.call_soon_threadsafe(queue.put_nowait, None)
                 return
 
@@ -1298,6 +1394,8 @@ async def diarize_path_endpoint(
                     for i_idx in range(len(ids)):
                         for j_idx in range(i_idx + 1, len(ids)):
                             id_i, id_j = ids[i_idx], ids[j_idx]
+                            if id_i not in cluster_avgs:
+                                continue
                             if id_j not in cluster_avgs:  # Already merged
                                 continue
                             dist = cosine_distances(
@@ -1318,7 +1416,15 @@ async def diarize_path_endpoint(
             
                 n_clusters = len(set(int(l) for l in long_labels))
                 print(f"[DEBUG] After voiceprint merge: {n_clusters} clusters", flush=True)
-             
+
+            # Compute normalized centroid vector for each raw cluster ID
+            cluster_centroids = {}
+            for cluster_id in set(long_labels):
+                mask = (long_labels == cluster_id)
+                mean_emb = raw_embeddings[mask].mean(axis=0)
+                norm_emb = mean_emb / (np.linalg.norm(mean_emb) + 1e-12)
+                cluster_centroids[int(cluster_id)] = norm_emb.tolist()
+
             # Assign cluster labels to embeddable windows
             for idx, label in zip(embeddable_indices, long_labels):
                 all_segments_meta[idx]["speaker_raw"] = int(label)
@@ -1334,13 +1440,119 @@ async def diarize_path_endpoint(
                     nearest = int(np.argmin(np.abs(emb_mids - mid)))
                     seg["speaker_raw"] = all_segments_meta[embeddable_indices[nearest]]["speaker_raw"]
 
-            # Map raw cluster int -> SPEAKER1, SPEAKER2, ... in first-appearance order
-            speaker_map: dict[int, str] = {}
-            for seg in sorted(all_segments_meta, key=lambda x: x["start"]):
-                raw = seg["speaker_raw"]
-                if raw not in speaker_map:
-                    speaker_map[raw] = f"SPEAKER{len(speaker_map) + 1}"
-                seg["speaker"] = speaker_map[raw]
+            # Map raw cluster IDs to speaker names (with known speaker matching)
+            if req.known_speakers:
+                log.info("known_speakers_received", keys=list(req.known_speakers.keys()))
+                from scipy.spatial.distance import cosine
+                
+                # Temporarily populate raw cluster IDs as speaker names
+                for seg in all_segments_meta:
+                    seg["speaker"] = f"RAW_{seg['speaker_raw']}"
+                
+                # Match RAW profiles to known speakers
+                speaker_map: dict[str, str] = {}
+                unknown_idx = 1
+                match_thresh = 0.4
+                close_match_thresh = 0.15  # If two clusters match same known speaker within this, merge them
+
+                # First pass: match all clusters
+                cluster_matches = {}
+                for raw_spk, centroid in cluster_centroids.items():
+                    raw_name = f"RAW_{raw_spk}"
+                    best_match = None
+                    best_dist = float('inf')
+
+                    for known_name, known_prof in req.known_speakers.items():
+                        if "embedding" not in known_prof:
+                            continue
+                        emb_dist = cosine(centroid, known_prof["embedding"])
+                        
+                        if emb_dist < best_dist:
+                            best_dist = emb_dist
+                            best_match = known_name
+
+                    cluster_matches[raw_spk] = {"name": best_match, "dist": best_dist, "centroid": centroid}
+
+                # Second pass: detect closely matching clusters to same known speaker
+                # If two clusters both match the same known speaker with very small distance, merge them
+                merged_clusters = set()
+                for raw_spk1, match1 in cluster_matches.items():
+                    if raw_spk1 in merged_clusters:
+                        continue
+                    if not match1["name"] or match1["dist"] > close_match_thresh:
+                        continue
+                    
+                    for raw_spk2, match2 in cluster_matches.items():
+                        if raw_spk2 == raw_spk1 or raw_spk2 in merged_clusters:
+                            continue
+                        if not match2["name"] or match2["dist"] > close_match_thresh:
+                            continue
+                        
+                        # Both closely match known speakers - check if they're the same
+                        if match1["name"] == match2["name"]:
+                            # Same known speaker, very close matches - merge
+                            dist_between = cosine(match1["centroid"], match2["centroid"])
+                            if dist_between < 0.2:
+                                print(f"[DEBUG] Merging clusters {raw_spk1} and {raw_spk2} (both match '{match1['name']}', dist: {dist_between:.4f})", flush=True)
+                                long_labels[long_labels == raw_spk2] = raw_spk1
+                                merged_clusters.add(raw_spk2)
+
+                # Recompute cluster centroids after merging
+                cluster_centroids = {}
+                for cluster_id in set(long_labels):
+                    mask = (long_labels == cluster_id)
+                    mean_emb = raw_embeddings[mask].mean(axis=0)
+                    norm_emb = mean_emb / (np.linalg.norm(mean_emb) + 1e-12)
+                    cluster_centroids[int(cluster_id)] = norm_emb.tolist()
+
+                # Third pass: assign final names
+                for raw_spk, centroid in cluster_centroids.items():
+                    raw_name = f"RAW_{raw_spk}"
+                    best_match = None
+                    best_dist = float('inf')
+
+                    for known_name, known_prof in req.known_speakers.items():
+                        if "embedding" not in known_prof:
+                            continue
+                        emb_dist = cosine(centroid, known_prof["embedding"])
+                        
+                        if emb_dist < best_dist:
+                            best_dist = emb_dist
+                            best_match = known_name
+
+                    if best_match and best_dist <= match_thresh:
+                        speaker_map[raw_name] = best_match
+                        print(f"[DEBUG] Cluster {raw_spk} matched to known speaker '{best_match}' (dist: {best_dist:.4f})", flush=True)
+                    else:
+                        speaker_map[raw_name] = f"SPEAKER{unknown_idx}"
+                        print(f"[DEBUG] Cluster {raw_spk} no match (best: {best_match}, dist: {best_dist:.4f})", flush=True)
+                        unknown_idx += 1
+
+                # Update segments with final speaker names
+                for seg in all_segments_meta:
+                    raw_name = f"RAW_{seg['speaker_raw']}"
+                    seg["speaker"] = speaker_map.get(raw_name, seg["speaker"])
+                
+                # Extract profiles for known speakers
+                profiles = {}
+                for raw_name, matched_name in speaker_map.items():
+                    if matched_name.startswith("SPEAKER"):
+                        continue
+                    if matched_name in req.known_speakers:
+                        profiles[matched_name] = req.known_speakers[matched_name]
+                
+                if profiles:
+                    loop.call_soon_threadsafe(queue.put_nowait, json.dumps({
+                        "type": "progress", "step": "Speaker Profiling", "completed": 1, "total": 1
+                    }))
+            else:
+                # Original logic: Map raw cluster int -> SPEAKER1, SPEAKER2, ... in first-appearance order
+                speaker_map: dict[int, str] = {}
+                for seg in sorted(all_segments_meta, key=lambda x: x["start"]):
+                    raw = seg["speaker_raw"]
+                    if raw not in speaker_map:
+                        speaker_map[raw] = f"SPEAKER{len(speaker_map) + 1}"
+                    seg["speaker"] = speaker_map[raw]
 
             # 5. Merge contiguous same-speaker windows
             #    Split on speaker change or gap > MAX_SPEAKER_GAP — no hard time cap.
@@ -1402,6 +1614,67 @@ async def diarize_path_endpoint(
             # Re-label by pitch so SPEAKER1 = lowest pitch (stable across runs)
             merged_segments, profiles = relabel_by_pitch(merged_segments, profiles)
 
+            # Apply known speaker matching AFTER relabeling
+            if req.known_speakers:
+                from scipy.spatial.distance import cosine
+                
+                print(f"[DEBUG] Post-relabel matching: {len(merged_segments)} segments, {len(all_segments_meta)} meta entries", flush=True)
+                print(f"[DEBUG] cluster_centroids keys: {list(cluster_centroids.keys())[:5]}...", flush=True)
+                
+                # Compute centroid for each final speaker
+                speaker_centroids = {}
+                for seg in merged_segments:
+                    spk = seg["speaker"]
+                    if spk not in speaker_centroids:
+                        speaker_centroids[spk] = []
+                    
+                    # Find embedding for this segment's time range
+                    seg_start = seg["start"]
+                    seg_end = seg["end"]
+                    for i, meta in enumerate(all_segments_meta):
+                        if meta["start"] >= seg_start - 0.1 and meta["end"] <= seg_end + 0.1:
+                            if "speaker_raw" in meta:
+                                raw_id = meta["speaker_raw"]
+                                if raw_id in cluster_centroids:
+                                    speaker_centroids[spk].append(np.array(cluster_centroids[raw_id]))
+                
+                print(f"[DEBUG] speaker_centroids computed: {list(speaker_centroids.keys())}", flush=True)
+                for spk, emb_list in speaker_centroids.items():
+                    print(f"[DEBUG]   {spk}: {len(emb_list)} embeddings", flush=True)
+                
+                # Match each speaker to known voiceprints
+                match_thresh = 0.4
+                for spk, emb_list in speaker_centroids.items():
+                    if not emb_list:
+                        continue
+                    
+                    centroid = np.mean(emb_list, axis=0)
+                    norm = np.linalg.norm(centroid)
+                    if norm > 0:
+                        centroid = centroid / norm
+                    
+                    best_match = None
+                    best_dist = float('inf')
+                    
+                    for known_name, known_prof in req.known_speakers.items():
+                        if "embedding" not in known_prof:
+                            continue
+                        emb_dist = cosine(centroid, known_prof["embedding"])
+                        
+                        if emb_dist < best_dist:
+                            best_dist = emb_dist
+                            best_match = known_name
+                    
+                    if best_match and best_dist <= match_thresh:
+                        print(f"[DEBUG] Final speaker '{spk}' matched to '{best_match}' (dist: {best_dist:.4f})", flush=True)
+                        # Update all segments with this speaker
+                        for seg in merged_segments:
+                            if seg["speaker"] == spk:
+                                seg["speaker"] = best_match
+                        # Update profiles
+                        profiles[best_match] = profiles.pop(spk)
+                        profiles[best_match]["matched_from"] = spk
+
             for spk, p in sorted(profiles.items()):
                 print(
                     f"[PROFILE] {spk}: pitch={p['pitch_hz']}Hz±{p['pitch_std']}Hz  "
@@ -1427,6 +1700,9 @@ async def diarize_path_endpoint(
                 }
                 for seg in merged_segments if seg["end"] > seg["start"]
             ]
+            
+            unique_speakers = list(set(s["speaker"] for s in final_data))
+            log.info("diarization_complete", unique_speakers=unique_speakers, num_segments=len(final_data))
 
             msg = {"type": "result", "segments": final_data, "profiles": profiles}
             loop.call_soon_threadsafe(queue.put_nowait, json.dumps(msg))
@@ -1444,6 +1720,8 @@ async def diarize_path_endpoint(
     async def event_generator():
         while True:
             msg = await queue.get()
+            if msg is None:
+                break
             yield msg + "\n"
 
             # Stop if we hit a terminal message
@@ -1495,6 +1773,12 @@ async def transcribe_upload(
                     audio, _ = await asyncio.to_thread(
                         librosa.load, tmp.name, sr=16000, mono=True
                     )
+                    
+                    # Normalize to exactly 30 seconds (model expects fixed-length input)
+                    if len(audio) < TARGET_SAMPLES:
+                        audio = np.pad(audio, (0, TARGET_SAMPLES - len(audio)), mode='constant')
+                    else:
+                        audio = audio[:TARGET_SAMPLES]
                     
                     # Transcribe
                     result = await transcribe_audio_async(
@@ -1559,6 +1843,12 @@ async def transcribe_paths(
                 audio, _ = await asyncio.to_thread(
                     librosa.load, str(resolved), sr=16000, mono=True
                 )
+                
+                # Normalize to exactly 30 seconds (model expects fixed-length input)
+                if len(audio) < TARGET_SAMPLES:
+                    audio = np.pad(audio, (0, TARGET_SAMPLES - len(audio)), mode='constant')
+                else:
+                    audio = audio[:TARGET_SAMPLES]
                 
                 # Transcribe
                 result = await transcribe_audio_async(
