@@ -1774,18 +1774,37 @@ async def transcribe_upload(
                         librosa.load, tmp.name, sr=16000, mono=True
                     )
                     
-                    # Normalize to exactly 30 seconds (model expects fixed-length input)
-                    if len(audio) < TARGET_SAMPLES:
-                        audio = np.pad(audio, (0, TARGET_SAMPLES - len(audio)), mode='constant')
-                    else:
-                        audio = audio[:TARGET_SAMPLES]
+                    # Process audio in 30s chunks (model expects fixed-length input)
+                    full_text = ""
+                    total_duration = 0
+                    total_inference = 0
+                    total_tokens = 0
                     
-                    # Transcribe
-                    result = await transcribe_audio_async(
-                        audio, 
-                        language, 
-                        settings.request_timeout
-                    )
+                    chunk_samples = TARGET_SAMPLES  # 30s at 16kHz
+                    for start in range(0, len(audio), chunk_samples):
+                        chunk = audio[start:start + chunk_samples]
+                        
+                        # Pad short final chunk to exactly 30s
+                        if len(chunk) < chunk_samples:
+                            chunk = np.pad(chunk, (0, chunk_samples - len(chunk)), mode='constant')
+                        
+                        result = await transcribe_audio_async(
+                            chunk, 
+                            language, 
+                            settings.request_timeout
+                        )
+                        
+                        full_text += result["text"] + " "
+                        total_duration += result["audio_duration_sec"]
+                        total_inference += result["inference_time_sec"]
+                        total_tokens += result["tokens_generated"]
+                    
+                    result = {
+                        "text": full_text.strip(),
+                        "audio_duration_sec": len(audio) / 16000,
+                        "inference_time_sec": total_inference,
+                        "tokens_generated": total_tokens
+                    }
                     
                     results.append(TranscribeResult(
                         text=result["text"],
@@ -1844,18 +1863,37 @@ async def transcribe_paths(
                     librosa.load, str(resolved), sr=16000, mono=True
                 )
                 
-                # Normalize to exactly 30 seconds (model expects fixed-length input)
-                if len(audio) < TARGET_SAMPLES:
-                    audio = np.pad(audio, (0, TARGET_SAMPLES - len(audio)), mode='constant')
-                else:
-                    audio = audio[:TARGET_SAMPLES]
+                # Process audio in 30s chunks (model expects fixed-length input)
+                full_text = ""
+                total_duration = 0
+                total_inference = 0
+                total_tokens = 0
                 
-                # Transcribe
-                result = await transcribe_audio_async(
-                    audio, 
-                    req.language, 
-                    settings.request_timeout
-                )
+                chunk_samples = TARGET_SAMPLES  # 30s at 16kHz
+                for start in range(0, len(audio), chunk_samples):
+                    chunk = audio[start:start + chunk_samples]
+                    
+                    # Pad short final chunk to exactly 30s
+                    if len(chunk) < chunk_samples:
+                        chunk = np.pad(chunk, (0, chunk_samples - len(chunk)), mode='constant')
+                    
+                    result = await transcribe_audio_async(
+                        chunk, 
+                        req.language, 
+                        settings.request_timeout
+                    )
+                    
+                    full_text += result["text"] + " "
+                    total_duration += result["audio_duration_sec"]
+                    total_inference += result["inference_time_sec"]
+                    total_tokens += result["tokens_generated"]
+                
+                result = {
+                    "text": full_text.strip(),
+                    "audio_duration_sec": len(audio) / 16000,
+                    "inference_time_sec": total_inference,
+                    "tokens_generated": total_tokens
+                }
                 
                 results.append(TranscribeResult(
                     text=result["text"],
