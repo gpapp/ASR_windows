@@ -43,7 +43,7 @@ class Config:
     # Server settings
     server_url: str = "http://127.0.0.1:8000"
     api_key: Optional[str] = None
-    request_timeout: int = 120
+    request_timeout: int = 600
     
     # Audio processing
     sample_rate: int = 16000
@@ -58,6 +58,12 @@ class Config:
     speaker_turn_gap: float = 1.5
     num_speakers: Optional[int] = None
     diarization_threshold: Optional[float] = None
+    window_sec: Optional[float] = None
+    stride_sec: Optional[float] = None
+    min_embed_duration: Optional[float] = None
+    vad_threshold: Optional[float] = None
+    vad_min_speech_duration_ms: Optional[int] = None
+    known_speakers_file: Optional[str] = None
     
     # Batch settings
     batch_size: int = 4
@@ -82,6 +88,12 @@ class Config:
         """Load configuration from environment variables."""
         num_speakers_env = os.getenv("TRANSCRIBE_NUM_SPEAKERS")
         threshold_env = os.getenv("TRANSCRIBE_DIARIZATION_THRESHOLD")
+        window_env = os.getenv("TRANSCRIBE_WINDOW_SEC")
+        stride_env = os.getenv("TRANSCRIBE_STRIDE_SEC")
+        min_embed_env = os.getenv("TRANSCRIBE_MIN_EMBED_DURATION")
+        vad_thresh_env = os.getenv("TRANSCRIBE_VAD_THRESHOLD")
+        vad_min_speech_env = os.getenv("TRANSCRIBE_VAD_MIN_SPEECH_DURATION_MS")
+        known_speakers_env = os.getenv("TRANSCRIBE_KNOWN_SPEAKERS_FILE")
 
         return cls(
             server_url=os.getenv("TRANSCRIBE_SERVER_URL", cls.server_url),
@@ -91,6 +103,12 @@ class Config:
             max_concurrent_requests=int(os.getenv("TRANSCRIBE_MAX_CONCURRENT", cls.max_concurrent_requests)),
             num_speakers=int(num_speakers_env) if num_speakers_env else None,
             diarization_threshold=float(threshold_env) if threshold_env else None,
+            window_sec=float(window_env) if window_env else None,
+            stride_sec=float(stride_env) if stride_env else None,
+            min_embed_duration=float(min_embed_env) if min_embed_env else None,
+            vad_threshold=float(vad_thresh_env) if vad_thresh_env else None,
+            vad_min_speech_duration_ms=int(vad_min_speech_env) if vad_min_speech_env else None,
+            known_speakers_file=known_speakers_env if known_speakers_env else None,
         )
 
 
@@ -310,7 +328,7 @@ class TranscriptionClient:
             if self.config.api_key:
                 headers["X-API-Key"] = self.config.api_key
 
-            extended_timeout = aiohttp.ClientTimeout(total=1800)
+            extended_timeout = aiohttp.ClientTimeout(total=3600)
 
             async with aiohttp.ClientSession(headers=headers, timeout=extended_timeout) as session:
                 payload = {"wav_path": str(Path(wav_path).resolve())}
@@ -318,6 +336,27 @@ class TranscriptionClient:
                     payload["num_speakers"] = self.config.num_speakers
                 if self.config.diarization_threshold is not None:
                     payload["diarization_threshold"] = self.config.diarization_threshold
+                if self.config.vad_threshold is not None:
+                    payload["vad_threshold"] = self.config.vad_threshold
+                if self.config.vad_min_speech_duration_ms is not None:
+                    payload["vad_min_speech_duration_ms"] = self.config.vad_min_speech_duration_ms
+
+                if not self.config.known_speakers_file and os.path.exists("voiceprints.json"):
+                    self.config.known_speakers_file = "voiceprints.json"
+
+                if self.config.known_speakers_file:
+                    try:
+                        with open(self.config.known_speakers_file, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                            known_spk = {}
+                            for name, profile in data.items():
+                                if "embedding" in profile:
+                                    known_spk[name] = profile
+                            if known_spk:
+                                payload["known_speakers"] = known_spk
+                                print(f"[INFO] Loaded {len(known_spk)} voiceprints from {self.config.known_speakers_file}")
+                    except Exception as e:
+                        log.warn(f"Failed to load voiceprints from {self.config.known_speakers_file}: {e}")
 
                 async with session.post(
                     f"{self.config.server_url}/diarize/path",
@@ -672,6 +711,32 @@ async def transcribe_file(
         # Detect speech segments via Diarization endpoint
         log.info("Running diarization on the full audio...")
         diarize_segments, speaker_profiles = await client.diarize_path(temp_wav)
+
+        # Update voiceprints.json with new speakers (those with embeddings)
+        if speaker_profiles:
+            voiceprints_path = Path("voiceprints.json")
+            existing_vp = {}
+            if voiceprints_path.exists():
+                try:
+                    with open(voiceprints_path, 'r', encoding='utf-8') as f:
+                        existing_vp = json.load(f)
+                except:
+                    pass
+            
+            updated = False
+            for name, profile in speaker_profiles.items():
+                if "embedding" in profile and name not in existing_vp:
+                    existing_vp[name] = profile
+                    updated = True
+                    print(f"[INFO] Added new voiceprint: {name}")
+            
+            if updated:
+                try:
+                    with open(voiceprints_path, 'w', encoding='utf-8') as f:
+                        json.dump(existing_vp, f, indent=2, ensure_ascii=False)
+                    print(f"[INFO] Updated voiceprints.json with {len(existing_vp)} speakers")
+                except Exception as e:
+                    log.warn(f"Failed to update voiceprints.json: {e}")
         
         if not diarize_segments:
             log.warn("Diarization returned no segments. Assuming single speaker for fallback.", file=p.name)
@@ -720,8 +785,7 @@ async def transcribe_file(
                         f"  {spk}: pitch={p_info.get('pitch_hz', 0):.0f}Hz "
                         f"(±{p_info.get('pitch_std', 0):.0f}Hz)  "
                         f"energy={p_info.get('energy_rms', 0):.4f}  "
-                        f"speech={p_info.get('total_speech_sec', 0):.0f}s  "
-                        f"gender={p_info.get('gender_hint', '?')}\n"
+                        f"speech={p_info.get('total_speech_sec', 0):.0f}s\n"
                     )
                 f.write("=" * 60 + "\n\n")
 
@@ -886,8 +950,13 @@ Examples:
     
     parser.add_argument(
         "files", 
-        nargs="+", 
-        help="Audio/video files to transcribe"
+        nargs="*", 
+        help="Audio/video files to transcribe (optional if --shutdown is used)"
+    )
+    parser.add_argument(
+        "--shutdown",
+        action="store_true",
+        help="Shutdown the server instead of transcribing files"
     )
     parser.add_argument(
         "--server", "-s",
@@ -934,6 +1003,42 @@ Examples:
         default=None,
         help="Distance threshold for clustering (overrides server default)"
     )
+    parser.add_argument(
+        "--window-sec",
+        type=float,
+        default=None,
+        help="Size of sliding window in seconds for embeddings (e.g. 1.5, 3.0)"
+    )
+    parser.add_argument(
+        "--stride-sec",
+        type=float,
+        default=None,
+        help="Stride step between windows in seconds (e.g. 0.375, 1.5)"
+    )
+    parser.add_argument(
+        "--min-embed-duration",
+        type=float,
+        default=None,
+        help="Minimum segment duration (sec) to include in clustering (e.g. 0.5)"
+    )
+    parser.add_argument(
+        "--vad-threshold",
+        type=float,
+        default=None,
+        help="VAD speech probability cutoff (0.0-1.0)"
+    )
+    parser.add_argument(
+        "--vad-min-speech",
+        type=int,
+        default=None,
+        help="VAD minimum speech chunk length (ms)"
+    )
+    parser.add_argument(
+        "--voiceprints",
+        type=str,
+        default=None,
+        help="Path to JSON file with known voice profiles (embedding-based identification)"
+    )
 
     args = parser.parse_args()
     
@@ -954,6 +1059,38 @@ Examples:
         config.num_speakers = args.num_speakers
     if args.diarization_threshold is not None:
         config.diarization_threshold = args.diarization_threshold
+    if args.window_sec is not None:
+        config.window_sec = args.window_sec
+    if args.stride_sec is not None:
+        config.stride_sec = args.stride_sec
+    if args.min_embed_duration is not None:
+        config.min_embed_duration = args.min_embed_duration
+    if args.vad_threshold is not None:
+        config.vad_threshold = args.vad_threshold
+    if args.vad_min_speech is not None:
+        config.vad_min_speech_duration_ms = args.vad_min_speech
+    if args.voiceprints is not None:
+        config.known_speakers_file = args.voiceprints
+
+    if args.shutdown:
+        async def do_shutdown():
+            headers = {}
+            if config.api_key:
+                headers["X-API-Key"] = config.api_key
+            try:
+                log.info(f"Sending shutdown request to {config.server_url}")
+                async with aiohttp.ClientSession(headers=headers) as session:
+                    async with session.post(f"{config.server_url}/shutdown") as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            log.info(f"Server responded: {data.get('status')}")
+                        else:
+                            log.error(f"Failed to shutdown server: HTTP {resp.status}")
+            except Exception as e:
+                log.error(f"Error shutting down server: {e}")
+        
+        asyncio.run(do_shutdown())
+        sys.exit(0)
 
     # Expand globs and validate files
     input_files = []

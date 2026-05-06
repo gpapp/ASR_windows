@@ -36,6 +36,8 @@ import json
 import librosa
 import onnxruntime as ort
 from sklearn.cluster import AgglomerativeClustering
+from sklearn.metrics.pairwise import cosine_distances
+from scipy.spatial.distance import cosine
 
 TARGET_SAMPLES = 480000  # 30 seconds at 16kHz
 from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, Request, Security
@@ -340,6 +342,9 @@ class ModelState:
         self.get_speech_timestamps = None
         self.tokens: dict[int, str] = {}
         self.token_to_id: dict[str, int] = {}
+        self.pre_computed_prompt_ids: list[int] = []
+        self.pre_computed_eos_id: int = -1
+        self.pre_computed_prompt_array: Optional[np.ndarray] = None
         self.use_dml: bool = False
         self.device: str = "cpu"
         self.status: str = "initializing"
@@ -405,6 +410,15 @@ def load_models(settings: Settings):
     token_to_id = {v: k for k, v in tokens.items()}
     log.info("vocabulary_loaded", token_count=len(tokens))
     
+    # Pre-compute prompt tokens for transcription
+    prompt_tokens = [
+        "<|startofcontext|>", "<|startoftranscript|>", "<|emo:undefined|>",
+        "<|en|>", "<|en|>", "<|pnc|>", "<|noitn|>", "<|notimestamp|>", "<|nodiarize|>",
+    ]
+    pre_computed_prompt_ids = [token_to_id[t] for t in prompt_tokens if t in token_to_id]
+    pre_computed_eos_id = token_to_id.get("<|endoftext|>", -1)
+    pre_computed_prompt_array = np.array([pre_computed_prompt_ids], dtype=np.int64)
+    
     # Determine execution providers
     # Per user request: Cohere ONNX runs best on CPU, not DirectML
     use_dml = False
@@ -439,6 +453,9 @@ def load_models(settings: Settings):
     state.decoder = decoder
     state.tokens = tokens
     state.token_to_id = token_to_id
+    state.pre_computed_prompt_ids = pre_computed_prompt_ids
+    state.pre_computed_eos_id = pre_computed_eos_id
+    state.pre_computed_prompt_array = pre_computed_prompt_array
     state.use_dml = use_dml
     state.device = device
     state.kv_pool = KVCachePool(settings, device)
@@ -535,6 +552,10 @@ def transcribe_audio_sync(
         token_to_id = state.token_to_id
         device = state.device
         
+        # Use pre-computed prompt for default language (en)
+        prompt_ids = state.pre_computed_prompt_ids
+        eos_id = state.pre_computed_eos_id
+        
         # Run encoder
         enc_io = encoder.io_binding()
         enc_io.bind_cpu_input("audio", audio.reshape(1, -1).astype(np.float32))
@@ -546,14 +567,9 @@ def transcribe_audio_sync(
         cross_k_ov = enc_out[0]
         cross_v_ov = enc_out[1]
         
-        # Build prompt
-        lang_token = f"<|{language}|>"
-        prompt_tokens = [
-            "<|startofcontext|>", "<|startoftranscript|>", "<|emo:undefined|>",
-            lang_token, lang_token, "<|pnc|>", "<|noitn|>", "<|notimestamp|>", "<|nodiarize|>",
-        ]
-        prompt_ids = [token_to_id[t] for t in prompt_tokens if t in token_to_id]
-        eos_id = token_to_id.get("<|endoftext|>", -1)
+        # Use pre-computed prompt and eos_id
+        prompt_ids = state.pre_computed_prompt_ids
+        eos_id = state.pre_computed_eos_id
         
         # Get KV cache from pool
         with state.kv_pool.acquire() as kv_cache:
@@ -1047,7 +1063,6 @@ def profile_speakers(
     Pitch is estimated via autocorrelation on 30 ms frames.
     Gender hint: <165 Hz median = male, >=165 Hz = female.
     """
-    import scipy.signal as _sig
 
     sr = sample_rate
     frame_len = int(0.030 * sr)   # 30 ms
@@ -1111,21 +1126,18 @@ def profile_speakers(
                 "pitch_hz": 0.0, "pitch_std": 0.0,
                 "energy_rms": float(np.mean(energies)) if energies else 0.0,
                 "total_speech_sec": total_sec,
-                "gender_hint": "unknown",
             }
             continue
 
         median_f0  = float(np.median(pitches))
         std_f0     = float(np.std(pitches))
         mean_rms   = float(np.mean(energies)) if energies else 0.0
-        gender     = "female" if median_f0 >= 165 else "male"
 
         profiles[spk] = {
             "pitch_hz":        round(median_f0, 1),
             "pitch_std":       round(std_f0, 1),
             "energy_rms":      round(mean_rms, 4),
             "total_speech_sec": round(total_sec, 1),
-            "gender_hint":     gender,
         }
 
     return profiles
@@ -1275,7 +1287,7 @@ async def diarize_path_endpoint(
                     "type": "progress", "step": "Feature Extraction", "completed": i + 1, "total": len(speech_ts)
                 }))
 
-            print(f"[DEBUG] Total windows: {len(all_segments_meta)}, embeddable (>={MIN_EMBED_DURATION}s): {len(all_fbanks)}", flush=True)
+            
 
             if not all_fbanks:
                 fallback_segments = []
@@ -1344,30 +1356,11 @@ async def diarize_path_endpoint(
                 long_labels = np.array([0])
             
             n_clusters = len(set(int(l) for l in long_labels))
-            # Distance diagnostics
-            from sklearn.metrics.pairwise import cosine_distances as _cdist
-            _d = _cdist(raw_embeddings)
-            _u = _d[np.triu_indices_from(_d, k=1)]
-            print(f"[DEBUG] threshold={dist_thresh_val} (num_speakers={n_clusters_val}) -> {n_clusters} clusters from {len(raw_embeddings)} windows", flush=True)
-            print(f"[DEBUG] cosine dist: min={_u.min():.4f} max={_u.max():.4f} mean={_u.mean():.4f} p25={np.percentile(_u,25):.4f} p75={np.percentile(_u,75):.4f}", flush=True)
-            print(f"[DEBUG] Cluster distribution: {dict((int(l), list(long_labels).count(l)) for l in set(long_labels))}", flush=True)
-            
-            # Store for analysis
-            import pickle
-            pickle.dump({
-                'embeddings': raw_embeddings,
-                'labels': long_labels,
-                'distances': _u
-            }, open('debug_diarization.pkl', 'wb'))
-            print("[DEBUG] Saved debug_diarization.pkl", flush=True)
             
             # Voiceprint-based speaker merging
             # SKIP if user forced exact speaker count
             if n_clusters > 1 and n_clusters_val is None:
-                from sklearn.metrics.pairwise import cosine_distances
-                
                 cluster_ids = sorted(set(int(l) for l in long_labels))
-                print(f"[DEBUG] Checking voiceprint merge for {len(cluster_ids)} clusters", flush=True)
                 cluster_avgs = {}
                 for cid in cluster_ids:
                     mask = long_labels == cid
@@ -1378,14 +1371,12 @@ async def diarize_path_endpoint(
             
                 # Debug: print pairwise distances
                 ids = sorted(cluster_avgs.keys())
-                print(f"[DEBUG] Cluster IDs: {ids}", flush=True)
                 for i_idx in range(len(ids)):
                     for j_idx in range(i_idx + 1, len(ids)):
                         id_i, id_j = ids[i_idx], ids[j_idx]
                         dist = cosine_distances(
                             [cluster_avgs[id_i]], [cluster_avgs[id_j]]
                         )[0][0]
-                        print(f"[DEBUG] Dist between {id_i} and {id_j}: {dist:.4f}", flush=True)
             
                 changed = True
                 while changed:
@@ -1409,13 +1400,11 @@ async def diarize_path_endpoint(
                                 cluster_avgs[id_i] = np.mean(raw_embeddings[mask_i], axis=0)
                                 del cluster_avgs[id_j]
                                 changed = True
-                                print(f"[DEBUG] Merged cluster {id_j} into {id_i} (dist={dist:.3f})", flush=True)
                                 break
                     if changed:
                         break
             
                 n_clusters = len(set(int(l) for l in long_labels))
-                print(f"[DEBUG] After voiceprint merge: {n_clusters} clusters", flush=True)
 
             # Compute normalized centroid vector for each raw cluster ID
             cluster_centroids = {}
@@ -1443,7 +1432,6 @@ async def diarize_path_endpoint(
             # Map raw cluster IDs to speaker names (with known speaker matching)
             if req.known_speakers:
                 log.info("known_speakers_received", keys=list(req.known_speakers.keys()))
-                from scipy.spatial.distance import cosine
                 
                 # Temporarily populate raw cluster IDs as speaker names
                 for seg in all_segments_meta:
@@ -1493,7 +1481,6 @@ async def diarize_path_endpoint(
                             # Same known speaker, very close matches - merge
                             dist_between = cosine(match1["centroid"], match2["centroid"])
                             if dist_between < 0.2:
-                                print(f"[DEBUG] Merging clusters {raw_spk1} and {raw_spk2} (both match '{match1['name']}', dist: {dist_between:.4f})", flush=True)
                                 long_labels[long_labels == raw_spk2] = raw_spk1
                                 merged_clusters.add(raw_spk2)
 
@@ -1522,10 +1509,8 @@ async def diarize_path_endpoint(
 
                     if best_match and best_dist <= match_thresh:
                         speaker_map[raw_name] = best_match
-                        print(f"[DEBUG] Cluster {raw_spk} matched to known speaker '{best_match}' (dist: {best_dist:.4f})", flush=True)
                     else:
                         speaker_map[raw_name] = f"SPEAKER{unknown_idx}"
-                        print(f"[DEBUG] Cluster {raw_spk} no match (best: {best_match}, dist: {best_dist:.4f})", flush=True)
                         unknown_idx += 1
 
                 # Update segments with final speaker names
@@ -1616,11 +1601,6 @@ async def diarize_path_endpoint(
 
             # Apply known speaker matching AFTER relabeling
             if req.known_speakers:
-                from scipy.spatial.distance import cosine
-                
-                print(f"[DEBUG] Post-relabel matching: {len(merged_segments)} segments, {len(all_segments_meta)} meta entries", flush=True)
-                print(f"[DEBUG] cluster_centroids keys: {list(cluster_centroids.keys())[:5]}...", flush=True)
-                
                 # Compute centroid for each final speaker
                 speaker_centroids = {}
                 for seg in merged_segments:
@@ -1637,10 +1617,6 @@ async def diarize_path_endpoint(
                                 raw_id = meta["speaker_raw"]
                                 if raw_id in cluster_centroids:
                                     speaker_centroids[spk].append(np.array(cluster_centroids[raw_id]))
-                
-                print(f"[DEBUG] speaker_centroids computed: {list(speaker_centroids.keys())}", flush=True)
-                for spk, emb_list in speaker_centroids.items():
-                    print(f"[DEBUG]   {spk}: {len(emb_list)} embeddings", flush=True)
                 
                 # Match each speaker to known voiceprints
                 match_thresh = 0.4
@@ -1666,7 +1642,6 @@ async def diarize_path_endpoint(
                             best_match = known_name
                     
                     if best_match and best_dist <= match_thresh:
-                        print(f"[DEBUG] Final speaker '{spk}' matched to '{best_match}' (dist: {best_dist:.4f})", flush=True)
                         # Update all segments with this speaker
                         for seg in merged_segments:
                             if seg["speaker"] == spk:
@@ -1674,18 +1649,6 @@ async def diarize_path_endpoint(
                         # Update profiles
                         profiles[best_match] = profiles.pop(spk)
                         profiles[best_match]["matched_from"] = spk
-
-            for spk, p in sorted(profiles.items()):
-                print(
-                    f"[PROFILE] {spk}: pitch={p['pitch_hz']}Hz±{p['pitch_std']}Hz  "
-                    f"energy={p['energy_rms']}  speech={p['total_speech_sec']}s  "
-                    f"gender={p['gender_hint']}",
-                    flush=True
-                )
-
-            print(f"[DEBUG] merged: {len(all_segments_meta)} windows -> {len(merged_segments)} segments", flush=True)
-            for i, ms in enumerate(merged_segments[:30]):
-                print(f"[DEBUG]   seg{i:02d} {ms['speaker']:12s} {ms['start']:7.2f}s - {ms['end']:7.2f}s", flush=True)
 
             loop.call_soon_threadsafe(queue.put_nowait, json.dumps({
                 "type": "progress", "step": "Clustering", "completed": 1, "total": 1
