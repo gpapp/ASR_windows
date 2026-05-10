@@ -5,3 +5,9 @@
 
 cohere-diarization/samples
 granite-diarization/samples
+
+
+.vscode/settings.json
+*/*.log
+
+models/*
