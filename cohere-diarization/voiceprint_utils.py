@@ -114,7 +114,10 @@ def extract_embedding(waveform, sample_rate, embedding_session: ort.InferenceSes
         if chunk_duration >= 1.5:
             if w.shape[-1] < target_length:
                 w = torch.nn.functional.pad(w, (0, target_length - w.shape[-1]))
-            all_fbanks.append(extract_fbank(w, sample_rate))
+            fb = extract_fbank(w, sample_rate)
+            # Apply CMN per sub-segment (critical for ECAPA-TDNN)
+            fb = fb - fb.mean(dim=1, keepdim=True)
+            all_fbanks.append(fb)
 
     if not all_fbanks:
         raise ValueError("No embeddable segments (need >=1.5s)")

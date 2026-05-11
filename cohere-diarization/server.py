@@ -83,7 +83,7 @@ class Settings(BaseSettings):
     port: int = 8000
     workers: int = 2
     request_timeout: int = 120
-    max_request_size_mb: int = 100
+    max_request_size_mb: int = 200
     
     # Batch settings
     max_batch_size: int = 10
@@ -104,13 +104,13 @@ class Settings(BaseSettings):
     rate_limit: str = "30/minute"
     
     # Diarization settings
-    diarization_threshold: float = Field(default=0.20, description="Distance threshold for AgglomerativeClustering (cosine metric) - P75 of earnings22 distances")
+    diarization_threshold: float = Field(default=0.35, description="Distance threshold for AgglomerativeClustering - higher = fewer clusters")
     vad_threshold: float = Field(default=0.5, description="Speech probability cutoff (0.0 to 1.0) for Silero VAD")
     vad_min_speech_duration_ms: int = Field(default=250, description="Minimum speech chunk length (ms) for Silero VAD")
     
     # Embedding model settings
-    embedding_model_repo: str = Field(default="onnx-community/wespeaker-voxceleb-resnet34-LM", description="HuggingFace repo for the embedding ONNX model")
-    embedding_model_filename: str = Field(default="onnx/model.onnx", description="Filename of the ONNX embedding model")
+    embedding_model_repo: str = Field(default="Wespeaker/wespeaker-ecapa-tdnn512-LM", description="HuggingFace repo for the embedding ONNX model")
+    embedding_model_filename: str = Field(default="voxceleb_ECAPA512_LM.onnx", description="Filename of the ONNX embedding model")
     
     # Cache settings
     kv_cache_pool_size: int = 4
@@ -462,20 +462,53 @@ def load_models(settings: Settings):
 
     if settings.enable_diarization:
         log.info("loading_vad_model")
-        try:
+        
+        # First try: ONNX with DirectML
+        vad_onnx_path = str(Path(torch.hub.get_dir()) / "silero_vad" / "silero_vad.onnx")
+        
+        if Path(vad_onnx_path).exists():
+            try:
+                vad_providers = ["DMLExecutionProvider", "CPUExecutionProvider"]
+                state.vad_session = ort.InferenceSession(vad_onnx_path, opts, providers=vad_providers)
+                state.use_vad_onnx = True
+                state.vad_model = None
+                
+                # Load utils for timestamps (they work with ONNX model too)
+                _, utils = torch.hub.load(
+                    repo_or_dir='snakers4/silero-vad',
+                    model='silero_vad',
+                    force_reload=False,
+                    onnx=True
+                )
+                state.get_speech_timestamps = utils[0]
+                log.info("vad_model_loaded_onnx_dml")
+            except Exception as e:
+                log.warning("vad_onnx_dml_failed", error=str(e))
+                state.vad_session = None
+                state.use_vad_onnx = False
+                model, utils = torch.hub.load(
+                    repo_or_dir='snakers4/silero-vad',
+                    model='silero_vad',
+                    force_reload=False,
+                    onnx=False
+                )
+                state.vad_model = model
+                state.get_speech_timestamps = utils[0]
+                log.info("vad_model_loaded_pytorch")
+        else:
+            # Fallback to PyTorch
             model, utils = torch.hub.load(
                 repo_or_dir='snakers4/silero-vad',
                 model='silero_vad',
                 force_reload=False,
                 onnx=False
             )
-            # Ensure VAD runs on CPU or the requested device
             model = model.to(torch.device("cpu"))
             state.vad_model = model
+            state.vad_session = None
+            state.use_vad_onnx = False
             state.get_speech_timestamps = utils[0]
-            log.info("vad_model_loaded")
-        except Exception as e:
-            log.error("vad_model_failed", error=str(e))
+            log.info("vad_model_loaded_pytorch")
 
         log.info("loading_embedding_model")
         try:
@@ -951,7 +984,10 @@ def get_rate_limit_decorator():
 
 
 def extract_fbank(waveform: torch.Tensor, sample_rate: int = 16000) -> torch.Tensor:
-    """Extracts 80-dim log-mel filterbanks from waveform matching WeSpeaker expectations."""
+    """Extracts 80-dim log-mel filterbanks from waveform matching WeSpeaker expectations.
+    
+    Note: CMN is NOT applied here - it's applied per sub-segment in extract_embedding.
+    """
     # Ensure waveform is 2D: [1, T]
     if waveform.dim() == 1:
         waveform = waveform.unsqueeze(0)
@@ -960,17 +996,19 @@ def extract_fbank(waveform: torch.Tensor, sample_rate: int = 16000) -> torch.Ten
     waveform = waveform * 32768.0
 
     # torchaudio.compliance.kaldi.fbank expects [B, T]
-    # Default Kaldi settings: frame_length=25, frame_shift=10, num_mel_bins=80
     fbank = torchaudio.compliance.kaldi.fbank(
         waveform,
         num_mel_bins=80,
         frame_length=25,
         frame_shift=10,
         energy_floor=0.0,
-        sample_frequency=sample_rate
+        sample_frequency=sample_rate,
+        dither=0.0,
+        window_type='hamming'
     )
-    # fbank shape is [frames, 80], we want to return [1, frames, 80] for batching
-    return fbank.unsqueeze(0)
+    
+    # NO CMN here - will be applied per sub-segment window
+    return fbank.unsqueeze(0)  # [1, frames, 80]
 
 
 def run_vad_chunked(waveform_tensor, vad_model, get_speech_timestamps, sample_rate=16000, 
@@ -1000,6 +1038,63 @@ def run_vad_chunked(waveform_tensor, vad_model, get_speech_timestamps, sample_ra
                 "start": t["start"] + start / sample_rate,
                 "end": t["end"] + start / sample_rate
             })
+    
+    if not all_speech_ts:
+        return []
+    
+    # Merge overlapping segments
+    all_speech_ts.sort(key=lambda x: x["start"])
+    merged = [all_speech_ts[0]]
+    for seg in all_speech_ts[1:]:
+        if seg["start"] <= merged[-1]["end"] + 0.1:
+            merged[-1]["end"] = max(merged[-1]["end"], seg["end"])
+        else:
+            merged.append(seg)
+    
+    return merged
+
+
+def run_vad_onnx(waveform_tensor, vad_session, sample_rate=16000, 
+                 chunk_duration=30, overlap=5, threshold=0.5, min_speech_duration_ms=250):
+    """Run VAD using ONNX model with DirectML acceleration."""
+    import torch
+    
+    total_samples = waveform_tensor.shape[-1]
+    chunk_samples = int(chunk_duration * sample_rate)
+    stride_samples = int((chunk_duration - overlap) * sample_rate)
+    
+    all_speech_ts = []
+    
+    for start in range(0, total_samples, stride_samples):
+        end = min(start + chunk_samples, total_samples)
+        chunk = waveform_tensor[..., start:end]
+        
+        # Convert to numpy and prepare input
+        chunk_np = chunk.squeeze(0).numpy().astype(np.float32)
+        
+        # Silero ONNX expects [batch, time] input
+        input_tensor = np.expand_dims(chunk_np, axis=0)
+        
+        # Run inference
+        out = vad_session.run(None, {"input": input_tensor})
+        probs = out[0][0]  # [time]
+        
+        # Find speech segments
+        speech_mask = probs > threshold
+        
+        # Find contiguous segments
+        if speech_mask.any():
+            indices = np.where(np.diff(np.concatenate([[False], speech_mask, [False]])))[0]
+            for i in range(0, len(indices), 2):
+                if i + 1 < len(indices):
+                    seg_start = indices[i] / 100  # 100 Hz output
+                    seg_end = indices[i + 1] / 100
+                    seg_dur_ms = (seg_end - seg_start) * 1000
+                    if seg_dur_ms >= min_speech_duration_ms:
+                        all_speech_ts.append({
+                            "start": seg_start + start / sample_rate,
+                            "end": seg_end + start / sample_rate
+                        })
     
     if not all_speech_ts:
         return []
@@ -1215,7 +1310,20 @@ async def diarize_path_endpoint(
             vad_min_dur_val = req.vad_min_speech_duration_ms if req.vad_min_speech_duration_ms is not None else settings.vad_min_speech_duration_ms
 
             audio_duration = waveform_tensor.shape[-1] / 16000
-            if audio_duration > 60:
+            
+            # Use ONNX VAD with DirectML if available, otherwise PyTorch
+            if getattr(state, 'use_vad_onnx', False) and getattr(state, 'vad_session', None):
+                log.info("vad_using_onnx_dml", duration=audio_duration)
+                speech_ts = run_vad_onnx(
+                    waveform_tensor,
+                    state.vad_session,
+                    sample_rate=16000,
+                    chunk_duration=30,
+                    overlap=5,
+                    threshold=vad_thresh_val,
+                    min_speech_duration_ms=vad_min_dur_val
+                )
+            elif audio_duration > 60:
                 log.info("vad_using_chunked", duration=audio_duration)
                 speech_ts = run_vad_chunked(
                     waveform_tensor,
@@ -1308,9 +1416,16 @@ async def diarize_path_endpoint(
                 "type": "progress", "step": "Embedding Extraction", "completed": 0, "total": 1
             }))
 
-            max_len = max(fb.shape[1] for fb in all_fbanks)
-            padded_fbanks = []
+            # Apply CMN per sub-segment (critical for ECAPA-TDNN)
+            cmn_fbanks = []
             for fb in all_fbanks:
+                # fb shape: [1, frames, 80] -> apply CMN per window
+                fb_cmn = fb - fb.mean(dim=1, keepdim=True)
+                cmn_fbanks.append(fb_cmn)
+
+            max_len = max(fb.shape[1] for fb in cmn_fbanks)
+            padded_fbanks = []
+            for fb in cmn_fbanks:
                 if fb.shape[1] < max_len:
                     fb = torch.nn.functional.pad(fb, (0, 0, 0, max_len - fb.shape[1]))
                 padded_fbanks.append(fb)
@@ -1320,7 +1435,7 @@ async def diarize_path_endpoint(
             raw_embeddings = []
             batch_size = 32
             for i in range(0, len(batch_fbanks), batch_size):
-                out = state.embedding_session.run(None, {"input_features": batch_fbanks[i:i+batch_size]})
+                out = state.embedding_session.run(None, {"feats": batch_fbanks[i:i+batch_size]})
                 raw_embeddings.append(out[0])
 
             raw_embeddings = np.concatenate(raw_embeddings, axis=0)  # [N_long, D]
@@ -1356,6 +1471,20 @@ async def diarize_path_endpoint(
                 long_labels = np.array([0])
             
             n_clusters = len(set(int(l) for l in long_labels))
+
+            # Cap at 15 clusters to preserve granularity before merging
+            max_clusters = 15
+            if n_clusters > max_clusters:
+                print(f"WARNING: {n_clusters} clusters created, capping at {max_clusters}")
+                # Re-cluster with exact number
+                clusterer = AgglomerativeClustering(
+                    n_clusters=max_clusters,
+                    metric="cosine",
+                    linkage="average"
+                )
+                if len(raw_embeddings) > 1:
+                    long_labels = clusterer.fit_predict(raw_embeddings)
+                n_clusters = max_clusters
             
             # Voiceprint-based speaker merging
             # SKIP if user forced exact speaker count
@@ -1440,8 +1569,8 @@ async def diarize_path_endpoint(
                 # Match RAW profiles to known speakers
                 speaker_map: dict[str, str] = {}
                 unknown_idx = 1
-                match_thresh = 0.4
-                close_match_thresh = 0.15  # If two clusters match same known speaker within this, merge them
+                match_thresh = 0.03  # Stricter - only match if very similar
+                close_match_thresh = 0.1  # If two clusters match same known speaker within this, merge them
 
                 # First pass: match all clusters
                 cluster_matches = {}
@@ -1600,6 +1729,7 @@ async def diarize_path_endpoint(
             merged_segments, profiles = relabel_by_pitch(merged_segments, profiles)
 
             # Apply known speaker matching AFTER relabeling
+            # Only match if we're very confident (distance < 0.1 = confidence > 0.8)
             if req.known_speakers:
                 # Compute centroid for each final speaker
                 speaker_centroids = {}
@@ -1619,51 +1749,316 @@ async def diarize_path_endpoint(
                                     speaker_centroids[spk].append(np.array(cluster_centroids[raw_id]))
                 
                 # Match each speaker to known voiceprints
-                match_thresh = 0.4
+                # Only match if distance < 0.12
+                match_thresh = 0.16
+
+                print(f"=== DEBUG SPEAKER MATCHING ===")
+                print(f"Cluster speakers: {list(speaker_centroids.keys())}")
+                print(f"Known speakers: {list(req.known_speakers.keys()) if req.known_speakers else 'None'}")
+
+                # Compute all possible matches for each cluster speaker
+                all_matches = {}  # spk -> [(name, distance, confidence), ...]
+                debug_matches = {}
+
                 for spk, emb_list in speaker_centroids.items():
                     if not emb_list:
                         continue
-                    
+
                     centroid = np.mean(emb_list, axis=0)
                     norm = np.linalg.norm(centroid)
                     if norm > 0:
                         centroid = centroid / norm
-                    
-                    best_match = None
-                    best_dist = float('inf')
-                    
+
+                    # Get cluster's pitch and energy from profiles
+                    cluster_pitch = profiles.get(spk, {}).get("pitch_hz", 0) or 0
+                    cluster_energy = profiles.get(spk, {}).get("energy_rms", 0) or 0
+
+                    matches = []
+                    debug_distances = {}
                     for known_name, known_prof in req.known_speakers.items():
                         if "embedding" not in known_prof:
                             continue
+
+                        # Embedding distance
                         emb_dist = cosine(centroid, known_prof["embedding"])
-                        
-                        if emb_dist < best_dist:
-                            best_dist = emb_dist
-                            best_match = known_name
+
+                        # Pitch distance (normalize to 0-1 range, 50Hz difference = 1.0)
+                        known_pitch = known_prof.get("pitch_hz", 0) or 0
+                        pitch_dist = abs(cluster_pitch - known_pitch) / 50.0 if cluster_pitch > 0 and known_pitch > 0 else 0.5
+
+                        # Energy distance (normalize, 0.05 difference = 1.0)
+                        known_energy = known_prof.get("energy_rms", 0) or 0
+                        energy_dist = abs(cluster_energy - known_energy) / 0.05 if cluster_energy > 0 and known_energy > 0 else 0.5
+
+                        # Combined distance: 70% embedding + 20% pitch + 10% energy
+                        # If embedding is close (< 0.15), trust it - pitch/energy vary too much with CMN
+                        if emb_dist < 0.15:
+                            combined_dist = emb_dist  # Pure embedding match
+                        else:
+                            combined_dist = 0.7 * emb_dist + 0.2 * min(pitch_dist, 1.0) + 0.1 * min(energy_dist, 1.0)
+
+                        conf = max(0, 1 - (combined_dist / 0.5))
+                        matches.append((known_name, combined_dist, conf))
+                        debug_distances[known_name] = {
+                            "emb_dist": round(float(emb_dist), 3),
+                            "pitch_dist": round(pitch_dist, 3),
+                            "energy_dist": round(energy_dist, 3),
+                            "combined": round(combined_dist, 3),
+                            "conf": round(conf, 3)
+                        }
+
+                    # Sort by distance ascending (best match = lowest distance)
+                    matches.sort(key=lambda x: x[1])
+                    all_matches[spk] = matches
+                    debug_matches[spk] = debug_distances
+
+                    print(f"Cluster '{spk}' (pitch={cluster_pitch:.0f}Hz, energy={cluster_energy:.3f}) matches: {debug_distances}")
+
+                print("=== END DEBUG ===")
+
+                # Apply best match if distance below threshold, store alternatives
+                for spk, emb_list in speaker_centroids.items():
+                    if not emb_list or spk not in all_matches:
+                        continue
+
+                    matches = all_matches[spk]
+                    if not matches:
+                        continue
+
+                    best_match, best_dist, best_conf = matches[0]
                     
-                    if best_match and best_dist <= match_thresh:
+                    # Check if it's a clear winner
+                    clear_winner = True
+                    if len(matches) > 1:
+                        second_dist = matches[1][1]
+                        gap = second_dist - best_dist
+                        if gap < 0.02:
+                            # When gap is small, prefer speaker with more training data
+                            first_dur = req.known_speakers.get(matches[0][0], {}).get("total_speech_sec", 0)
+                            second_dur = req.known_speakers.get(matches[1][0], {}).get("total_speech_sec", 0)
+                            
+                            # If best has significantly more data, use it despite small gap
+                            if first_dur > second_dur * 2 and best_dist < 0.05:
+                                clear_winner = True
+                                print(f"  -> Using {matches[0][0]} (more training data: {first_dur:.0f}s vs {second_dur:.0f}s)")
+                            else:
+                                clear_winner = False
+
+                    # Debug: show why this match was chosen
+                    print(f"Cluster '{spk}' -> best_match='{best_match}' best_dist={best_dist:.3f} match_thresh={match_thresh:.3f} clear_winner={clear_winner} -> {'MATCH' if best_dist <= match_thresh and clear_winner else 'NO MATCH'}")
+
+                    # Store alternatives in each segment
+                    alternatives = []
+                    for name, dist, conf in matches[1:4]:  # Top 3 alternatives
+                        if conf >= 0.3:  # Only include if >30% confident
+                            alternatives.append({"speaker": name, "confidence": round(conf, 2)})
+
+                    if best_match and best_dist <= match_thresh and clear_winner:
                         # Update all segments with this speaker
                         for seg in merged_segments:
                             if seg["speaker"] == spk:
                                 seg["speaker"] = best_match
+                                seg["alternatives"] = alternatives
+                                # Store debug for logging and output
+                                seg["debug"] = {"from_cluster": spk, "confidence": best_conf, "distances": debug_matches[spk]}
                         # Update profiles
                         profiles[best_match] = profiles.pop(spk)
                         profiles[best_match]["matched_from"] = spk
+                        profiles[best_match]["match_confidence"] = best_conf
+
+            # Post-match merging: combine clusters that both matched to the same speaker
+            # This handles cases where one speaker's voice was split into multiple clusters
+            speaker_to_clusters = {}
+            for spk, matches_list in all_matches.items():
+                if not matches_list:
+                    continue
+                best_match, best_dist, _ = matches_list[0]
+                if best_match and best_dist <= match_thresh:
+                    if best_match not in speaker_to_clusters:
+                        speaker_to_clusters[best_match] = []
+                    speaker_to_clusters[best_match].append(spk)
+
+            # Merge clusters with same speaker match
+            for speaker, cluster_list in speaker_to_clusters.items():
+                if len(cluster_list) > 1:
+                    print(f"MERGING: {cluster_list} -> {speaker}")
+                    primary = cluster_list[0]
+                    for extra in cluster_list[1:]:
+                        # Update all segments from extra cluster to primary speaker
+                        for seg in merged_segments:
+                            if seg["speaker"] == extra:
+                                seg["speaker"] = speaker
+                        # Merge profiles
+                        if extra in profiles and primary in profiles:
+                            profiles[primary]["speech_sec"] = profiles[primary].get("speech_sec", 0) + profiles[extra].get("speech_sec", 0)
+                            profiles[primary]["segment_count"] = profiles[primary].get("segment_count", 0) + profiles[extra].get("segment_count", 0)
+                            del profiles[extra]
+
+            # Additional merge: clusters with similar distance profiles to known speakers
+            # This catches cases where two clusters don't both meet threshold but are same speaker
+            cluster_ids = list(all_matches.keys())
+            merged_already = set()
+            for i in range(len(cluster_ids)):
+                if cluster_ids[i] in merged_already:
+                    continue
+                for j in range(i + 1, len(cluster_ids)):
+                    if cluster_ids[j] in merged_already:
+                        continue
+                    # Compare distance vectors
+                    matches_i = all_matches[cluster_ids[i]]
+                    matches_j = all_matches[cluster_ids[j]]
+                    if not matches_i or not matches_j:
+                        continue
+                    # Build distance vectors for same speakers
+                    dist_vec_i = {m[0]: m[1] for m in matches_i}
+                    dist_vec_j = {m[0]: m[1] for m in matches_j}
+                    common_speakers = set(dist_vec_i.keys()) & set(dist_vec_j.keys())
+                    if len(common_speakers) >= 3:
+                        # Check if distances are similar (within 0.05)
+                        max_diff = max(abs(dist_vec_i[s] - dist_vec_j[s]) for s in common_speakers)
+                        if max_diff < 0.05:
+                            print(f"PROFILE MERGE: {cluster_ids[i]} and {cluster_ids[j]} (similar profiles)")
+                            # Merge j into i
+                            target_spk = cluster_ids[i]
+                            for seg in merged_segments:
+                                if seg["speaker"] == cluster_ids[j]:
+                                    seg["speaker"] = target_spk
+                            if cluster_ids[j] in profiles and target_spk in profiles:
+                                profiles[target_spk]["speech_sec"] = profiles[target_spk].get("speech_sec", 0) + profiles[cluster_ids[j]].get("speech_sec", 0)
+                                profiles[target_spk]["segment_count"] = profiles[target_spk].get("segment_count", 0) + profiles[cluster_ids[j]].get("segment_count", 0)
+                                del profiles[cluster_ids[j]]
+                            merged_already.add(cluster_ids[j])
 
             loop.call_soon_threadsafe(queue.put_nowait, json.dumps({
                 "type": "progress", "step": "Clustering", "completed": 1, "total": 1
             }))
 
-            # Format final response — include profiles so client can write a header
-            final_data = [
-                {
+            # Compute confidence for each segment based on embedding distances to all cluster centroids
+            # For each embeddable window: compute distance to ALL centroids, measure assignment clarity
+            # Clarity = distance_to_assigned / distance_to_2nd_closest (lower = clearer assignment)
+
+            # First compute per-window distances to centroids
+            if cluster_centroids and raw_embeddings is not None:
+                centroid_arrays = {cid: np.array(centroid) for cid, centroid in cluster_centroids.items()}
+
+                # For each embeddable window, store distances to all centroids
+                for idx, (meta_idx, label) in enumerate(zip(embeddable_indices, long_labels)):
+                    if meta_idx < len(raw_embeddings):
+                        emb = raw_embeddings[meta_idx]
+                        all_dists = {}
+                        for cid, centroid in centroid_arrays.items():
+                            dist = cosine(emb, centroid)
+                            all_dists[cid] = dist
+
+                        # Get sorted distances to measure clarity
+                        sorted_dists = sorted(all_dists.values())
+                        assigned_dist = all_dists.get(int(label), 1.0)
+
+                        # Clarity: ratio of assigned distance to 2nd closest (lower = more confident)
+                        if len(sorted_dists) > 1:
+                            second_closest = sorted_dists[1]
+                            clarity = assigned_dist / second_closest if second_closest > 0 else 0.0
+                        else:
+                            clarity = 0.0  # Only one cluster
+
+                        # Store in metadata: distance to assigned cluster and clarity score
+                        all_segments_meta[meta_idx]["assigned_dist"] = assigned_dist
+                        all_segments_meta[meta_idx]["clarity"] = min(1.0, clarity)
+                        all_segments_meta[meta_idx]["all_dists"] = all_dists
+
+            # Now compute segment-level confidence
+            segment_confidences = []
+            for seg in merged_segments:
+                seg_start = seg["start"]
+                seg_end = seg["end"]
+
+                clarities = []
+                assigned_dists = []
+                window_count = 0
+                embeddable_count = 0
+                speaker_consistency = {}  # count per speaker in this segment
+
+                for meta in all_segments_meta:
+                    if meta["start"] >= seg_start - 0.1 and meta["end"] <= seg_end + 0.1:
+                        window_count += 1
+                        if "speaker_raw" in meta:
+                            embeddable_count += 1
+                            raw_spk = meta["speaker_raw"]
+                            speaker_consistency[raw_spk] = speaker_consistency.get(raw_spk, 0) + 1
+
+                            # Collect clarity and distance if available
+                            if "clarity" in meta:
+                                clarities.append(meta["clarity"])
+                            if "assigned_dist" in meta:
+                                assigned_dists.append(meta["assigned_dist"])
+
+                # Confidence components:
+                # 1. Clarity score (average assignment clarity) - lower ratio = clearer
+                clarity_conf = 0.5  # default
+                if clarities:
+                    avg_clarity = sum(clarities) / len(clarities)
+                    # Convert clarity ratio to confidence: 0.0 = perfect, 1.0 = ambiguous
+                    # confidence = 1 - clarity (so high clarity = high confidence)
+                    clarity_conf = max(0, 1 - avg_clarity)
+
+                # 2. Embedding distance to centroid (closer = higher confidence)
+                dist_conf = 0.5  # default
+                if assigned_dists:
+                    avg_dist = sum(assigned_dists) / len(assigned_dists)
+                    # Convert distance to confidence: 0.5 is max expected, scale to 0-1
+                    dist_conf = max(0, 1 - (avg_dist / 0.5))
+
+                # 3. Speaker consistency (do all windows agree?)
+                consistency_conf = 0.5
+                if speaker_consistency:
+                    max_count = max(speaker_consistency.values())
+                    total = sum(speaker_consistency.values())
+                    consistency_conf = max_count / total if total > 0 else 0.5
+
+                # 4. Duration factor (longer segments = more reliable)
+                seg_dur = seg_end - seg_start
+                dur_conf = min(1.0, seg_dur / 5.0)  # 5+ seconds = full confidence
+
+                # Aggregate: weighted combination
+                # Weight clarity and distance more heavily
+                final_conf = (
+                    clarity_conf * 0.3 +
+                    dist_conf * 0.3 +
+                    consistency_conf * 0.25 +
+                    dur_conf * 0.15
+                )
+
+                # Boost if known speaker matching (inferred from profiles)
+                if req.known_speakers and seg["speaker"] in req.known_speakers:
+                    final_conf = min(1.0, final_conf + 0.15)  # Known speaker gets boost
+
+                segment_confidences.append(final_conf)
+
+            # Format final response — include profiles, confidence, and alternatives
+            final_data = []
+            for i, seg in enumerate(merged_segments):
+                if seg["end"] <= seg["start"]:
+                    continue
+                seg_data = {
                     "start": round(float(seg["start"]), 3),
                     "end": round(float(seg["end"]), 3),
-                    "speaker": seg["speaker"]
+                    "speaker": seg["speaker"],
+                    "confidence": round(segment_confidences[i], 3) if i < len(segment_confidences) else 0.5
                 }
-                for seg in merged_segments if seg["end"] > seg["start"]
-            ]
-            
+                # Add alternatives if present
+                if "alternatives" in seg and seg["alternatives"]:
+                    seg_data["alternatives"] = seg["alternatives"]
+                final_data.append(seg_data)
+
+            # Debug: log each segment's assignment
+            for i, seg in enumerate(merged_segments):
+                debug = seg.get("debug", {})
+                conf = segment_confidences[i] if i < len(segment_confidences) else 0.5
+                print(f"SEGMENT {seg['start']:.1f}-{seg['end']:.1f}: assigned='{seg['speaker']}' conf={conf:.2f}")
+
+            # Ensure sorted by start time
+            final_data.sort(key=lambda x: x["start"])
+
             unique_speakers = list(set(s["speaker"] for s in final_data))
             log.info("diarization_complete", unique_speakers=unique_speakers, num_segments=len(final_data))
 

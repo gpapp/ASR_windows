@@ -1,32 +1,33 @@
 # Core dependencies
-fastapi>=0.104.0
-uvicorn>=0.24.0
-pydantic>=2.0.0
-pydantic-settings>=2.0.0
-numpy>=1.24.0
-librosa>=0.10.0
-onnxruntime>=1.16.0
-huggingface-hub>=0.23.0
+fastapi
+uvicorn
+pydantic
+pydantic-settings
+numpy
+librosa
+onnxruntime
+onnxruntime-directml
+huggingface-hub
 
 # Diarization
-scikit-learn>=1.4.2
-torchaudio>=2.4.1
-torch>=2.4.1
+scikit-learn
+torchaudio
+torch
 
 # Async HTTP client
 python-multipart
-aiohttp>=3.9.0
+aiohttp
 
 # Logging
-structlog>=23.2.0
+structlog
 
 # Progress bars
-tqdm>=4.66.0
+tqdm
 
 # Optional: Metrics
-prometheus-client>=0.19.0
+prometheus-client
 
 # Optional: Rate limiting
-slowapi>=0.1.9
+slowapi
 
 python-dotenv

@@ -10,9 +10,22 @@ if not exist ".venv\Scripts\python.exe" (
     exit /b 1
 )
 
+:: Default options - use voiceprints from parent folder if exists
+set DEFAULT_ARGS=--diarization-threshold 0.5
+set VOICEPRINTS_ARG=
+
+if exist "voiceprints.json" (
+    set VOICEPRINTS_ARG=--voiceprints "%~dp0voiceprints.json"
+) else if exist "..\voiceprints.json" (
+    set VOICEPRINTS_ARG=--voiceprints "..\voiceprints.json"
+)
+
 if "%~1"=="" (
     echo Drop audio or video files onto this batch file to transcribe them.
     echo Supported formats: .mp3 .mp4 .wav .m4a .flac .mov .mkv .avi .webm .ogg
+    echo.
+    echo Using voiceprints for speaker recognition if available.
+    echo Default: 4 speakers, strict clustering threshold
     pause
     exit /b 0
 )
@@ -35,8 +48,8 @@ powershell -Command "try { $r = Invoke-WebRequest -Uri 'http://127.0.0.1:8000/he
 if %errorlevel% neq 0 goto wait_loop
 
 :run
-echo [INFO] Server ready. Transcribing files...
-.venv\Scripts\python.exe transcribe.py %*
+echo [INFO] Server ready. Transcribing with voiceprints (4 speakers, threshold 0.2)...
+.venv\Scripts\python.exe transcribe.py %DEFAULT_ARGS% %VOICEPRINTS_ARG% %*
 
 echo.
 echo [INFO] Done.

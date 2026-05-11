@@ -246,6 +246,7 @@ def cmd_extract(args):
             speaker_name=args.speaker,
             output_dir=args.output,
             min_duration=args.min_duration,
+            min_confidence=args.min_confidence,
         )
     elif args.start and args.end:
         from voiceprint_utils import ensure_wav, load_audio_segment
@@ -750,6 +751,7 @@ def main():
     p_extract.add_argument("--vad-min-speech", type=int, default=250, help="VAD min speech duration (ms)")
     p_extract.add_argument("--match-threshold", type=float, default=0.4, help="Voiceprint match threshold (cosine distance)")
     p_extract.add_argument("--single-speaker-threshold", type=float, default=0.8, help="Min ratio of windows matching dominant speaker (0.0-1.0)")
+    p_extract.add_argument("--min-confidence", type=float, default=0.0, help="Minimum confidence threshold (0-1). Lower quality segments are skipped.")
     p_extract.set_defaults(func=cmd_extract)
 
     # reassign subcommand

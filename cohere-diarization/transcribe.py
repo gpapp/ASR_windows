@@ -501,12 +501,14 @@ class TranscriptWriter:
         self.last_end = 0.0
     
     def add_segment(
-        self, 
-        text: str, 
-        start: float, 
+        self,
+        text: str,
+        start: float,
         end: float,
         speaker_turn_gap: float = None,  # Kept for compatibility, not used
-        speaker: str = "SPEAKER"
+        speaker: str = "SPEAKER",
+        confidence: float = None,
+        alternatives: list = None
     ):
         """Add a transcribed segment."""
         if not text.strip():
@@ -522,7 +524,9 @@ class TranscriptWriter:
             "start": start,
             "end": end,
             "new_speaker": is_new_speaker,
-            "speaker": speaker
+            "speaker": speaker,
+            "confidence": confidence,
+            "alternatives": alternatives or []
         }
         self.segments.append(segment_data)
         self.last_end = end
@@ -531,12 +535,32 @@ class TranscriptWriter:
         if self.format == "txt":
             self._append_txt(segment_data)
 
+    def _format_speaker_line(self, seg: dict) -> str:
+        """Format speaker line with confidence and alternatives."""
+        speaker_name = seg.get("speaker", "SPEAKER")
+        conf = seg.get("confidence")
+        alternatives = seg.get("alternatives", [])
+
+        if conf is not None:
+            conf_str = f" ({conf:.0%})"
+        else:
+            conf_str = ""
+
+        # Add alternatives if any are >= 50%
+        alt_str = ""
+        if alternatives:
+            high_conf_alts = [a for a in alternatives if a.get("confidence", 0) >= 0.5]
+            if high_conf_alts:
+                alt_names = ", ".join(f"{a['speaker']} ({a['confidence']:.0%})" for a in high_conf_alts)
+                alt_str = f" [also: {alt_names}]"
+
+        return f"\n[{format_timestamp(seg['start'])}] {speaker_name}{conf_str}{alt_str}:\n"
+
     def _append_txt(self, seg: dict):
         """Append a single segment directly to the file."""
         with open(self.output_path, "a", encoding="utf-8") as f:
             if seg["new_speaker"]:
-                speaker_name = seg.get("speaker", "SPEAKER")
-                f.write(f"\n[{format_timestamp(seg['start'])}] {speaker_name}:\n")
+                f.write(self._format_speaker_line(seg))
             f.write(seg["text"] + " ")
     
     def write(self):
@@ -563,8 +587,7 @@ class TranscriptWriter:
         with open(self.output_path, "w", encoding="utf-8") as f:
             for seg in self.segments:
                 if seg["new_speaker"]:
-                    speaker_name = seg.get("speaker", "SPEAKER")
-                    f.write(f"\n[{format_timestamp(seg['start'])}] {speaker_name}:\n")
+                    f.write(self._format_speaker_line(seg))
                 f.write(seg["text"] + " ")
 
         # Clean up trailing whitespace
@@ -600,59 +623,76 @@ class TranscriptWriter:
 # Segment Refinement and Overlap Detection
 # ============================================================================
 
-def refactor_and_detect_overlaps(diarize_segments: list[dict], min_duration: float, 
+def refactor_and_detect_overlaps(diarize_segments: list[dict], min_duration: float,
                                   max_chunk_duration: float, merge_gap: float) -> tuple[list[tuple], list[dict]]:
     """
     Refine diarization segments and detect overlaps between speakers.
-    
+
     Args:
         diarize_segments: List of dicts with 'start', 'end', 'speaker' keys
         min_duration: Minimum segment duration to keep
         max_chunk_duration: Maximum duration for a single chunk
         merge_gap: Maximum gap between segments to merge
-        
+
     Returns:
         Tuple of (refined_segments, overlaps)
-        - refined_segments: List of tuples (start, end, speaker)
+        - refined_segments: List of tuples (start, end, speaker, confidence)
         - overlaps: List of overlapping regions with speaker info
     """
     if not diarize_segments:
         return [], []
-    
-    # Convert start and end to floats
+
+    # Convert start and end to floats, preserve confidence and alternatives
     processed = []
     for seg in diarize_segments:
         processed.append({
             'start': float(seg['start']),
             'end': float(seg['end']),
-            'speaker': seg['speaker']
+            'speaker': seg['speaker'],
+            'confidence': float(seg.get('confidence', 0.5)),
+            'alternatives': seg.get('alternatives', [])
         })
-    
+
     # Sort segments by start time
     sorted_segments = sorted(processed, key=lambda x: x['start'])
-    
+
     # Merge segments that are close together (same speaker)
     merged = []
     current = dict(sorted_segments[0])
-    
+
     for seg in sorted_segments[1:]:
         if seg['speaker'] == current['speaker'] and (seg['start'] - current['end']) <= merge_gap:
             current['end'] = max(current['end'], seg['end'])
+            current['confidence'] = (current.get('confidence', 0.5) + seg.get('confidence', 0.5)) / 2
         else:
             if current['end'] - current['start'] >= min_duration:
                 merged.append(current)
             current = dict(seg)
-    
+
     if current['end'] - current['start'] >= min_duration:
         merged.append(current)
-    
+
+# Note: Truncation logic disabled - confidence metric not reliable enough
+    # Re-enable if confidence improves in the future
+    # Disabled to prevent cutting sentences incorrectly
+
+    # Detect overlaps between segments of different speakers
+    # The truncation was causing sentences to be cut incorrectly
+    # merged = truncated
+
     # Detect overlaps between segments of different speakers
     overlaps = []
     refined = []
-    
+
     for i, seg in enumerate(merged):
-        # Return as tuple (start, end, speaker) to match expected format
-        refined.append((seg['start'], seg['end'], seg['speaker']))
+        # Return as tuple (start, end, speaker, confidence, alternatives)
+        refined.append((
+            seg['start'],
+            seg['end'],
+            seg['speaker'],
+            seg.get('confidence', 0.5),
+            seg.get('alternatives', [])
+        ))
         # Check for overlaps with subsequent segments
         for j in range(i + 1, len(merged)):
             other = merged[j]
@@ -667,7 +707,7 @@ def refactor_and_detect_overlaps(diarize_segments: list[dict], min_duration: flo
                         'end': overlap_end,
                         'speakers': [seg['speaker'], other['speaker']]
                     })
-    
+
     return refined, overlaps
 
 
@@ -792,17 +832,27 @@ async def transcribe_file(
         for batch_idx in range(0, len(segments), config.batch_size):
             batch = segments[batch_idx:batch_idx + config.batch_size]
             chunk_files = []
-            chunk_info = []  # (path, start, end)
-            
+            chunk_info = []  # (path, start, end, speaker, confidence, alternatives)
+
             # Extract chunks
-            for j, (start, end, speaker) in enumerate(batch):
+            for j, seg in enumerate(batch):
+                if len(seg) >= 5:
+                    start, end, speaker, confidence, alternatives = seg[0], seg[1], seg[2], seg[3], seg[4] if len(seg) > 4 else []
+                elif len(seg) >= 4:
+                    start, end, speaker, confidence = seg[0], seg[1], seg[2], seg[3]
+                    alternatives = []
+                else:
+                    start, end, speaker = seg[0], seg[1], seg[2]
+                    confidence = None
+                    alternatives = []
+
                 chunk_path = os.path.join(temp_dir, f"chunk_{batch_idx + j}.wav")
                 duration = end - start
 
                 if extract_chunk(temp_wav, start, duration, chunk_path, config.sample_rate):
                     if rms_check(chunk_path, config.rms_silence_threshold):
                         chunk_files.append(chunk_path)
-                        chunk_info.append((chunk_path, start, end, speaker))
+                        chunk_info.append((chunk_path, start, end, speaker, confidence, alternatives))
                     else:
                         # Silent chunk, skip
                         try:
@@ -822,7 +872,8 @@ async def transcribe_file(
                     language="en"
                 )
 
-                for (_, start, end, speaker), result in zip(chunk_info, results):
+                for info, result in zip(chunk_info, results):
+                    _, start, end, speaker, confidence, alternatives = info
                     if isinstance(result, dict):
                         text = result.get("text", "")
                         error = result.get("error")
@@ -835,7 +886,7 @@ async def transcribe_file(
                         continue
 
                     if text.strip():
-                        writer.add_segment(text, start, end, speaker=speaker)
+                        writer.add_segment(text, start, end, speaker=speaker, confidence=confidence, alternatives=alternatives)
                         if progress_bar is not None:
                             progress_bar.set_postfix_str(text[:40] + "...")
 
