@@ -27,7 +27,7 @@ The server will automatically exit after 1 second.
 ## Voiceprints (Speaker Recognition)
 
 ### File Location
-Voiceprints are stored in `voiceprints.json` in the project root (`C:\Users\Gergely_Papp\source\ASR\voiceprints.json`).
+Voiceprints are stored in `voiceprints.json` in the project folder (`C:\Users\Gergely_Papp\source\ASR\cohere-diarization\voiceprints.json`).
 
 ### Voiceprint Format
 ```json
@@ -45,17 +45,17 @@ Voiceprints are stored in `voiceprints.json` in the project root (`C:\Users\Gerg
 ### Using Voiceprints
 Pass `--voiceprints` flag to transcribe.py:
 ```powershell
-python transcribe.py "video.mp4" --num-speakers 4 --voiceprints "C:\Users\Gergely_Papp\source\ASR\voiceprints.json"
+python transcribe.py "video.mp4" --num-speakers 4 --voiceprints "C:\Users\Gergely_Papp\source\ASR\cohere-diarization\voiceprints.json"
 ```
 
 ### Auto-loading
-If `voiceprints.json` exists in the project root, it's auto-loaded without needing `--voiceprints` flag.
+If `voiceprints.json` exists in the cohere-diarization folder, it's auto-loaded without needing `--voiceprints` flag.
 
 ## Command-line Options
 
 ### Diarization
 - `--num-speakers N` - Force exact number of speakers (improves clustering)
-- `--diarization-threshold X` - Distance threshold for clustering (default: 0.20)
+- `--diarization-threshold X` - Distance threshold for clustering (default: 0.35)
 - `--voiceprints PATH` - Path to voiceprints.json file
 - `--vad-threshold X` - VAD speech probability cutoff (default: 0.5)
 - `--vad-min-speech MS` - VAD minimum speech chunk length in ms (default: 250)
@@ -76,16 +76,39 @@ If `voiceprints.json` exists in the project root, it's auto-loaded without needi
 - `TRANSCRIBE_VAD_THRESHOLD` - VAD threshold
 - `TRANSCRIBE_VAD_MIN_SPEECH_DURATION_MS` - VAD min speech duration
 
+## Technical Details
+
+### Embedding Model
+Uses `Wespeaker/wespeaker-ecapa-tdnn512-LM` for speaker embeddings (192-dimensional).
+
+### Clustering
+- Default threshold: 0.35 (higher = fewer clusters)
+- Max clusters capped at 15 to prevent over-segmentation
+- Can be overridden with `--num-speakers N`
+
+### Voiceprint Matching
+- Matching threshold: 0.16 (distance below this = potential match)
+- Clear winner requirement: best match must be at least 0.02 better than second-best
+- When embedding distance < 0.15, uses pure embedding (ignores pitch/energy)
+- CMN (Cepstral Mean Normalization) applied per 1.5s window - critical for speaker discrimination
+
+### VAD Acceleration
+Silero VAD runs on ONNX with DirectML for iGPU acceleration. Falls back to PyTorch CPU if unavailable.
+
 ## Known Issues
 
 ### Over-segmentation
-If diarization identifies too many speakers (e.g., 63 instead of 4):
+If diarization identifies too many speakers:
 1. Use `--num-speakers 4` to force exact speaker count
-2. Use `--diarization-threshold 0.2` for stricter clustering
+2. Use `--diarization-threshold 0.35` (default is already higher)
+
+### Similar Voices
+When multiple voiceprints have very similar embeddings, matching requires a clear gap (0.02) between best and second-best. Otherwise keeps original SPEAKER label.
 
 ### Voiceprint Matching
-The matching threshold is currently set to 0.4 cosine distance. If voices aren't matching:
-- Check that voiceprints have valid embeddings
+If voices aren't matching:
+- Check that voiceprints were created with ecapa-tdnn512 model
+- Recreate voiceprints using `mass_refine` if switching models
 - Verify video has enough speech for the known speakers
 
 ## Creating Voiceprints

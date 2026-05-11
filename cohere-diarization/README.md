@@ -24,13 +24,22 @@ python transcribe.py meeting.mp4 --num-speakers 4
 ## Diarization Workflow
 
 ```
-Audio Input → VAD (Voice Activity Detection) → Feature Extraction → Embedding → Clustering → Speaker Segmentation
+Audio Input → VAD (Voice Activity Detection) → Feature Extraction → Embedding → Clustering → Speaker Identification
 ```
 
 ### Key Options
 - `--num-speakers N` - Force exact speaker count
-- `--diarization-threshold X` - Distance threshold (default: 0.20)
+- `--diarization-threshold X` - Distance threshold (default: 0.35, higher = fewer clusters)
 - `--voiceprints PATH` - Use known voiceprints for identification
+- `--vad-threshold X` - VAD speech probability cutoff (default: 0.5)
+
+### Technical Details
+- **Embedding Model:** Wespeaker ecapa-tdnn512 (192-dimensional)
+- **Max Clusters:** 15 (capped to prevent over-segmentation)
+- **Matching Threshold:** 0.16 (distance below this = potential match)
+- **Clear Winner:** Best match must be 0.02 better than second-best
+- **CMN:** Cepstral Mean Normalization applied per window (critical for speaker discrimination)
+- **Embedding-Only Mode:** When embedding distance < 0.15, uses pure embedding (ignores pitch/energy)
 
 ## Voiceprint Management
 
@@ -70,10 +79,17 @@ When refining, longer segments have proportionally more influence:
 - 60s segment = 10x weight of 6s segment
 - Blending weight = existing_duration / total_duration
 
+### Quality Guidelines
+| Quality | Duration | Notes |
+|---------|----------|-------|
+| Minimum | 5-10s | Works but may have lower accuracy |
+| Good | 30-60s | Reliable matching |
+| Excellent | 60s+ | Best accuracy with diverse speech |
+
 ## Server Endpoints
 
 | Endpoint | Method | Description |
-|-----------|-------|-------------|
+|-----------|--------|-------------|
 | `/health` | GET | Health check |
 | `/diarize/path` | POST | Diarize audio file by path |
 | `/shutdown` | POST | Shutdown server |
@@ -84,3 +100,4 @@ When refining, longer segments have proportionally more influence:
 - `transcribe.py` - Client orchestrator
 - `voiceprint_mgmt.py` - Voiceprint CLI (create, extract, refine, mass_refine)
 - `voiceprint_utils.py` - Shared voiceprint utilities
+- `AGENTS.md` - Detailed technical documentation
