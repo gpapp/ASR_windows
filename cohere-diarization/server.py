@@ -40,6 +40,11 @@ from sklearn.metrics.pairwise import cosine_distances
 from scipy.spatial.distance import cosine
 
 TARGET_SAMPLES = 480000  # 30 seconds at 16kHz
+
+# Config and speaker modules
+from config import get, is_debug
+from speaker.matcher import match_clusters, merge_matched_clusters
+
 from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, Request, Security
 from fastapi.security import APIKeyHeader
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
@@ -1749,12 +1754,13 @@ async def diarize_path_endpoint(
                                     speaker_centroids[spk].append(np.array(cluster_centroids[raw_id]))
                 
                 # Match each speaker to known voiceprints
-                # Only match if distance < 0.35
-                match_thresh = 0.35
+                # Use config for threshold
+                match_thresh = get("matching", "accept_threshold", 0.35)
 
-                print(f"=== DEBUG SPEAKER MATCHING ===")
-                print(f"Cluster speakers: {list(speaker_centroids.keys())}")
-                print(f"Known speakers: {list(req.known_speakers.keys()) if req.known_speakers else 'None'}")
+                if is_debug():
+                    print(f"=== DEBUG SPEAKER MATCHING ===")
+                    print(f"Cluster speakers: {list(speaker_centroids.keys())}")
+                    print(f"Known speakers: {list(req.known_speakers.keys()) if req.known_speakers else 'None'}")
 
                 # Compute all possible matches for each cluster speaker
                 all_matches = {}  # spk -> [(name, distance, confidence), ...]
@@ -1782,22 +1788,34 @@ async def diarize_path_endpoint(
                         # Embedding distance
                         emb_dist = cosine(centroid, known_prof["embedding"])
 
-                        # Pitch distance (normalize to 0-1 range, 50Hz difference = 1.0)
+                        # Get normalization params from config
+                        norm_cfg = get("normalization", default={})
+                        pitch_per_unit = norm_cfg.get("pitch_hz_per_unit", 50)
+                        energy_per_unit = norm_cfg.get("energy_rms_per_unit", 0.05)
+                        conf_max_dist = norm_cfg.get("confidence_max_distance", 0.5)
+
+                        # Get weights from config
+                        weights = get("weights", default={})
+                        w_emb = weights.get("embedding", 0.7)
+                        w_pitch = weights.get("pitch", 0.2)
+                        w_energy = weights.get("energy", 0.1)
+
+                        # Pitch distance (normalize to 0-1 range)
                         known_pitch = known_prof.get("pitch_hz", 0) or 0
-                        pitch_dist = abs(cluster_pitch - known_pitch) / 50.0 if cluster_pitch > 0 and known_pitch > 0 else 0.5
+                        pitch_dist = abs(cluster_pitch - known_pitch) / pitch_per_unit if cluster_pitch > 0 and known_pitch > 0 else 0.5
 
-                        # Energy distance (normalize, 0.05 difference = 1.0)
+                        # Energy distance (normalize)
                         known_energy = known_prof.get("energy_rms", 0) or 0
-                        energy_dist = abs(cluster_energy - known_energy) / 0.05 if cluster_energy > 0 and known_energy > 0 else 0.5
+                        energy_dist = abs(cluster_energy - known_energy) / energy_per_unit if cluster_energy > 0 and known_energy > 0 else 0.5
 
-                        # Combined distance: 70% embedding + 20% pitch + 10% energy
-                        # If embedding is close (< 0.16), trust it - pitch/energy vary too much with CMN
-                        if emb_dist < 0.16:
-                            combined_dist = emb_dist  # Pure embedding match
-                        else:
-                            combined_dist = 0.7 * emb_dist + 0.2 * min(pitch_dist, 1.0) + 0.1 * min(energy_dist, 1.0)
+                        # Get matching thresholds from config
+                        matching_cfg = get("matching", default={})
+                        embed_only_thresh = matching_cfg.get("embed_only_threshold", 0.16)
 
-                        conf = max(0, 1 - (combined_dist / 0.5))
+                        # Combined distance: use weighted combination always (simpler)
+                        combined_dist = w_emb * emb_dist + w_pitch * min(pitch_dist, 1.0) + w_energy * min(energy_dist, 1.0)
+
+                        conf = max(0, 1 - (combined_dist / conf_max_dist))
                         matches.append((known_name, combined_dist, conf))
                         debug_distances[known_name] = {
                             "emb_dist": round(float(emb_dist), 3),
@@ -1812,9 +1830,11 @@ async def diarize_path_endpoint(
                     all_matches[spk] = matches
                     debug_matches[spk] = debug_distances
 
-                    print(f"Cluster '{spk}' (pitch={cluster_pitch:.0f}Hz, energy={cluster_energy:.3f}) matches: {debug_distances}")
+                    if is_debug():
+                        print(f"Cluster '{spk}' (pitch={cluster_pitch:.0f}Hz, energy={cluster_energy:.3f}) matches: {debug_distances}")
 
-                print("=== END DEBUG ===")
+                if is_debug():
+                    print("=== END DEBUG ===")
 
                 # Apply best match if distance below threshold, store alternatives
                 for spk, emb_list in speaker_centroids.items():
@@ -1829,28 +1849,35 @@ async def diarize_path_endpoint(
                     
                     # Check if it's a clear winner
                     clear_winner = True
+                    matching_cfg = get("matching", default={})
+                    gap_threshold = matching_cfg.get("clear_winner_gap", 0.02)
+                    embed_only_thresh = matching_cfg.get("embed_only_threshold", 0.16)
+                    
                     if len(matches) > 1:
                         second_dist = matches[1][1]
                         gap = second_dist - best_dist
-                        if gap < 0.02:
+                        if gap < gap_threshold:
                             # When gap is small, prefer speaker with more training data
                             first_dur = req.known_speakers.get(matches[0][0], {}).get("total_speech_sec", 0)
                             second_dur = req.known_speakers.get(matches[1][0], {}).get("total_speech_sec", 0)
                             
                             # If best has significantly more data, use it despite small gap
-                            if first_dur > second_dur * 2 and best_dist < 0.05:
+                            if first_dur > second_dur * 2 and best_dist < embed_only_thresh:
                                 clear_winner = True
-                                print(f"  -> Using {matches[0][0]} (more training data: {first_dur:.0f}s vs {second_dur:.0f}s)")
+                                if is_debug():
+                                    print(f"  -> Using {matches[0][0]} (more training data: {first_dur:.0f}s vs {second_dur:.0f}s)")
                             else:
                                 clear_winner = False
 
                     # Debug: show why this match was chosen
-                    print(f"Cluster '{spk}' -> best_match='{best_match}' best_dist={best_dist:.3f} match_thresh={match_thresh:.3f} clear_winner={clear_winner} -> {'MATCH' if best_dist <= match_thresh and clear_winner else 'NO MATCH'}")
+                    if is_debug():
+                        print(f"Cluster '{spk}' -> best_match='{best_match}' best_dist={best_dist:.3f} match_thresh={match_thresh:.3f} clear_winner={clear_winner} -> {'MATCH' if best_dist <= match_thresh and clear_winner else 'NO MATCH'}")
 
                     # Store alternatives in each segment
                     alternatives = []
                     for name, dist, conf in matches[1:4]:  # Top 3 alternatives
-                        if conf >= 0.3:  # Only include if >30% confident
+                        conf_thresh = matching_cfg.get("confidence_threshold", 0.3)
+                        if conf >= conf_thresh:
                             alternatives.append({"speaker": name, "confidence": round(conf, 2)})
 
                     if best_match and best_dist <= match_thresh and clear_winner:
@@ -1881,7 +1908,8 @@ async def diarize_path_endpoint(
             # Merge clusters with same speaker match
             for speaker, cluster_list in speaker_to_clusters.items():
                 if len(cluster_list) > 1:
-                    print(f"MERGING: {cluster_list} -> {speaker}")
+                    if is_debug():
+                        print(f"MERGING: {cluster_list} -> {speaker}")
                     primary = cluster_list[0]
                     for extra in cluster_list[1:]:
                         # Update all segments from extra cluster to primary speaker
