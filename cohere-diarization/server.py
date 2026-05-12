@@ -639,6 +639,13 @@ def transcribe_audio_sync(
                 
                 dec_out = dec_io.get_outputs()
                 logits = dec_out[0].numpy()
+                
+                # Handle potential scalar output from new torch version
+                if logits.ndim == 0:
+                    logits = logits.reshape(1, -1)
+                elif logits.ndim == 1:
+                    logits = logits.reshape(1, -1)
+                
                 self_k_ov = dec_out[1]
                 self_v_ov = dec_out[2]
                 
