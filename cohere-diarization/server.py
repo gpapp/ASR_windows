@@ -1749,8 +1749,8 @@ async def diarize_path_endpoint(
                                     speaker_centroids[spk].append(np.array(cluster_centroids[raw_id]))
                 
                 # Match each speaker to known voiceprints
-                # Only match if distance < 0.12
-                match_thresh = 0.16
+                # Only match if distance < 0.35
+                match_thresh = 0.35
 
                 print(f"=== DEBUG SPEAKER MATCHING ===")
                 print(f"Cluster speakers: {list(speaker_centroids.keys())}")
@@ -1791,8 +1791,8 @@ async def diarize_path_endpoint(
                         energy_dist = abs(cluster_energy - known_energy) / 0.05 if cluster_energy > 0 and known_energy > 0 else 0.5
 
                         # Combined distance: 70% embedding + 20% pitch + 10% energy
-                        # If embedding is close (< 0.15), trust it - pitch/energy vary too much with CMN
-                        if emb_dist < 0.15:
+                        # If embedding is close (< 0.16), trust it - pitch/energy vary too much with CMN
+                        if emb_dist < 0.16:
                             combined_dist = emb_dist  # Pure embedding match
                         else:
                             combined_dist = 0.7 * emb_dist + 0.2 * min(pitch_dist, 1.0) + 0.1 * min(energy_dist, 1.0)

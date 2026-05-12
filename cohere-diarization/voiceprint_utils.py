@@ -101,7 +101,7 @@ def extract_embedding(waveform, sample_rate, embedding_session: ort.InferenceSes
     """Extract voice embedding from waveform using ONNX model."""
     from server import generate_sliding_windows, extract_fbank
 
-    windows, start_times = generate_sliding_windows(waveform, sample_rate, window_sec=3.0, stride_sec=2.0)
+    windows, start_times = generate_sliding_windows(waveform, sample_rate, window_sec=3.0, stride_sec=1.5)
 
     if not windows:
         raise ValueError("No valid audio windows found")
