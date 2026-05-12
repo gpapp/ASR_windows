@@ -618,6 +618,10 @@ def transcribe_audio_sync(
             current = np.array([prompt_ids], dtype=np.int64)
             offset = np.array(0, dtype=np.int64)
             
+            # Pre-allocate reusable arrays to avoid repeated allocation in loop
+            current_buffer = np.zeros((1, 1), dtype=np.int64)
+            offset_buffer = np.array([0], dtype=np.int64)
+            
             dec_io = decoder.io_binding()
             
             for _ in range(settings.max_new_tokens):
@@ -643,8 +647,10 @@ def transcribe_audio_sync(
                     break
                     
                 generated.append(next_id)
-                offset = np.array(int(offset) + current.shape[1], dtype=np.int64)
-                current = np.array([[next_id]], dtype=np.int64)
+                offset_buffer[0] = offset[0] + current.shape[1]
+                offset = offset_buffer
+                current_buffer[0, 0] = next_id
+                current = current_buffer
         
         # Decode text
         text = "".join(
@@ -1422,20 +1428,21 @@ async def diarize_path_endpoint(
             }))
 
             # Apply CMN per sub-segment (critical for ECAPA-TDNN)
-            cmn_fbanks = []
-            for fb in all_fbanks:
-                # fb shape: [1, frames, 80] -> apply CMN per window
-                fb_cmn = fb - fb.mean(dim=1, keepdim=True)
-                cmn_fbanks.append(fb_cmn)
-
-            max_len = max(fb.shape[1] for fb in cmn_fbanks)
-            padded_fbanks = []
-            for fb in cmn_fbanks:
-                if fb.shape[1] < max_len:
-                    fb = torch.nn.functional.pad(fb, (0, 0, 0, max_len - fb.shape[1]))
-                padded_fbanks.append(fb)
-
-            batch_fbanks = torch.cat(padded_fbanks, dim=0).numpy()
+            # Vectorized: stack all, apply CMN in one operation
+            if all_fbanks:
+                batch = torch.stack(all_fbanks, dim=0)  # [N, 1, frames, 80]
+                cmn_batch = batch - batch.mean(dim=2, keepdim=True)  # CMN on all at once
+                
+                # Pad to max length in one operation
+                max_len = max(fb.shape[1] for fb in all_fbanks)
+                if cmn_batch.shape[2] < max_len:
+                    padded_batch = torch.nn.functional.pad(cmn_batch, (0, 0, 0, max_len - cmn_batch.shape[2]))
+                else:
+                    padded_batch = cmn_batch
+                
+                batch_fbanks = padded_batch.squeeze(1).numpy()  # [N, frames, 80]
+            else:
+                batch_fbanks = np.array([])
 
             raw_embeddings = []
             batch_size = 32
@@ -1766,6 +1773,18 @@ async def diarize_path_endpoint(
                 all_matches = {}  # spk -> [(name, distance, confidence), ...]
                 debug_matches = {}
 
+                # Cache config values before loops to avoid repeated lookups
+                norm_cfg = get("normalization", default={})
+                pitch_per_unit = norm_cfg.get("pitch_hz_per_unit", 50)
+                energy_per_unit = norm_cfg.get("energy_rms_per_unit", 0.05)
+                conf_max_dist = norm_cfg.get("confidence_max_distance", 0.5)
+                weights = get("weights", default={})
+                w_emb = weights.get("embedding", 0.7)
+                w_pitch = weights.get("pitch", 0.2)
+                w_energy = weights.get("energy", 0.1)
+                matching_cfg = get("matching", default={})
+                embed_only_thresh = matching_cfg.get("embed_only_threshold", 0.16)
+
                 for spk, emb_list in speaker_centroids.items():
                     if not emb_list:
                         continue
@@ -1788,31 +1807,15 @@ async def diarize_path_endpoint(
                         # Embedding distance
                         emb_dist = cosine(centroid, known_prof["embedding"])
 
-                        # Get normalization params from config
-                        norm_cfg = get("normalization", default={})
-                        pitch_per_unit = norm_cfg.get("pitch_hz_per_unit", 50)
-                        energy_per_unit = norm_cfg.get("energy_rms_per_unit", 0.05)
-                        conf_max_dist = norm_cfg.get("confidence_max_distance", 0.5)
-
-                        # Get weights from config
-                        weights = get("weights", default={})
-                        w_emb = weights.get("embedding", 0.7)
-                        w_pitch = weights.get("pitch", 0.2)
-                        w_energy = weights.get("energy", 0.1)
-
-                        # Pitch distance (normalize to 0-1 range)
+                        # Pitch distance (normalize to 0-1 range) - using cached config values
                         known_pitch = known_prof.get("pitch_hz", 0) or 0
                         pitch_dist = abs(cluster_pitch - known_pitch) / pitch_per_unit if cluster_pitch > 0 and known_pitch > 0 else 0.5
 
-                        # Energy distance (normalize)
+                        # Energy distance (normalize) - using cached config values
                         known_energy = known_prof.get("energy_rms", 0) or 0
                         energy_dist = abs(cluster_energy - known_energy) / energy_per_unit if cluster_energy > 0 and known_energy > 0 else 0.5
 
-                        # Get matching thresholds from config
-                        matching_cfg = get("matching", default={})
-                        embed_only_thresh = matching_cfg.get("embed_only_threshold", 0.16)
-
-                        # Combined distance: use weighted combination always (simpler)
+                        # Combined distance: use weighted combination always (using cached weights)
                         combined_dist = w_emb * emb_dist + w_pitch * min(pitch_dist, 1.0) + w_energy * min(energy_dist, 1.0)
 
                         conf = max(0, 1 - (combined_dist / conf_max_dist))

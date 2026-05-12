@@ -13,6 +13,7 @@ def extract_embedding(waveform, sample_rate, embedding_session: ort.InferenceSes
     if not windows:
         raise ValueError("No valid audio windows found")
 
+    # Process windows - fbank must be per-window, but collect first
     all_fbanks = []
     target_length = 4800
 
@@ -22,20 +23,22 @@ def extract_embedding(waveform, sample_rate, embedding_session: ort.InferenceSes
             if w.shape[-1] < target_length:
                 w = torch.nn.functional.pad(w, (0, target_length - w.shape[-1]))
             fb = extract_fbank(w, sample_rate)
-            fb = fb - fb.mean(dim=1, keepdim=True)
             all_fbanks.append(fb)
 
     if not all_fbanks:
         raise ValueError("No embeddable segments (need >=1.5s)")
 
+    # Vectorized: stack all, apply CMN and padding in single operations
+    batch = torch.stack(all_fbanks, dim=0)  # [N, 1, frames, 80]
+    cmn_batch = batch - batch.mean(dim=2, keepdim=True)  # CMN on all at once
+    
     max_len = max(fb.shape[1] for fb in all_fbanks)
-    padded_fbanks = []
-    for fb in all_fbanks:
-        if fb.shape[1] < max_len:
-            fb = torch.nn.functional.pad(fb, (0, 0, 0, max_len - fb.shape[1]))
-        padded_fbanks.append(fb)
-
-    batch = torch.stack(padded_fbanks).squeeze(1)
+    if cmn_batch.shape[2] < max_len:
+        padded_batch = torch.nn.functional.pad(cmn_batch, (0, 0, 0, max_len - cmn_batch.shape[2]))
+    else:
+        padded_batch = cmn_batch
+    
+    batch = padded_batch.squeeze(1)  # [N, frames, 80]
 
     input_onnx = {embedding_session.get_inputs()[0].name: batch.numpy()}
     embeddings = embedding_session.run(None, input_onnx)[0]
@@ -106,6 +109,7 @@ def compute_pitch(waveform, sample_rate):
 
 def compute_energy(waveform):
     """Compute RMS energy of audio."""
-    if waveform.shape[0] > 1:
+    # Handle multi-channel: average across channels if shape[0] > 1 and it's not batch
+    if waveform.dim() > 1 and waveform.shape[0] <= 64:  # Assume channel dim if small
         waveform = waveform.mean(dim=0)
     return float(torch.sqrt(torch.mean(waveform ** 2)).numpy())

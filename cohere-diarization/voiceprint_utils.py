@@ -103,19 +103,39 @@ def load_audio_segment(wav_path: str, start_sec: float, end_sec: float):
 
 
 
-def init_embedding_session(settings) -> ort.InferenceSession:
-    """Initialize the ONNX embedding session."""
-    from server import ensure_embedding_model
+# Cached embedding session - created once and reused
+_cached_embedding_session = None
+_cached_embedding_path = None
 
+
+def get_embedding_session(settings) -> ort.InferenceSession:
+    """Get cached ONNX embedding session. Creates once, reuses for all calls."""
+    global _cached_embedding_session, _cached_embedding_path
+    
+    from server import ensure_embedding_model
+    
     emb_path = ensure_embedding_model(
         settings.embedding_model_repo,
         settings.embedding_model_filename,
         settings.hf_token
     )
-
+    
+    # Return cached session if already created for this path
+    if _cached_embedding_session is not None and _cached_embedding_path == emb_path:
+        return _cached_embedding_session
+    
+    # Create new session
     opts = ort.SessionOptions()
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    return ort.InferenceSession(emb_path, opts, providers=["CPUExecutionProvider"])
+    _cached_embedding_session = ort.InferenceSession(emb_path, opts, providers=["CPUExecutionProvider"])
+    _cached_embedding_path = emb_path
+    
+    return _cached_embedding_session
+
+
+def init_embedding_session(settings) -> ort.InferenceSession:
+    """Initialize the ONNX embedding session. DEPRECATED - use get_embedding_session() instead."""
+    return get_embedding_session(settings)
 
 
 def load_voiceprints(path: Path) -> dict:

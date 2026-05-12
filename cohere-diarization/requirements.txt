@@ -11,8 +11,9 @@ huggingface-hub
 
 # Diarization
 scikit-learn
-torchaudio
 torch
+torchaudio
+# discontinued: torch-directml==0.2.5.dev240914
 
 # Async HTTP client
 python-multipart
