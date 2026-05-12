@@ -28,17 +28,22 @@ def extract_embedding(waveform, sample_rate, embedding_session: ort.InferenceSes
     if not all_fbanks:
         raise ValueError("No embeddable segments (need >=1.5s)")
 
-    # Vectorized: stack all, apply CMN and padding in single operations
-    batch = torch.stack(all_fbanks, dim=0)  # [N, 1, frames, 80]
+    # Vectorized: pad first, then stack and apply CMN
+    max_len = max(fb.shape[1] for fb in all_fbanks)
+    
+    # Pad each fb to max_len BEFORE stacking
+    padded_fbanks = []
+    for fb in all_fbanks:
+        if fb.shape[1] < max_len:
+            fb_padded = torch.nn.functional.pad(fb, (0, 0, 0, max_len - fb.shape[1]))
+        else:
+            fb_padded = fb
+        padded_fbanks.append(fb_padded)
+    
+    batch = torch.stack(padded_fbanks, dim=0)  # [N, 1, max_len, 80]
     cmn_batch = batch - batch.mean(dim=2, keepdim=True)  # CMN on all at once
     
-    max_len = max(fb.shape[1] for fb in all_fbanks)
-    if cmn_batch.shape[2] < max_len:
-        padded_batch = torch.nn.functional.pad(cmn_batch, (0, 0, 0, max_len - cmn_batch.shape[2]))
-    else:
-        padded_batch = cmn_batch
-    
-    batch = padded_batch.squeeze(1)  # [N, frames, 80]
+    batch = cmn_batch.squeeze(1)  # [N, max_len, 80]
 
     input_onnx = {embedding_session.get_inputs()[0].name: batch.numpy()}
     embeddings = embedding_session.run(None, input_onnx)[0]

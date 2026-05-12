@@ -1428,19 +1428,23 @@ async def diarize_path_endpoint(
             }))
 
             # Apply CMN per sub-segment (critical for ECAPA-TDNN)
-            # Vectorized: stack all, apply CMN in one operation
+            # Vectorized: pad first, then stack and apply CMN
             if all_fbanks:
-                batch = torch.stack(all_fbanks, dim=0)  # [N, 1, frames, 80]
+                max_len = max(fb.shape[1] for fb in all_fbanks)
+                
+                # Pad each fb to max_len BEFORE stacking
+                padded_fbanks = []
+                for fb in all_fbanks:
+                    if fb.shape[1] < max_len:
+                        fb_padded = torch.nn.functional.pad(fb, (0, 0, 0, max_len - fb.shape[1]))
+                    else:
+                        fb_padded = fb
+                    padded_fbanks.append(fb_padded)
+                
+                batch = torch.stack(padded_fbanks, dim=0)  # [N, 1, max_len, 80]
                 cmn_batch = batch - batch.mean(dim=2, keepdim=True)  # CMN on all at once
                 
-                # Pad to max length in one operation
-                max_len = max(fb.shape[1] for fb in all_fbanks)
-                if cmn_batch.shape[2] < max_len:
-                    padded_batch = torch.nn.functional.pad(cmn_batch, (0, 0, 0, max_len - cmn_batch.shape[2]))
-                else:
-                    padded_batch = cmn_batch
-                
-                batch_fbanks = padded_batch.squeeze(1).numpy()  # [N, frames, 80]
+                batch_fbanks = cmn_batch.squeeze(1).numpy()  # [N, max_len, 80]
             else:
                 batch_fbanks = np.array([])
 
