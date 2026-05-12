@@ -36,10 +36,9 @@ Audio Input → VAD (Voice Activity Detection) → Feature Extraction → Embedd
 ### Technical Details
 - **Embedding Model:** Wespeaker ecapa-tdnn512 (192-dimensional)
 - **Max Clusters:** 15 (capped to prevent over-segmentation)
-- **Matching Threshold:** 0.16 (distance below this = potential match)
-- **Clear Winner:** Best match must be 0.02 better than second-best
+- **Configuration:** All tunable parameters in `config/thresholds.json`
+- **Clear Winner:** Best match must beat second-best by 0.02 gap
 - **CMN:** Cepstral Mean Normalization applied per window (critical for speaker discrimination)
-- **Embedding-Only Mode:** When embedding distance < 0.15, uses pure embedding (ignores pitch/energy)
 
 ## Voiceprint Management
 
@@ -96,8 +95,28 @@ When refining, longer segments have proportionally more influence:
 
 ## Project Structure
 
+```
+cohere-diarization/
+├── config/
+│   ├── thresholds.json   # All tunable parameters
+│   └── __init__.py       # Config loader
+├── speaker/
+│   ├── embedding.py      # Embedding extraction functions
+│   ├── matcher.py        # Speaker matching logic
+│   └── __init__.py
+├── server.py            # FastAPI server with ONNX inference
+├── transcribe.py         # CLI client
+├── voiceprint_mgmt.py   # Voiceprint CLI (create, extract, refine)
+├── voiceprint_utils.py  # Shared utilities
+└── tests/
+    ├── test_matcher.py   # Unit tests for matching
+    └── test_embedding.py # Unit tests for embeddings
+```
+
 - `server.py` - FastAPI server with ONNX inference
 - `transcribe.py` - Client orchestrator
 - `voiceprint_mgmt.py` - Voiceprint CLI (create, extract, refine, mass_refine)
 - `voiceprint_utils.py` - Shared voiceprint utilities
+- `config/thresholds.json` - All tunable parameters
+- `speaker/matcher.py` - Speaker matching logic (extracted from server.py)
 - `AGENTS.md` - Detailed technical documentation

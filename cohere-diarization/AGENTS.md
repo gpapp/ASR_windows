@@ -76,7 +76,29 @@ If `voiceprints.json` exists in the cohere-diarization folder, it's auto-loaded 
 - `TRANSCRIBE_VAD_THRESHOLD` - VAD threshold
 - `TRANSCRIBE_VAD_MIN_SPEECH_DURATION_MS` - VAD min speech duration
 
+## Debug Mode
+
+Enable debug output by setting `"debug": true` in `config/thresholds.json`:
+```json
+{
+  "debug": true
+}
+```
+
+When enabled, server logs detailed speaker matching info including:
+- Cluster to voiceprint distances
+- Best match selection reasoning
+- Cluster merging decisions
+
 ## Technical Details
+
+### Configuration
+All tunable parameters are in `config/thresholds.json`:
+- Diarization thresholds (clustering, merging)
+- Matching thresholds (acceptance, clear winner gap)
+- Weights (embedding, pitch, energy)
+- Normalization factors
+- Debug flag
 
 ### Embedding Model
 Uses `Wespeaker/wespeaker-ecapa-tdnn512-LM` for speaker embeddings (192-dimensional).
@@ -87,9 +109,9 @@ Uses `Wespeaker/wespeaker-ecapa-tdnn512-LM` for speaker embeddings (192-dimensio
 - Can be overridden with `--num-speakers N`
 
 ### Voiceprint Matching
-- Matching threshold: 0.16 (distance below this = potential match)
-- Clear winner requirement: best match must be at least 0.02 better than second-best
-- When embedding distance < 0.15, uses pure embedding (ignores pitch/energy)
+- Accept threshold: 0.35 (combined distance below this = match)
+- Clear winner gap: 0.02 (best must beat second-best by this much)
+- Embed-only threshold: 0.16 (when emb_dist < this, lower accept threshold applies)
 - CMN (Cepstral Mean Normalization) applied per 1.5s window - critical for speaker discrimination
 
 ### VAD Acceleration
