@@ -21,7 +21,11 @@ The server will automatically exit after 1 second.
 
 ### Server Endpoints
 - `GET /health` - Health check
-- `POST /diarize/path` - Diarize audio file
+- `GET /metrics` - Prometheus-style metrics
+- `POST /diarize/path` - Diarize audio file by local path
+- `POST /transcribe/upload` - Transcribe uploaded audio file
+- `POST /transcribe/paths` - Transcribe audio chunks by local path list
+- `POST /transcribe` - Transcribe audio (generic)
 - `POST /shutdown` - Shutdown server (requires API key)
 
 ## Voiceprints (Speaker Recognition)
@@ -94,25 +98,56 @@ When enabled, server logs detailed speaker matching info including:
 
 ### Configuration
 All tunable parameters are in `config/thresholds.json`:
-- Diarization thresholds (clustering, merging)
-- Matching thresholds (acceptance, clear winner gap)
-- Weights (embedding, pitch, energy)
-- Normalization factors
-- Debug flag
+
+```json
+{
+  "diarization": {
+    "default_threshold": 0.35,   // clustering cosine distance
+    "max_clusters": 15,
+    "merge_threshold": 0.25,     // greedy post-merge threshold
+    "close_match_threshold": 0.17,
+    "min_segment_duration": 0.5
+  },
+  "matching": {
+    "accept_threshold": 0.35,
+    "clear_winner_gap": 0.02,
+    "embed_only_threshold": 0.16,
+    "confidence_threshold": 0.3,
+    "embed_only_accept_threshold": 0.22
+  },
+  "weights": { "embedding": 0.7, "pitch": 0.2, "energy": 0.1 },
+  "normalization": { "pitch_hz_per_unit": 50, "energy_rms_per_unit": 0.05, "confidence_max_distance": 0.5 },
+  "vad": { "default_threshold": 0.5, "min_speech_duration_ms": 250, "chunk_duration": 30, "overlap": 5 },
+  "debug": false
+}
+```
 
 ### Embedding Model
 Uses `Wespeaker/wespeaker-ecapa-tdnn512-LM` for speaker embeddings (192-dimensional).
 
+### Diarization Pipeline
+1. **VAD** — Silero VAD (ONNX/DirectML with CPU fallback) detects speech segments, chunked in 30s with 5s overlap.
+2. **Energy-dip splitting** (`speaker/vad.py:split_at_energy_dips`) — Long segments (>5s) are split at local RMS energy minima (dip_ratio=0.35, min_dip_dur=0.15s) to reduce cross-speaker window contamination.
+3. **Sliding-window embedding** (`speaker/audio.py:generate_sliding_windows`) — 2.0s windows, 0.75s stride. CMN applied per window inside `extract_embedding`.
+4. **Agglomerative clustering** — Default cosine threshold 0.35, max 15 clusters.
+5. **Greedy merge** — Clusters with centroid cosine distance < 0.25 are merged.
+6. **Speaker profiling** (`speaker/profiling.py:profile_speakers`) — Autocorrelation pitch + RMS energy per speaker.
+7. **Relabelling** (`speaker/profiling.py:relabel_by_pitch`) — SPEAKER1 = lowest pitch, ascending.
+8. **Boundary refinement** (`speaker/audio.py:refine_speaker_boundaries`) — At each speaker transition, fine 0.5s sub-windows (0.1s stride) are embedded and compared to adjacent cluster centroids; boundary moved to the precise switch point.
+9. **Island absorption** — Isolated segments < 1.0s surrounded by the same speaker are absorbed.
+10. **Voiceprint matching** (`speaker/matcher.py`) — Combined distance (emb 0.7 + pitch 0.2 + energy 0.1); clear winner gap 0.02.
+
 ### Clustering
 - Default threshold: 0.35 (higher = fewer clusters)
 - Max clusters capped at 15 to prevent over-segmentation
+- Post-clustering greedy merge at 0.25
 - Can be overridden with `--num-speakers N`
 
 ### Voiceprint Matching
 - Accept threshold: 0.35 (combined distance below this = match)
 - Clear winner gap: 0.02 (best must beat second-best by this much)
-- Embed-only threshold: 0.16 (when emb_dist < this, lower accept threshold applies)
-- CMN (Cepstral Mean Normalization) applied per 1.5s window - critical for speaker discrimination
+- Embed-only threshold: 0.16 (when emb_dist < this, lower accept threshold 0.22 applies)
+- CMN (Cepstral Mean Normalization) applied per window — critical for speaker discrimination
 
 ### VAD Acceleration
 Silero VAD runs on ONNX with DirectML for iGPU acceleration. Falls back to PyTorch CPU if unavailable.

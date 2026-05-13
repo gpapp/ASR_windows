@@ -24,7 +24,7 @@ python transcribe.py meeting.mp4 --num-speakers 4
 ## Diarization Workflow
 
 ```
-Audio Input → VAD (Voice Activity Detection) → Feature Extraction → Embedding → Clustering → Speaker Identification
+Audio Input → VAD → Energy-dip Splitting → Feature Extraction → Embedding → Clustering → Boundary Refinement → Speaker Identification
 ```
 
 ### Key Options
@@ -35,29 +35,42 @@ Audio Input → VAD (Voice Activity Detection) → Feature Extraction → Embedd
 
 ### Technical Details
 - **Embedding Model:** Wespeaker ecapa-tdnn512 (192-dimensional)
-- **Max Clusters:** 15 (capped to prevent over-segmentation)
+- **Sliding Window:** 2.0s window, 0.75s stride (reduced from 3.0s/1.5s to limit cross-speaker contamination)
+- **Energy-dip Splitting:** Long VAD segments (>5s) are split at natural energy minima before embedding extraction, reducing spill-over when speakers alternate with minimal silence
+- **Boundary Refinement:** After clustering, each speaker transition is re-examined with 0.5s sub-windows (0.1s stride) to find the precise switch point
+- **Max Clusters:** 15 (capped to prevent over-segmentation), then greedy-merged below 0.25 cosine distance
+- **Speaker Gap:** 1.0s max gap before a same-speaker segment is split (reduced from 2.0s)
+- **Island Absorption:** Isolated segments shorter than 1.0s surrounded by the same speaker are absorbed (reduced from 2.1s)
 - **Configuration:** All tunable parameters in `config/thresholds.json`
-- **Clear Winner:** Best match must beat second-best by 0.02 gap
 - **CMN:** Cepstral Mean Normalization applied per window (critical for speaker discrimination)
 
 ## Voiceprint Management
 
+### Extracting Training Segments
+```powershell
+# Identify known speakers and extract their segments:
+uv run voiceprint_mgmt.py extract --audio meeting.mp4 --voiceprints voiceprints.json --output segments/
+
+# Also extract unknown speakers for training new voiceprints:
+uv run voiceprint_mgmt.py extract --audio meeting.mp4 --voiceprints voiceprints.json --output segments/ --include-unknown
+
+# Extract a specific time range manually:
+uv run voiceprint_mgmt.py extract --audio meeting.mp4 --speaker "John" --start 00:05:30 --end 00:06:15 --output segments/
+```
+
 ### Creating Voiceprints
 ```powershell
 # Create from a single segment
-python voiceprint_mgmt.py create video.mp4 00:05:30 00:06:15 "John"
-
-# Extract segments from diarization
-python voiceprint_mgmt.py extract --audio meeting.mp4 --diarize diarization.json --speaker "SPEAKER_00" --output segments/
+uv run voiceprint_mgmt.py create video.mp4 00:05:30 00:06:15 "John"
 ```
 
 ### Refining Voiceprints
 ```powershell
 # Single speaker
-python voiceprint_mgmt.py refine --voiceprints voiceprints.json --speaker "John" --segments segments/John/
+uv run voiceprint_mgmt.py refine --voiceprints voiceprints.json --speaker "John" --segments segments/John/
 
 # Batch refine multiple speakers
-python voiceprint_mgmt.py mass_refine segments/ --voiceprints voiceprints.json
+uv run voiceprint_mgmt.py mass_refine segments/ --voiceprints voiceprints.json
 ```
 
 ### Voiceprint Format
@@ -91,6 +104,7 @@ When refining, longer segments have proportionally more influence:
 |-----------|--------|-------------|
 | `/health` | GET | Health check |
 | `/diarize/path` | POST | Diarize audio file by path |
+| `/transcribe/paths` | POST | Transcribe audio chunks by path |
 | `/shutdown` | POST | Shutdown server |
 
 ## Project Structure
@@ -98,25 +112,24 @@ When refining, longer segments have proportionally more influence:
 ```
 cohere-diarization/
 ├── config/
-│   ├── thresholds.json   # All tunable parameters
-│   └── __init__.py       # Config loader
+│   ├── thresholds.json        # All tunable parameters
+│   └── __init__.py            # Config loader
 ├── speaker/
-│   ├── embedding.py      # Embedding extraction functions
-│   ├── matcher.py        # Speaker matching logic
+│   ├── audio.py               # extract_fbank, generate_sliding_windows, refine_speaker_boundaries
+│   ├── embedding.py           # Embedding extraction (ONNX + CMN)
+│   ├── matcher.py             # Speaker matching logic
+│   ├── profiling.py           # profile_speakers, relabel_by_pitch
+│   ├── vad.py                 # run_vad_chunked, run_vad_onnx, split_at_energy_dips
 │   └── __init__.py
-├── server.py            # FastAPI server with ONNX inference
-├── transcribe.py         # CLI client
-├── voiceprint_mgmt.py   # Voiceprint CLI (create, extract, refine)
-├── voiceprint_utils.py  # Shared utilities
-└── tests/
-    ├── test_matcher.py   # Unit tests for matching
-    └── test_embedding.py # Unit tests for embeddings
+├── tests/
+│   ├── test_cmn_embedding.py  # CMN consistency regression tests
+│   ├── test_embedding.py      # Embedding unit tests
+│   ├── test_matcher.py        # Matcher unit tests
+│   ├── test_offset_indexing.py # ONNX decoder offset regression tests
+│   └── test_vad_splitting.py  # VAD splitting tests
+├── server.py                  # FastAPI server with ONNX inference
+├── transcribe.py              # CLI client
+├── voiceprint_mgmt.py         # Voiceprint CLI (create, extract, refine)
+├── voiceprint_utils.py        # Shared voiceprint utilities
+└── AGENTS.md                  # Detailed technical documentation
 ```
-
-- `server.py` - FastAPI server with ONNX inference
-- `transcribe.py` - Client orchestrator
-- `voiceprint_mgmt.py` - Voiceprint CLI (create, extract, refine, mass_refine)
-- `voiceprint_utils.py` - Shared voiceprint utilities
-- `config/thresholds.json` - All tunable parameters
-- `speaker/matcher.py` - Speaker matching logic (extracted from server.py)
-- `AGENTS.md` - Detailed technical documentation
