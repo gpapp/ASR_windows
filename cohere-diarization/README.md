@@ -24,7 +24,7 @@ python transcribe.py meeting.mp4 --num-speakers 4
 ## Diarization Workflow
 
 ```
-Audio Input → VAD → Energy-dip Splitting → Feature Extraction → Embedding → Clustering → Boundary Refinement → Speaker Identification
+Audio Input → VAD → Energy-dip Splitting → Feature Extraction → Embedding → Clustering → Boundary Refinement → Ghost-speaker Elimination → Speaker Identification
 ```
 
 ### Key Options
@@ -37,7 +37,8 @@ Audio Input → VAD → Energy-dip Splitting → Feature Extraction → Embeddin
 - **Embedding Model:** Wespeaker ecapa-tdnn512 (192-dimensional)
 - **Sliding Window:** 2.0s window, 0.75s stride (reduced from 3.0s/1.5s to limit cross-speaker contamination)
 - **Energy-dip Splitting:** Long VAD segments (>5s) are split at natural energy minima before embedding extraction, reducing spill-over when speakers alternate with minimal silence
-- **Boundary Refinement:** After clustering, each speaker transition is re-examined with 0.5s sub-windows (0.1s stride) to find the precise switch point
+- **Boundary Refinement:** After clustering, all speaker-transition sub-windows are collected and embedded in a single batched ONNX call, then each boundary is walked to find the precise switch point (0.5s sub-windows, 0.1s stride)
+- **Ghost-speaker Elimination:** After all merging, speakers with < 2s total speech are reassigned — using stored voiceprint alternatives first, then falling back to the nearest temporal neighbour
 - **Max Clusters:** 15 (capped to prevent over-segmentation), then greedy-merged below 0.25 cosine distance
 - **Speaker Gap:** 1.0s max gap before a same-speaker segment is split (reduced from 2.0s)
 - **Island Absorption:** Isolated segments shorter than 1.0s surrounded by the same speaker are absorbed (reduced from 2.1s)
@@ -58,6 +59,10 @@ uv run voiceprint_mgmt.py extract --audio meeting.mp4 --voiceprints voiceprints.
 uv run voiceprint_mgmt.py extract --audio meeting.mp4 --speaker "John" --start 00:05:30 --end 00:06:15 --output segments/
 ```
 
+Segments with less than 10s total detected speech are skipped automatically.
+Extracted segments are written as FLAC (lossless, ~3x smaller than WAV) directly
+from the in-memory decoded audio — no intermediate files.
+
 ### Creating Voiceprints
 ```powershell
 # Create from a single segment
@@ -71,7 +76,14 @@ uv run voiceprint_mgmt.py refine --voiceprints voiceprints.json --speaker "John"
 
 # Batch refine multiple speakers
 uv run voiceprint_mgmt.py mass_refine segments/ --voiceprints voiceprints.json
+
+# Use larger ONNX batches for many segments (default: 600s = 10 min per batch)
+uv run voiceprint_mgmt.py mass_refine segments/ --voiceprints voiceprints.json --block-sec 1200
 ```
+
+`refine` and `mass_refine` accept `.wav`, `.mp3`, and `.flac` segments.
+All files are loaded first and embedded in batched ONNX blocks (`--block-sec`),
+so ONNX round-trips scale with total audio duration rather than file count.
 
 ### Voiceprint Format
 ```json
@@ -116,7 +128,7 @@ cohere-diarization/
 │   └── __init__.py            # Config loader
 ├── speaker/
 │   ├── audio.py               # extract_fbank, generate_sliding_windows, refine_speaker_boundaries
-│   ├── embedding.py           # Embedding extraction (ONNX + CMN)
+│   ├── embedding.py           # Embedding extraction (ONNX + CMN) + batch_embed_files
 │   ├── matcher.py             # Speaker matching logic
 │   ├── profiling.py           # profile_speakers, relabel_by_pitch
 │   ├── vad.py                 # run_vad_chunked, run_vad_onnx, split_at_energy_dips
@@ -129,7 +141,7 @@ cohere-diarization/
 │   └── test_vad_splitting.py  # VAD splitting tests
 ├── server.py                  # FastAPI server with ONNX inference
 ├── transcribe.py              # CLI client
-├── voiceprint_mgmt.py         # Voiceprint CLI (create, extract, refine)
+├── voiceprint_mgmt.py         # Voiceprint CLI (create, extract, refine, mass_refine)
 ├── voiceprint_utils.py        # Shared voiceprint utilities
 └── AGENTS.md                  # Detailed technical documentation
 ```

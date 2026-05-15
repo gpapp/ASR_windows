@@ -93,6 +93,7 @@ When enabled, server logs detailed speaker matching info including:
 - Cluster to voiceprint distances
 - Best match selection reasoning
 - Cluster merging decisions
+- Ghost-speaker reassignments (speakers < 2s total)
 
 ## Technical Details
 
@@ -133,9 +134,10 @@ Uses `Wespeaker/wespeaker-ecapa-tdnn512-LM` for speaker embeddings (192-dimensio
 5. **Greedy merge** — Clusters with centroid cosine distance < 0.25 are merged.
 6. **Speaker profiling** (`speaker/profiling.py:profile_speakers`) — Autocorrelation pitch + RMS energy per speaker.
 7. **Relabelling** (`speaker/profiling.py:relabel_by_pitch`) — SPEAKER1 = lowest pitch, ascending.
-8. **Boundary refinement** (`speaker/audio.py:refine_speaker_boundaries`) — At each speaker transition, fine 0.5s sub-windows (0.1s stride) are embedded and compared to adjacent cluster centroids; boundary moved to the precise switch point.
+8. **Boundary refinement** (`speaker/audio.py:refine_speaker_boundaries`) — All transition sub-windows across the entire file are collected first, then embedded in a single batched ONNX call. Each boundary is then walked to the precise speaker-switch point (0.5s sub-windows, 0.1s stride).
 9. **Island absorption** — Isolated segments < 1.0s surrounded by the same speaker are absorbed.
 10. **Voiceprint matching** (`speaker/matcher.py`) — Combined distance (emb 0.7 + pitch 0.2 + energy 0.1); clear winner gap 0.02.
+11. **Ghost-speaker elimination** — Speakers with < 2s total speech across the whole file are reassigned: stored voiceprint alternatives are tried first; if none qualify, the segment is merged into the nearest temporal neighbour. Adjacent same-speaker segments are then re-collapsed.
 
 ### Clustering
 - Default threshold: 0.35 (higher = fewer clusters)
@@ -192,6 +194,12 @@ uv run voiceprint_mgmt.py extract --audio meeting.mp4 --diarize diarization.json
 uv run voiceprint_mgmt.py refine --voiceprints voiceprints.json --speaker "John" --segments segments/
 ```
 
+When using `--voiceprints` for automatic speaker identification:
+- Speakers with less than 10s total detected speech are skipped
+- Segments are written as FLAC directly from the decoded in-memory audio (no intermediate WAV)
+- Speaker boundaries are refined with a batched ONNX pass before extraction
+- Match threshold defaults to 0.3 (cosine distance); lower = stricter matching
+
 ### Mass Refine (Batch Processing)
 
 Process multiple speakers from a folder structure:
@@ -201,17 +209,24 @@ Process multiple speakers from a folder structure:
 # segments/
 #   John/
 #     audio1.wav
-#     audio2.wav
+#     audio2.flac
 #   Jane/
-#     audio1.wav
-#     audio2.wav
+#     audio1.flac
 
 # Refine all speakers at once:
 uv run voiceprint_mgmt.py mass_refine segments/ --voiceprints voiceprints.json
 
 # Skip speakers who already have voiceprints:
 uv run voiceprint_mgmt.py mass_refine segments/ --voiceprints voiceprints.json --skip-existing
+
+# Use larger ONNX batches (default 600s = 10 min per call):
+uv run voiceprint_mgmt.py mass_refine segments/ --voiceprints voiceprints.json --block-sec 1200
 ```
+
+`refine` and `mass_refine` accept `.wav`, `.mp3`, and `.flac` files.
+All files for a speaker are loaded first, then embedded in a single batched ONNX
+pass (`--block-sec` controls block size). ONNX round-trips scale with total audio
+duration rather than file count.
 
 ### Voiceprint Quality Guidelines
 

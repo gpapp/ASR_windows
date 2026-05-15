@@ -21,6 +21,7 @@ import torch
 import torchaudio
 import onnxruntime as ort
 import soundfile as sf
+from tqdm import tqdm
 
 # Re-export from speaker module for backwards compatibility
 from speaker.embedding import extract_embedding, compute_pitch, compute_energy
@@ -163,9 +164,10 @@ def identify_speakers_in_audio(
     sample_rate: int = 16000,
     vad_threshold: float = 0.5,
     vad_min_speech_ms: int = 250,
-    match_threshold: float = 0.4,
+    match_threshold: float = 0.3,
     single_speaker_threshold: float = 0.8,
-) -> list[dict]:
+    include_unknown: bool = False,
+) -> tuple[list[dict], np.ndarray, int]:
     """
     Identify speakers in audio using existing voiceprints.
     Only returns segments that are clearly a SINGLE speaker.
@@ -173,24 +175,24 @@ def identify_speakers_in_audio(
 
     Args:
         single_speaker_threshold: Fraction of windows that must match the dominant speaker
+        include_unknown: If True, also return segments that don't match any known voiceprint,
+                         labelled as UNKNOWN_1, UNKNOWN_2, etc. based on embedding similarity.
 
     Returns:
-        List of dicts with: start, end, speaker, confidence
+        Tuple of (segments, waveform, sample_rate) where segments is a list of dicts
+        with: start, end, speaker, confidence. Waveform is float32 numpy array at sample_rate.
     """
-    import librosa
-    import soundfile as sf
-
-    # Load audio using soundfile (faster than librosa)
-    waveform, sr = sf.read(audio_path)
-    if waveform.ndim > 1:
-        waveform = waveform.mean(axis=1)  # Stereo to mono
-    waveform = waveform.astype(np.float32)
-    if sr != sample_rate:
-        # Use torchaudio for resampling (already imported)
-        waveform_tensor = torch.from_numpy(waveform).unsqueeze(0).float()
-        waveform_tensor = torchaudio.functional.resample(waveform_tensor, orig_freq=sr, new_freq=sample_rate)
-        waveform = waveform_tensor.squeeze(0).numpy()
-        sr = sample_rate
+    # Decode audio to raw PCM via ffmpeg pipe — handles any container (MKV, MP4, WAV, ...)
+    # without writing a temp file and without depending on torchaudio backends.
+    cmd = [
+        "ffmpeg", "-nostdin", "-i", audio_path,
+        "-ar", str(sample_rate), "-ac", "1",
+        "-f", "f32le", "-loglevel", "error", "pipe:1",
+    ]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed decoding {audio_path}: {result.stderr.decode()}")
+    waveform = np.frombuffer(result.stdout, dtype=np.float32).copy()
     waveform_tensor = torch.from_numpy(waveform).unsqueeze(0).float()
 
     # Run VAD to get speech segments
@@ -229,10 +231,16 @@ def identify_speakers_in_audio(
             speech_ts = [{"start": 0, "end": len(waveform) / sample_rate}]
 
     if not speech_ts:
-        return []
+        return [], waveform, sample_rate
 
-    # Import server functions for embedding extraction
-    from server import generate_sliding_windows, extract_fbank
+    # Split long VAD segments at energy dips — same pre-processing as the server
+    # diarization pipeline. Reduces cross-speaker window contamination when two
+    # speakers alternate with minimal silence.
+    from speaker.vad import split_at_energy_dips
+    speech_ts = split_at_energy_dips(speech_ts, waveform, sample_rate=sample_rate)
+
+    # Import audio helpers
+    from speaker.audio import generate_sliding_windows, extract_fbank, refine_speaker_boundaries
 
     # Prepare known speaker embeddings
     known_embeddings = {}
@@ -241,7 +249,7 @@ def identify_speakers_in_audio(
             known_embeddings[name] = np.array(profile["embedding"])
 
     if not known_embeddings:
-        return []
+        return [], waveform, sample_rate
 
     # Track new speakers (unknown speakers get assigned SPEAKER1, SPEAKER2, etc.)
     new_speaker_counter = 1
@@ -249,8 +257,7 @@ def identify_speakers_in_audio(
 
     # Process each VAD segment - check if it's a single speaker
     all_segments = []
-
-    from tqdm import tqdm
+    unknown_segments = []  # Collect unmatched segments with embeddings for clustering
 
     total_segments = len(speech_ts)
     for ts in tqdm(speech_ts, desc="Identifying speakers", unit="segment"):
@@ -259,7 +266,9 @@ def identify_speakers_in_audio(
         segment_wav = waveform_tensor[:, start_sample:end_sample]
 
         # Generate sliding windows and extract embeddings
-        windows, start_times = generate_sliding_windows(segment_wav, sample_rate, window_sec=3.0, stride_sec=2.0)
+        # Use same parameters as server diarization pipeline (2.0s window, 0.75s stride)
+        # to keep contamination at speaker boundaries below 0.75s.
+        windows, start_times = generate_sliding_windows(segment_wav, sample_rate, window_sec=2.0, stride_sec=0.75)
 
         all_fbanks = []
         window_info = []
@@ -287,7 +296,10 @@ def identify_speakers_in_audio(
                 fb = torch.nn.functional.pad(fb, (0, 0, 0, max_len - fb.shape[1]))
             padded_fbanks.append(fb)
 
-        batch = torch.stack(padded_fbanks).squeeze(1).numpy()
+        batch = torch.stack(padded_fbanks)  # [N, 1, max_len, 80]
+        # Apply CMN (Cepstral Mean Normalization) — critical for ECAPA-TDNN
+        batch = batch - batch.mean(dim=2, keepdim=True)
+        batch = batch.squeeze(1).numpy()  # [N, max_len, 80]
 
         embeddings = embedding_session.run(None, {embedding_session.get_inputs()[0].name: batch})[0]
 
@@ -319,10 +331,12 @@ def identify_speakers_in_audio(
                 window_matches.append((None, 0.0, 1.0))
 
         # Check if this is a SINGLE speaker segment
-        # Count matches per speaker
+        # Count matches per speaker (including None for unmatched)
         speaker_counts = {}
+        unmatched_count = 0
         for spk, conf, dist in window_matches:
             if spk is None:
+                unmatched_count += 1
                 continue
             if spk not in speaker_counts:
                 speaker_counts[spk] = {"count": 0, "total_conf": 0, "total_dist": 0}
@@ -330,11 +344,21 @@ def identify_speakers_in_audio(
             speaker_counts[spk]["total_conf"] += conf
             speaker_counts[spk]["total_dist"] += dist
 
+        total_windows = len(window_matches)
+
         if not speaker_counts:
-            continue  # No identifiable speakers in this segment
+            # No known speaker matched — this is an unknown speaker segment
+            if include_unknown:
+                mean_emb = embeddings.mean(axis=0)
+                mean_emb = mean_emb / (np.linalg.norm(mean_emb) + 1e-12)
+                unknown_segments.append({
+                    "start": round(ts['start'], 3),
+                    "end": round(ts['end'], 3),
+                    "embedding": mean_emb,
+                })
+            continue
 
         # Find dominant speaker
-        total_windows = len(window_matches)
         dominant_speaker = max(speaker_counts.items(), key=lambda x: x[1]["count"])
         dominant_name = dominant_speaker[0]
         dominant_count = dominant_speaker[1]["count"]
@@ -344,7 +368,15 @@ def identify_speakers_in_audio(
         dominant_ratio = dominant_count / total_windows
 
         if dominant_ratio < single_speaker_threshold:
-            # Ambiguous - multiple speakers in this segment, skip it
+            # Ambiguous - if mostly unmatched, treat as unknown
+            if include_unknown and unmatched_count / total_windows > 0.5:
+                mean_emb = embeddings.mean(axis=0)
+                mean_emb = mean_emb / (np.linalg.norm(mean_emb) + 1e-12)
+                unknown_segments.append({
+                    "start": round(ts['start'], 3),
+                    "end": round(ts['end'], 3),
+                    "embedding": mean_emb,
+                })
             continue
 
         # This is a single speaker segment - use the dominant speaker
@@ -360,9 +392,95 @@ def identify_speakers_in_audio(
             "distance": round(avg_dist, 4)
         })
 
+    # Cluster unknown segments into distinct speakers (same logic as server.py diarization)
+    unknown_centroids: dict[str, np.ndarray] = {}
+    if include_unknown and unknown_segments:
+        from sklearn.cluster import AgglomerativeClustering
+        from scipy.spatial.distance import cosine
+
+        unknown_embeddings = np.array([s["embedding"] for s in unknown_segments])
+
+        if len(unknown_segments) == 1:
+            labels = np.array([0])
+        else:
+            # Initial clustering with distance threshold
+            clusterer = AgglomerativeClustering(
+                n_clusters=None,
+                metric="cosine",
+                linkage="average",
+                distance_threshold=0.35,
+            )
+            labels = clusterer.fit_predict(unknown_embeddings)
+
+            n_clusters = len(set(int(l) for l in labels))
+
+            # Cap at 10 clusters max (like server caps at 15, then merges)
+            max_clusters = 10
+            if n_clusters > max_clusters:
+                clusterer = AgglomerativeClustering(
+                    n_clusters=max_clusters,
+                    metric="cosine",
+                    linkage="average",
+                )
+                labels = clusterer.fit_predict(unknown_embeddings)
+                n_clusters = max_clusters
+
+            # Greedy merge: merge closest cluster pairs below threshold
+            if n_clusters > 1:
+                merge_threshold = 0.25
+                cluster_ids = sorted(set(int(l) for l in labels))
+                cluster_avgs = {}
+                for cid in cluster_ids:
+                    mask = labels == cid
+                    avg = unknown_embeddings[mask].mean(axis=0)
+                    cluster_avgs[cid] = avg / (np.linalg.norm(avg) + 1e-12)
+
+                changed = True
+                while changed:
+                    changed = False
+                    ids = sorted(cluster_avgs.keys())
+                    for i_idx in range(len(ids)):
+                        for j_idx in range(i_idx + 1, len(ids)):
+                            id_i, id_j = ids[i_idx], ids[j_idx]
+                            if id_i not in cluster_avgs or id_j not in cluster_avgs:
+                                continue
+                            dist = cosine(cluster_avgs[id_i], cluster_avgs[id_j])
+                            if dist < merge_threshold:
+                                # Merge j into i
+                                labels[labels == id_j] = id_i
+                                mask_i = labels == id_i
+                                avg = unknown_embeddings[mask_i].mean(axis=0)
+                                cluster_avgs[id_i] = avg / (np.linalg.norm(avg) + 1e-12)
+                                del cluster_avgs[id_j]
+                                changed = True
+                                break
+                        if changed:
+                            break
+
+        # Remap labels to contiguous 1-based numbering
+        unique_labels = sorted(set(int(l) for l in labels))
+        label_map = {old: new + 1 for new, old in enumerate(unique_labels)}
+
+        # Build per-UNKNOWN centroid from clustered embeddings (for boundary refinement)
+        unknown_centroids: dict[str, np.ndarray] = {}
+        unk_emb_matrix = np.array([s["embedding"] for s in unknown_segments])
+        for old_label in unique_labels:
+            mask = labels == old_label
+            avg = unk_emb_matrix[mask].mean(axis=0)
+            unknown_centroids[f"UNKNOWN_{label_map[old_label]}"] = avg / (np.linalg.norm(avg) + 1e-12)
+
+        for seg, label in zip(unknown_segments, labels):
+            all_segments.append({
+                "start": seg["start"],
+                "end": seg["end"],
+                "speaker": f"UNKNOWN_{label_map[int(label)]}",
+                "confidence": 0.0,
+                "distance": 1.0,
+            })
+
     # Merge adjacent segments for same speaker
     if not all_segments:
-        return []
+        return [], waveform, sample_rate
 
     all_segments.sort(key=lambda x: x["start"])
     merged = [all_segments[0].copy()]
@@ -380,7 +498,27 @@ def identify_speakers_in_audio(
         else:
             merged.append(seg.copy())
 
-    return merged
+    # Refine speaker boundaries: all sub-windows across all transitions are
+    # collected and embedded in a single batched ONNX call, so the cost is
+    # one inference round-trip regardless of the number of transitions.
+    if len(merged) >= 2:
+        centroids: dict[str, np.ndarray] = {}
+        for name, emb in known_embeddings.items():
+            centroids[name] = np.array(emb)
+        if include_unknown and unknown_segments:
+            centroids.update(unknown_centroids)
+        active_speakers = set(s["speaker"] for s in merged)
+        active_centroids = {k: v for k, v in centroids.items() if k in active_speakers}
+        if len(active_centroids) >= 2:
+            merged = refine_speaker_boundaries(
+                merged,
+                waveform_tensor,
+                embedding_session,
+                active_centroids,
+                sample_rate=sample_rate,
+            )
+
+    return merged, waveform, sample_rate
 
 
 def extract_speaker_segments(
@@ -422,7 +560,7 @@ def extract_speaker_segments(
     wav_path = ensure_wav(audio_file, output_dir)
 
     extracted = []
-    for i, seg in enumerate(matching):
+    for i, seg in enumerate(tqdm(matching, desc=f"Extracting {speaker_name}", unit="seg")):
         start = seg.get("start", 0)
         end = seg.get("end", 0)
         duration = end - start
@@ -461,21 +599,28 @@ def refine_voiceprint_from_segments(
     voiceprints_file: Path,
     speaker_name: str,
     segments_dir: Path,
-    min_duration: float = 1.5
+    min_duration: float = 1.5,
+    block_sec: float = 600.0,
 ) -> dict:
     """
     Refine a voiceprint by processing all segments in a directory.
+
+    All audio files are loaded first, then embedded in batched ONNX blocks of
+    ``block_sec`` seconds (default 10 minutes) so the inference engine is used
+    efficiently regardless of how many files are present.
 
     Args:
         voiceprints_file: Path to voiceprints.json
         speaker_name: Speaker to refine
         segments_dir: Directory containing extracted segments
         min_duration: Minimum segment duration
+        block_sec: Total audio seconds to process per ONNX call (default 600 = 10 min)
 
     Returns:
         Updated voiceprint dict
     """
     from server import Settings, state
+    from speaker.embedding import batch_embed_files
 
     voiceprints = load_voiceprints(voiceprints_file)
 
@@ -501,107 +646,119 @@ def refine_voiceprint_from_segments(
     if not segments_dir.exists():
         raise ValueError(f"Segments directory not found: {segments_dir}")
 
-    wav_files = sorted(segments_dir.glob("*.wav"))
+    wav_files = sorted(segments_dir.glob("*.wav")) + sorted(segments_dir.glob("*.mp3")) + sorted(segments_dir.glob("*.flac"))
     if not wav_files:
-        raise ValueError(f"No .wav files found in {segments_dir}")
+        raise ValueError(f"No .wav, .mp3, or .flac files found in {segments_dir}")
 
-    all_embeddings = []
-    all_pitches = []
-    all_energies = []
-    all_durations = []  # Track durations for weighted averaging
-    pitch_durations = []  # Separate list for pitch durations
-    total_duration = 0.0
-    valid_count = 0
+    # ------------------------------------------------------------------ #
+    # Pass 1: load all audio files, filter by duration.
+    # ------------------------------------------------------------------ #
+    valid_files   = []
+    waveforms     = []
+    sample_rates  = []
+    all_durations = []
+    all_pitches   = []
+    all_energies  = []
+    pitch_durations = []
 
-    for wav_file in wav_files:
+    print(f"[INFO] Loading {len(wav_files)} files...")
+    for wav_file in tqdm(wav_files, desc=f"Loading {speaker_name}", unit="file"):
         try:
             waveform, sr = load_audio_segment(str(wav_file), 0, None)
-
             duration = waveform.shape[-1] / sr
             if duration < min_duration:
                 print(f"[SKIP] {wav_file.name} too short: {duration:.1f}s")
                 continue
 
-            emb = extract_embedding(waveform, sr, embedding_session)
             pitch, pitch_std = compute_pitch(waveform, sr)
             energy = compute_energy(waveform)
 
-            all_embeddings.append(np.array(emb))
-            all_energies.append(energy)
+            valid_files.append(wav_file)
+            waveforms.append(waveform)
+            sample_rates.append(sr)
             all_durations.append(duration)
-            total_duration += duration
-            valid_count += 1
-
+            all_energies.append(energy)
             if pitch > 0:
                 all_pitches.append(pitch)
                 pitch_durations.append(duration)
 
-            print(f"[OK] {wav_file.name}: pitch={pitch:.1f}Hz, energy={energy:.4f}")
-
         except Exception as e:
-            print(f"[WARN] Failed to process {wav_file.name}: {e}")
+            print(f"[WARN] Failed to load {wav_file.name}: {e}")
             continue
 
-    if not all_embeddings:
+    if not waveforms:
         raise ValueError("No valid segments processed")
 
-    print(f"[INFO] Processed {valid_count} segments: {total_duration:.1f}s total")
+    total_duration = sum(all_durations)
+    print(f"[INFO] Loaded {len(waveforms)} segments: {total_duration:.1f}s total")
+    print(f"[INFO] Embedding in {block_sec:.0f}s blocks...")
 
-    # Duration-weighted averaging for new embeddings
-    durations_array = np.array(all_durations)
+    # ------------------------------------------------------------------ #
+    # Pass 2: batch-embed all files — one (or a few) ONNX calls total.
+    # ------------------------------------------------------------------ #
+    embeddings = batch_embed_files(waveforms, sample_rates, all_durations,
+                                   embedding_session, block_sec=block_sec)
+
+    all_embeddings = []
+    valid_durations = []
+    for i, emb in enumerate(embeddings):
+        if emb is None:
+            print(f"[WARN] No embeddable windows in {valid_files[i].name}")
+            continue
+        all_embeddings.append(emb)
+        valid_durations.append(all_durations[i])
+
+    if not all_embeddings:
+        raise ValueError("No valid embeddings produced")
+
+    valid_count = len(all_embeddings)
+    print(f"[INFO] Embedded {valid_count} segments")
+
+    # ------------------------------------------------------------------ #
+    # Pass 3: duration-weighted averaging — identical logic to before.
+    # ------------------------------------------------------------------ #
+    durations_array = np.array(valid_durations)
     weights = durations_array / durations_array.sum()
     combined_emb = np.average(np.stack(all_embeddings), axis=0, weights=weights)
     combined_emb = combined_emb / (np.linalg.norm(combined_emb) + 1e-12)
 
-    # Blend with existing embedding using duration-weighted averaging
     current = voiceprints.get(speaker_name, {})
     prev_duration = current.get("total_speech_sec", 0)
     prev_embedding = current.get("embedding")
-    
+
     if prev_embedding is not None and prev_duration > 0 and total_duration > 0:
-        # Duration-weighted blend: existing_weight = prev_duration / (prev_duration + new_duration)
         prev_emb = np.array(prev_embedding)
         prev_emb = prev_emb / (np.linalg.norm(prev_emb) + 1e-12)
         prev_weight = prev_duration / (prev_duration + total_duration)
         new_weight = total_duration / (prev_duration + total_duration)
         combined_emb = prev_emb * prev_weight + combined_emb * new_weight
         combined_emb = combined_emb / (np.linalg.norm(combined_emb) + 1e-12)
-    
+
     combined_emb = combined_emb.tolist()
 
-    # Duration-weighted average for pitch (fallback to simple average if pitch issues)
     if all_pitches and pitch_durations and len(all_pitches) == len(pitch_durations):
-        pitches_array = np.array(all_pitches)
-        avg_pitch = np.average(pitches_array, weights=np.array(pitch_durations))
+        avg_pitch = np.average(np.array(all_pitches), weights=np.array(pitch_durations))
     else:
-        # Fallback: simple average if lengths don't match
         avg_pitch = np.mean(all_pitches) if all_pitches else 0.0
-    
-    # Duration-weighted average for energy
-    avg_energy = np.average(np.array(all_energies), weights=all_durations)
 
-    # Standard deviation of pitches (unweighted, just for variance measure)
-    pitch_std = np.std(all_pitches) if len(all_pitches) > 1 else 0.0
+    avg_energy  = np.average(np.array(all_energies), weights=all_durations)
+    pitch_std   = np.std(all_pitches) if len(all_pitches) > 1 else 0.0
 
-    # Get other values from existing voiceprint
-    prev_pitch = current.get("pitch_hz", 0)
+    prev_pitch     = current.get("pitch_hz", 0)
     prev_pitch_std = current.get("pitch_std", 0)
-    prev_energy = current.get("energy_rms", 0)
+    prev_energy    = current.get("energy_rms", 0)
+    new_duration   = prev_duration + total_duration
 
-    new_duration = prev_duration + total_duration
-
-    # Duration-weighted blend: if existing has 600s and new adds 60s, existing contributes 600/(600+60)=0.91
     if prev_duration > 0 and total_duration > 0:
         prev_weight = prev_duration / new_duration
-        new_weight = total_duration / new_duration
-        # Weighted average for pitch and energy
-        new_pitch = (prev_pitch * prev_weight + avg_pitch * new_weight) if avg_pitch > 0 else prev_pitch
-        new_energy = prev_energy * prev_weight + avg_energy * new_weight
+        new_weight  = total_duration / new_duration
+        new_pitch   = (prev_pitch * prev_weight + avg_pitch * new_weight) if avg_pitch > 0 else prev_pitch
+        new_energy  = prev_energy * prev_weight + avg_energy * new_weight
     elif avg_pitch > 0:
-        new_pitch = avg_pitch
+        new_pitch  = avg_pitch
         new_energy = avg_energy
     else:
-        new_pitch = prev_pitch
+        new_pitch  = prev_pitch
         new_energy = prev_energy
 
     new_pitch_std = pitch_std if pitch_std > 0 else prev_pitch_std

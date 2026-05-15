@@ -36,6 +36,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -110,10 +111,10 @@ def cmd_extract(args):
         sys.exit(1)
 
     if args.voiceprints:
-        from voiceprint_utils import (
-            load_voiceprints, init_embedding_session, ensure_wav, identify_speakers_in_audio
-        )
         import soundfile as sf
+        from voiceprint_utils import (
+            load_voiceprints, init_embedding_session, identify_speakers_in_audio
+        )
 
         voiceprints = load_voiceprints(Path(args.voiceprints))
         if not voiceprints:
@@ -129,21 +130,18 @@ def cmd_extract(args):
         output_dir = Path(args.output)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        wav_path = ensure_wav(audio_path, output_dir)
         print(f"[INFO] Identifying speakers in {audio_path.name}...")
 
-        segments = identify_speakers_in_audio(
-            audio_path=str(wav_path),
+        segments, waveform, sample_rate = identify_speakers_in_audio(
+            audio_path=str(audio_path),
             voiceprints=voiceprints,
             embedding_session=embedding_session,
             vad_threshold=args.vad_threshold or 0.5,
             vad_min_speech_ms=args.vad_min_speech or 250,
-            match_threshold=args.match_threshold or 0.4,
+            match_threshold=args.match_threshold or 0.3,
             single_speaker_threshold=args.single_speaker_threshold or 0.8,
+            include_unknown=args.include_unknown,
         )
-
-        if wav_path != audio_path:
-            wav_path.unlink()
 
         if not segments:
             print("[WARN] No speaker segments identified")
@@ -160,6 +158,22 @@ def cmd_extract(args):
             if spk not in speakers:
                 speakers[spk] = []
             speakers[spk].append(seg)
+
+        # Drop speakers with less than 10s total detected speech
+        min_total_sec = 10.0
+        skipped = {
+            spk: round(sum(s["end"] - s["start"] for s in segs), 1)
+            for spk, segs in speakers.items()
+            if sum(s["end"] - s["start"] for s in segs) < min_total_sec
+        }
+        if skipped:
+            for spk, dur in skipped.items():
+                print(f"[SKIP] {spk}: only {dur}s detected (< {min_total_sec}s)")
+            speakers = {spk: segs for spk, segs in speakers.items() if spk not in skipped}
+
+        if not speakers:
+            print("[WARN] No speakers met the minimum detection time threshold")
+            sys.exit(0)
 
         # Identify unknown speakers (not in original voiceprints) and assign SPEAKER1, SPEAKER2, etc.
         known_speakers = set(voiceprints.keys())
@@ -210,7 +224,7 @@ def cmd_extract(args):
             with open(speaker_dir / "segments.json", "w", encoding="utf-8") as f:
                 json.dump(speaker_segments, f, indent=2)
 
-            for i, seg in enumerate(speaker_segments):
+            for i, seg in enumerate(tqdm(speaker_segments, desc=f"Extracting {speaker_name}", unit="seg", leave=False)):
                 start = seg["start"]
                 end = seg["end"]
                 duration = end - start
@@ -218,17 +232,12 @@ def cmd_extract(args):
                 if duration < (args.min_duration or 1.5):
                     continue
 
-                # Extract audio chunk
+                # Slice directly from the in-memory waveform — no ffmpeg needed
                 conf = int(seg["confidence"] * 100)
-                out_file = speaker_dir / f"{audio_hash}_{format_time_short(start)}_{conf:02d}_{duration:02.0f}.wav"
-                cmd = [
-                    "ffmpeg", "-y", "-i", str(audio_path),
-                    "-ss", str(start), "-t", str(duration),
-                    "-ar", "16000", "-ac", "1",
-                    "-acodec", "pcm_s16le", "-loglevel", "error",
-                    str(out_file)
-                ]
-                subprocess.run(cmd, check=True)
+                out_file = speaker_dir / f"{audio_hash}_{format_time_short(start)}_{conf:02d}_{duration:02.0f}.flac"
+                start_sample = int(start * sample_rate)
+                end_sample = int(end * sample_rate)
+                sf.write(str(out_file), waveform[start_sample:end_sample], sample_rate)
                 extracted_count += 1
 
             print(f"  - {speaker_name}: {len(speaker_segments)} segments, {extracted_count} extracted to {speaker_dir}")
@@ -265,7 +274,10 @@ def cmd_extract(args):
         wav_path = ensure_wav(audio_path, output_dir)
         waveform, sr = load_audio_segment(str(wav_path), start_sec, end_sec)
 
-        out_file = output_dir / f"segment_{args.speaker}_{args.start}_{args.end}.wav"
+        # Replace colons with dashes for Windows-safe filenames
+        safe_start = args.start.replace(":", "-")
+        safe_end = args.end.replace(":", "-")
+        out_file = output_dir / f"segment_{args.speaker}_{safe_start}_{safe_end}.wav"
         import soundfile as sf
         sf.write(str(out_file), waveform, sr)
 
@@ -360,6 +372,7 @@ def cmd_refine(args):
         speaker_name=args.speaker,
         segments_dir=segments_dir,
         min_duration=args.min_duration,
+        block_sec=args.block_sec,
     )
 
     print(f"[SUCCESS] Refined voiceprint for '{args.speaker}'")
@@ -681,7 +694,7 @@ def cmd_mass_refine(args):
     # Show preview
     print(f"\n[INFO] Speakers to process:")
     for sd in sorted(speaker_dirs):
-        wavs = list(sd.glob("*.wav"))
+        wavs = list(sd.glob("*.wav")) + list(sd.glob("*.mp3")) + list(sd.glob("*.flac"))
         dur_str = f"{len(wavs)} segments" if wavs else "NO WAVS"
         print(f"  - {sd.name}: {dur_str}")
 
@@ -695,12 +708,12 @@ def cmd_mass_refine(args):
     success_count = 0
     error_count = 0
     
-    for speaker_dir in sorted(speaker_dirs):
+    for speaker_dir in tqdm(sorted(speaker_dirs), desc="Refining voiceprints", unit="speaker"):
         speaker_name = speaker_dir.name
-        wavs = list(speaker_dir.glob("*.wav"))
+        wavs = list(speaker_dir.glob("*.wav")) + list(speaker_dir.glob("*.mp3")) + list(speaker_dir.glob("*.flac"))
         
         if not wavs:
-            print(f"[WARN] No .wav files in {speaker_name}, skipping")
+            print(f"[WARN] No audio files in {speaker_name}, skipping")
             error_count += 1
             continue
 
@@ -718,6 +731,7 @@ def cmd_mass_refine(args):
                 speaker_name=speaker_name,
                 segments_dir=speaker_dir,
                 min_duration=args.min_duration,
+                block_sec=args.block_sec,
             )
             print(f"[OK] {speaker_name}: total {result.get('total_speech_sec', 0):.1f}s")
             success_count += 1
@@ -749,8 +763,9 @@ def main():
     p_extract.add_argument("--end", help="End time (if extracting single segment without diarization)")
     p_extract.add_argument("--vad-threshold", type=float, default=0.5, help="VAD threshold (0.0-1.0)")
     p_extract.add_argument("--vad-min-speech", type=int, default=250, help="VAD min speech duration (ms)")
-    p_extract.add_argument("--match-threshold", type=float, default=0.4, help="Voiceprint match threshold (cosine distance)")
+    p_extract.add_argument("--match-threshold", type=float, default=0.3, help="Voiceprint match threshold (cosine distance)")
     p_extract.add_argument("--single-speaker-threshold", type=float, default=0.8, help="Min ratio of windows matching dominant speaker (0.0-1.0)")
+    p_extract.add_argument("--include-unknown", action="store_true", default=False, help="Also extract segments from unknown speakers (not matching any voiceprint) for training")
     p_extract.add_argument("--min-confidence", type=float, default=0.0, help="Minimum confidence threshold (0-1). Lower quality segments are skipped.")
     p_extract.set_defaults(func=cmd_extract)
 
@@ -767,6 +782,7 @@ def main():
     p_refine.add_argument("--speaker", required=True, help="Speaker name")
     p_refine.add_argument("--segments", required=True, help="Segments directory")
     p_refine.add_argument("--min-duration", type=float, default=1.5, help="Minimum segment duration")
+    p_refine.add_argument("--block-sec", type=float, default=600.0, help="Seconds of audio per ONNX batch (default 600 = 10 min)")
     p_refine.set_defaults(func=cmd_refine)
 
     # mass_refine subcommand (NEW)
@@ -774,6 +790,7 @@ def main():
     p_mass.add_argument("folder", help="Root folder containing speaker subfolders (e.g., segments/)")
     p_mass.add_argument("--voiceprints", default="voiceprints.json", help="Voiceprints JSON file")
     p_mass.add_argument("--min-duration", type=float, default=1.5, help="Minimum segment duration")
+    p_mass.add_argument("--block-sec", type=float, default=600.0, help="Seconds of audio per ONNX batch (default 600 = 10 min)")
     p_mass.add_argument("--skip-existing", action="store_true", help="Skip speakers who already have voiceprints")
     p_mass.add_argument("--skip-confirm", action="store_true", help="Skip confirmation prompt")
     p_mass.set_defaults(func=cmd_mass_refine)
