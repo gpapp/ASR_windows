@@ -1,4 +1,4 @@
-@echo off
+@echo on
 setlocal enabledelayedexpansion
 
 cd /d "%~dp0"
@@ -38,8 +38,9 @@ if %SERVER_STATUS% equ 0 goto run
 :: Server not running or not yet ready — start it only if not running at all
 if %SERVER_STATUS% equ 1 (
     echo [INFO] Starting transcription server...
-    set LAUNCH_DIR=%~dp0
-    start "Cohere Transcribe Server" /min cmd /c "cd /d ""%~dp0"" && call .venv\Scripts\activate && python server.py"
+    set "LAUNCH_DIR=%~dp0"
+    set "LAUNCH_DIR=!LAUNCH_DIR:~0,-1!"
+    start "Cohere Transcribe Server" /min cmd /c "cd /d "!LAUNCH_DIR!" && call .venv\Scripts\activate && python server.py"
 )
 
 :: Poll until model is ready (first run downloads ~2.9 GB, so be patient)
