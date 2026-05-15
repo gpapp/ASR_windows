@@ -19,6 +19,7 @@ import time
 import threading
 import tempfile
 import signal
+import re
 from pathlib import Path
 from typing import Optional
 from functools import lru_cache
@@ -561,6 +562,30 @@ def inference_timeout(seconds: int):
         signal.signal(signal.SIGALRM, old_handler)
 
 
+# ---------------------------------------------------------------------------
+# Transcript hallucination cleaner
+# ---------------------------------------------------------------------------
+# Whisper-family models produce looping repetitions when fed laughter, noise,
+# or silence: e.g. "the ones who are the ones who are ..." repeated hundreds
+# of times.  Detect any phrase of 1-10 words that repeats 4+ times
+# consecutively and replace the entire run with [inaudible].
+_LOOP_RE = re.compile(
+    r'\b(.{4,80}?)(?:\s+\1){3,}',   # phrase repeated ≥4 times
+    re.IGNORECASE,
+)
+
+def clean_transcript(text: str) -> str:
+    """Replace hallucinated looping repetitions with [inaudible]."""
+    # Iterate: one pass may expose a shorter inner loop after the outer is removed
+    prev = None
+    while prev != text:
+        prev = text
+        text = _LOOP_RE.sub('[inaudible]', text)
+    # Collapse multiple consecutive [inaudible] tags into one
+    text = re.sub(r'(\[inaudible\]\s*){2,}', '[inaudible] ', text)
+    return text.strip()
+
+
 def transcribe_audio_sync(
     audio: np.ndarray, 
     language: str = "en",
@@ -661,12 +686,13 @@ def transcribe_audio_sync(
                 current_buffer[0, 0] = next_id
                 current = current_buffer
         
-        # Decode text
+        # Decode text and clean hallucinated repetition loops
         text = "".join(
             tokens.get(t, "").replace("\u2581", " ")
             for t in generated[len(prompt_ids):]
             if not tokens.get(t, "").startswith("<|")
         ).strip()
+        text = clean_transcript(text)
 
         tokens_generated = len(generated) - len(prompt_ids)
         inference_time = time.perf_counter() - start_time
@@ -1809,6 +1835,11 @@ async def diarize_path_endpoint(
                     else:
                         collapsed.append(seg)
                 merged_segments = collapsed
+
+                # Remove ghost speakers from profiles — their segments have been
+                # reassigned so they no longer appear in the final output.
+                for ghost in ghost_speakers:
+                    profiles.pop(ghost, None)
 
             # Compute confidence for each segment based on embedding distances to all cluster centroids
             # For each embeddable window: compute distance to ALL centroids, measure assignment clarity
