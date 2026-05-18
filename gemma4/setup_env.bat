@@ -13,26 +13,23 @@ if %errorlevel% neq 0 (
 )
 
 echo [1/3] Creating virtual environment...
-uv venv .venv --clear
+uv venv .venv
 
 echo [2/3] Installing dependencies...
 call .venv\Scripts\activate
-uv pip install --upgrade -r requirements.txt
+uv pip install ^
+    requests ^
+    tqdm ^
+    pydub"
 
 if %errorlevel% neq 0 (
     echo [ERROR] Package installation failed.
     pause
     exit /b 1
 )
-:: ONNX is faster 
-:: uv pip install --upgrade torch torchaudio --index-url https://download.pytorch.org/whl/xpu
 
 echo.
 echo [3/3] Setup complete!
-echo.
-echo NOTE: The Cohere ONNX model (~2.9 GB) will be downloaded automatically
-echo       on first use from: gn64/cohere-transcribe-onnx-int8
-echo       Model files will be saved to: models\
 echo.
 echo Drop audio/video files onto DropToTranscribe.bat to transcribe.
 pause

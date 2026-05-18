@@ -32,6 +32,53 @@ from tqdm import tqdm
 
 MIN_ISLAND_DUR = 0.3  # Minimum duration for a segment to be considered an "island"
 
+# ---------------------------------------------------------------------------
+# Transcript hallucination cleaner (mirrors server.py clean_transcript)
+# ---------------------------------------------------------------------------
+_LOOP_RE = re.compile(r"(.{4,120}?)(?:\s+\1){2,}", re.IGNORECASE)
+
+def _trim_partial_prefix(before: str, unit: str) -> str:
+    words = unit.lower().split()
+    b = before.rstrip()
+    b_lower = b.lower()
+    for start in range(len(words)):
+        suffix = " ".join(words[start:])
+        if b_lower.endswith(suffix):
+            return b[: len(b) - len(suffix)].rstrip()
+    return b
+
+def _trim_partial_suffix(after: str, unit: str) -> str:
+    words = unit.lower().split()
+    a = after.lstrip()
+    a_lower = a.lower()
+    for end in range(len(words), 0, -1):
+        prefix = " ".join(words[:end])
+        if a_lower.startswith(prefix):
+            return a[len(prefix):].lstrip()
+    return a
+
+def clean_transcript(text: str) -> str:
+    """Replace hallucinated looping repetitions with [inaudible]."""
+    prev = None
+    while prev != text:
+        prev = text
+        m = _LOOP_RE.search(text)
+        if not m:
+            break
+        unit   = m.group(1)
+        before = _trim_partial_prefix(text[:m.start()], unit)
+        after  = _trim_partial_suffix(text[m.end():], unit)
+        parts  = [p for p in (before, "[inaudible]", after) if p]
+        text   = " ".join(parts)
+    text = re.sub(r"(\[inaudible\]\s*){2,}", "[inaudible] ", text)
+    # Drop short fragments sandwiched between [inaudible] tags
+    text = re.sub(
+        r"\[inaudible\]\s+(?:\w[\w\s,\']{0,80}?)\s+\[inaudible\]",
+        "[inaudible]",
+        text,
+    )
+    return text.strip()
+
 # ============================================================================
 # Configuration
 # ============================================================================
@@ -511,6 +558,7 @@ class TranscriptWriter:
         alternatives: list = None
     ):
         """Add a transcribed segment."""
+        text = clean_transcript(text)
         if not text.strip():
             return
 

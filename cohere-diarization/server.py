@@ -7,7 +7,6 @@ Features:
 - Request validation and size limits
 - Timeout protection
 - KV cache pooling for memory efficiency
-- Prometheus metrics
 - Structured logging
 - Optional API key authentication
 - Rate limiting
@@ -106,7 +105,6 @@ class Settings(BaseSettings):
     
     # Feature flags
     enable_dml: bool = True
-    enable_metrics: bool = True
     enable_rate_limit: bool = True
     enable_diarization: bool = True
     hf_token: Optional[str] = None
@@ -168,87 +166,6 @@ def setup_logging():
 
 setup_logging()
 log = structlog.get_logger()
-
-
-# ============================================================================
-# Metrics (Prometheus)
-# ============================================================================
-
-class Metrics:
-    """Prometheus metrics container."""
-    
-    def __init__(self, enabled: bool = True):
-        self.enabled = enabled
-        if not enabled:
-            return
-            
-        from prometheus_client import Counter, Histogram, Gauge
-        
-        self.requests_total = Counter(
-            "transcribe_requests_total",
-            "Total transcription requests",
-            ["endpoint", "status"]
-        )
-        self.audio_duration = Histogram(
-            "transcribe_audio_duration_seconds",
-            "Duration of audio processed",
-            buckets=[1, 5, 10, 30, 60, 120, 300, 600]
-        )
-        self.inference_time = Histogram(
-            "transcribe_inference_seconds",
-            "Time spent in inference",
-            buckets=[0.1, 0.5, 1, 2, 5, 10, 30, 60]
-        )
-        self.tokens_generated = Histogram(
-            "transcribe_tokens_generated",
-            "Number of tokens generated",
-            buckets=[10, 50, 100, 200, 300, 448]
-        )
-        self.active_requests = Gauge(
-            "transcribe_active_requests",
-            "Currently processing requests"
-        )
-        self.model_loaded = Gauge(
-            "transcribe_model_loaded",
-            "Whether the model is loaded (1) or not (0)"
-        )
-    
-    def inc_request(self, endpoint: str, status: str):
-        if self.enabled:
-            self.requests_total.labels(endpoint=endpoint, status=status).inc()
-    
-    def observe_audio(self, duration: float):
-        if self.enabled:
-            self.audio_duration.observe(duration)
-    
-    def observe_inference(self, duration: float):
-        if self.enabled:
-            self.inference_time.observe(duration)
-    
-    def observe_tokens(self, count: int):
-        if self.enabled:
-            self.tokens_generated.observe(count)
-    
-    @contextmanager
-    def track_request(self):
-        if self.enabled:
-            self.active_requests.inc()
-        try:
-            yield
-        finally:
-            if self.enabled:
-                self.active_requests.dec()
-    
-    def set_model_loaded(self, loaded: bool):
-        if self.enabled:
-            self.model_loaded.set(1 if loaded else 0)
-    
-    def generate(self) -> bytes:
-        if not self.enabled:
-            return b""
-        from prometheus_client import generate_latest
-        return generate_latest()
-
 
 # ============================================================================
 # Custom Exceptions
@@ -366,7 +283,6 @@ class ModelState:
 
 
 state = ModelState()
-metrics: Optional[Metrics] = None
 executor: Optional[ThreadPoolExecutor] = None
 
 
@@ -403,9 +319,7 @@ def ensure_model(settings: Settings) -> Path:
 
 
 def load_models(settings: Settings):
-    """Load encoder and decoder models."""
-    global metrics
-    
+    """Load encoder and decoder models."""    
     model_dir = ensure_model(settings)
     
     # Load vocabulary
@@ -533,9 +447,6 @@ def load_models(settings: Settings):
 
     state.status = "ready"
     
-    if metrics:
-        metrics.set_model_loaded(True)
-    
     log.info("model_ready", device=device)
 
 
@@ -566,23 +477,70 @@ def inference_timeout(seconds: int):
 # Transcript hallucination cleaner
 # ---------------------------------------------------------------------------
 # Whisper-family models produce looping repetitions when fed laughter, noise,
-# or silence: e.g. "the ones who are the ones who are ..." repeated hundreds
-# of times.  Detect any phrase of 1-10 words that repeats 4+ times
-# consecutively and replace the entire run with [inaudible].
+# or silence: e.g. "The police are the ones who are the ones who are ..."
+# repeated hundreds of times.
+#
+# The tricky part: the text before the detected repeat is often a *partial*
+# instance of the same phrase (the loop started mid-sentence), and the text
+# after may be a partial trailing instance.  We trim both.
+#
+# Example:
+#   "Right. The police are the ones who are the ones who are the ones."
+#   repeated unit  = "are the ones who"
+#   prefix before  = "Right. The police "  <- ends with suffix of unit
+#   suffix after   = " are the ones."      <- starts with prefix of unit
+#   result         = "Right. [inaudible]."
+
 _LOOP_RE = re.compile(
-    r'\b(.{4,80}?)(?:\s+\1){3,}',   # phrase repeated ≥4 times
+    r'(.{4,120}?)(?:\s+\1){2,}',   # phrase repeated ≥3 times total
     re.IGNORECASE,
 )
 
+def _trim_partial_prefix(before: str, unit: str) -> str:
+    """Remove a trailing suffix-of-unit bleed from `before`."""
+    words = unit.lower().split()
+    b = before.rstrip()
+    b_lower = b.lower()
+    for start in range(len(words)):           # try longest suffix first
+        suffix = " ".join(words[start:])
+        if b_lower.endswith(suffix):
+            return b[: len(b) - len(suffix)].rstrip()
+    return b
+
+def _trim_partial_suffix(after: str, unit: str) -> str:
+    """Remove a leading prefix-of-unit bleed from `after`."""
+    words = unit.lower().split()
+    a = after.lstrip()
+    a_lower = a.lower()
+    for end in range(len(words), 0, -1):      # try longest prefix first
+        prefix = " ".join(words[:end])
+        if a_lower.startswith(prefix):
+            return a[len(prefix):].lstrip()
+    return a
+
 def clean_transcript(text: str) -> str:
     """Replace hallucinated looping repetitions with [inaudible]."""
-    # Iterate: one pass may expose a shorter inner loop after the outer is removed
     prev = None
     while prev != text:
         prev = text
-        text = _LOOP_RE.sub('[inaudible]', text)
-    # Collapse multiple consecutive [inaudible] tags into one
+        m = _LOOP_RE.search(text)
+        if not m:
+            break
+        unit   = m.group(1)
+        before = _trim_partial_prefix(text[:m.start()], unit)
+        after  = _trim_partial_suffix(text[m.end():], unit)
+        parts  = [p for p in (before, '[inaudible]', after) if p]
+        text   = ' '.join(parts)
+    # Collapse consecutive tags
     text = re.sub(r'(\[inaudible\]\s*){2,}', '[inaudible] ', text)
+    # Drop short fragments sandwiched between [inaudible] tags — these are
+    # mutation-zone remnants where the loop phrase slowly morphed and the
+    # exact-repeat regex could not catch the transitional words (≤12 words).
+    text = re.sub(
+        r'\[inaudible\]\s+(?:\w[\w\s,\']{0,80}?)\s+\[inaudible\]',
+        '[inaudible]',
+        text,
+    )
     return text.strip()
 
 
@@ -607,9 +565,6 @@ def transcribe_audio_sync(
         raise AudioValidationError(
             f"Audio too long: {audio_duration:.1f}s > {settings.max_audio_duration_sec}s max"
         )
-    
-    if metrics:
-        metrics.observe_audio(audio_duration)
     
     with inference_timeout(timeout_sec):
         encoder = state.encoder
@@ -696,10 +651,6 @@ def transcribe_audio_sync(
 
         tokens_generated = len(generated) - len(prompt_ids)
         inference_time = time.perf_counter() - start_time
-
-        if metrics:
-            metrics.observe_inference(inference_time)
-            metrics.observe_tokens(tokens_generated)
 
         log.debug(
             "transcription_complete",
@@ -839,7 +790,6 @@ def validate_path_security(path: str, settings: Settings) -> Path:
     
     return resolved
 
-
 # ============================================================================
 # FastAPI Application
 # ============================================================================
@@ -847,13 +797,10 @@ def validate_path_security(path: str, settings: Settings) -> Path:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager."""
-    global metrics, executor
+    global executor
     
     settings = get_settings()
-    
-    # Initialize metrics
-    metrics = Metrics(enabled=settings.enable_metrics)
-    
+       
     # Initialize thread pool
     executor = ThreadPoolExecutor(max_workers=settings.workers)
     
@@ -867,10 +814,8 @@ async def lifespan(app: FastAPI):
     log.info("shutting_down")
     if executor:
         executor.shutdown(wait=True)
-    if metrics:
-        metrics.set_model_loaded(False)
-    state.status = "shutdown"
 
+    state.status = "shutdown"
 
 app = FastAPI(
     title="Transcription Server",
@@ -878,7 +823,6 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
-
 
 # ============================================================================
 # Middleware
@@ -923,7 +867,6 @@ async def request_middleware(request: Request, call_next):
         log.exception("request_error", request_id=request_id, error=str(e))
         raise
 
-
 # CORS middleware
 settings = get_settings()
 if settings.enable_cors:
@@ -934,7 +877,6 @@ if settings.enable_cors:
         allow_methods=["*"],
         allow_headers=["*"],
     )
-
 
 # Rate limiting (optional)
 try:
@@ -951,7 +893,6 @@ except ImportError:
     limiter = None
     log.warning("rate_limiting_unavailable", reason="slowapi not installed")
 
-
 # ============================================================================
 # Exception Handlers
 # ============================================================================
@@ -959,9 +900,6 @@ except ImportError:
 @app.exception_handler(TranscriptionError)
 async def transcription_error_handler(request: Request, exc: TranscriptionError):
     """Handle transcription-specific errors."""
-    if metrics:
-        metrics.inc_request(request.url.path, "error")
-    
     return JSONResponse(
         status_code=400 if isinstance(exc, (AudioValidationError, PathSecurityError)) else 500,
         content={
@@ -971,20 +909,15 @@ async def transcription_error_handler(request: Request, exc: TranscriptionError)
         }
     )
 
-
 @app.exception_handler(Exception)
 async def general_error_handler(request: Request, exc: Exception):
     """Handle unexpected errors."""
-    if metrics:
-        metrics.inc_request(request.url.path, "error")
-    
     log.exception("unhandled_error", path=request.url.path)
     
     return JSONResponse(
         status_code=500,
         content={"error": "Internal server error"}
     )
-
 
 # ============================================================================
 # Endpoints
@@ -999,11 +932,9 @@ async def health():
         device=state.device
     )
 
-
 async def delayed_shutdown():
     await asyncio.sleep(1.0)
     os._exit(0)
-
 
 @app.post("/shutdown")
 async def shutdown(_: str = Depends(verify_api_key)):
@@ -1012,28 +943,12 @@ async def shutdown(_: str = Depends(verify_api_key)):
     asyncio.create_task(delayed_shutdown())
     return {"status": "shutting down"}
 
-
-@app.get("/metrics")
-async def prometheus_metrics():
-    """Prometheus metrics endpoint."""
-    if not metrics or not metrics.enabled:
-        raise HTTPException(status_code=404, detail="Metrics disabled")
-    return PlainTextResponse(metrics.generate(), media_type="text/plain")
-
-
 def get_rate_limit_decorator():
     """Get rate limit decorator if available."""
     settings = get_settings()
     if RATE_LIMIT_AVAILABLE and settings.enable_rate_limit and limiter:
         return limiter.limit(settings.rate_limit)
     return lambda f: f  # No-op decorator
-
-
-
-
-
-
-
 
 @app.post("/diarize/path")
 async def diarize_path_endpoint(
@@ -2017,13 +1932,10 @@ async def transcribe_upload(
             status_code=400, 
             detail=f"Too many files. Max: {settings.max_batch_size}"
         )
-    
-    if metrics:
-        metrics.inc_request("/transcribe/upload", "started")
-    
+      
     results = []
     
-    with metrics.track_request() if metrics else contextmanager(lambda: (yield))():
+    with contextmanager(lambda: (yield))():
         for file in files:
             try:
                 # Save to temp file
@@ -2066,7 +1978,7 @@ async def transcribe_upload(
                         total_tokens += result["tokens_generated"]
                     
                     result = {
-                        "text": full_text.strip(),
+                        "text": clean_transcript(full_text.strip()),
                         "audio_duration_sec": len(audio) / 16000,
                         "inference_time_sec": total_inference,
                         "tokens_generated": total_tokens
@@ -2089,10 +2001,6 @@ async def transcribe_upload(
                     error=str(e)
                 ))
     
-    if metrics:
-        status = "success" if all(r.error is None for r in results) else "partial"
-        metrics.inc_request("/transcribe/upload", status)
-    
     return TranscribeResponse(
         results=results,
         total_time_sec=time.perf_counter() - start_time
@@ -2113,12 +2021,9 @@ async def transcribe_paths(
     """
     start_time = time.perf_counter()
     
-    if metrics:
-        metrics.inc_request("/transcribe/paths", "started")
-    
     results = []
     
-    with metrics.track_request() if metrics else contextmanager(lambda: (yield))():
+    with contextmanager(lambda: (yield))():
         for path in req.wav_paths:
             try:
                 # Validate path
@@ -2155,7 +2060,7 @@ async def transcribe_paths(
                     total_tokens += result["tokens_generated"]
                 
                 result = {
-                    "text": full_text.strip(),
+                    "text": clean_transcript(full_text.strip()),
                     "audio_duration_sec": len(audio) / 16000,
                     "inference_time_sec": total_inference,
                     "tokens_generated": total_tokens
@@ -2188,34 +2093,11 @@ async def transcribe_paths(
                     tokens_generated=0,
                     error=str(e)
                 ))
-    
-    if metrics:
-        status = "success" if all(r.error is None for r in results) else "partial"
-        metrics.inc_request("/transcribe/paths", status)
-    
+        
     return TranscribeResponse(
         results=results,
         total_time_sec=time.perf_counter() - start_time
     )
-
-
-# Legacy endpoint for backward compatibility
-@app.post("/transcribe")
-async def transcribe_legacy(
-    req: TranscribePathsRequest,
-    settings: Settings = Depends(get_settings),
-    _: str = Depends(verify_api_key)
-):
-    """
-    Legacy transcription endpoint (deprecated).
-    Use /transcribe/paths or /transcribe/upload instead.
-    """
-    response = await transcribe_paths(req, settings, _)
-    
-    # Return legacy format
-    return {
-        "results": [r.text if r.error is None else f"[ERROR: {r.error}]" for r in response.results]
-    }
 
 
 # ============================================================================
