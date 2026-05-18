@@ -9,12 +9,63 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import get
 
 
+def _compute_spectral_distance(cluster: Dict, voiceprint: Dict, norm_cfg: Dict) -> float:
+    """Compute normalized spectral feature distance."""
+    dist = 0.0
+    count = 0
+    
+    # Spectral centroid distance
+    cluster_centroid = cluster.get("spectral_centroid", 0)
+    vp_centroid = voiceprint.get("spectral_centroid", 0)
+    if cluster_centroid > 0 and vp_centroid > 0:
+        centroid_per_unit = norm_cfg.get("spectral_centroid_per_unit", 500)
+        dist += abs(cluster_centroid - vp_centroid) / centroid_per_unit
+        count += 1
+    
+    # Spectral rolloff distance
+    cluster_rolloff = cluster.get("spectral_rolloff", 0)
+    vp_rolloff = voiceprint.get("spectral_rolloff", 0)
+    if cluster_rolloff > 0 and vp_rolloff > 0:
+        rolloff_per_unit = norm_cfg.get("spectral_rolloff_per_unit", 1000)
+        dist += abs(cluster_rolloff - vp_rolloff) / rolloff_per_unit
+        count += 1
+    
+    return dist / count if count > 0 else 0.5
+
+
+def _compute_mfcc_distance(cluster: Dict, voiceprint: Dict, norm_cfg: Dict) -> float:
+    """Compute MFCC feature distance (first 13 coefficients)."""
+    dist = 0.0
+    count = 0
+    
+    for i in range(13):
+        cluster_mean = cluster.get(f"mfcc{i}_mean", 0)
+        vp_mean = voiceprint.get(f"mfcc{i}_mean", 0)
+        cluster_std = cluster.get(f"mfcc{i}_std", 0)
+        vp_std = voiceprint.get(f"mfcc{i}_std", 0)
+        
+        if cluster_mean != 0 or vp_mean != 0:
+            # Distance between means, normalized by typical MFCC range
+            mean_per_unit = norm_cfg.get(f"mfcc{i}_mean_per_unit", 10)
+            mean_dist = abs(cluster_mean - vp_mean) / mean_per_unit
+            
+            # Also compare std deviation
+            std_per_unit = norm_cfg.get(f"mfcc{i}_std_per_unit", 5)
+            std_dist = abs(cluster_std - vp_std) / std_per_unit
+            
+            dist += (mean_dist + std_dist) / 2
+            count += 1
+    
+    return dist / count if count > 0 else 0.5
+
+
 def compute_distance(
     cluster_emb: List[float],
     cluster_pitch: float,
     cluster_energy: float,
     voiceprint: Dict,
-    cfg: Dict = None
+    cfg: Dict = None,
+    cluster_features: Dict = None
 ) -> Dict[str, float]:
     """
     Compute distance between a cluster and a voiceprint.
@@ -23,11 +74,16 @@ def compute_distance(
     - emb_dist: cosine distance of embeddings
     - pitch_dist: normalized pitch distance (0-1)
     - energy_dist: normalized energy distance (0-1)
+    - spectral_dist: normalized spectral feature distance (0-1)
+    - mfcc_dist: normalized MFCC feature distance (0-1)
     - combined: weighted combination
     - confidence: 0-1 confidence score
     """
     if cfg is None:
         cfg = get("weights")
+    
+    if cluster_features is None:
+        cluster_features = {}
     
     weights = cfg.get("embedding", 0.7), cfg.get("pitch", 0.2), cfg.get("energy", 0.1)
     norm = cfg.get("normalization", {})
@@ -35,29 +91,43 @@ def compute_distance(
     energy_per_unit = norm.get("energy_rms_per_unit", 0.05)
     conf_max_dist = norm.get("confidence_max_distance", 0.5)
     
-    # Embedding distance
     emb_dist = cosine(cluster_emb, voiceprint.get("embedding", []))
     
-    # Pitch distance (normalized)
     known_pitch = voiceprint.get("pitch_hz", 0) or 0
     if cluster_pitch > 0 and known_pitch > 0:
         pitch_dist = abs(cluster_pitch - known_pitch) / pitch_per_unit
     else:
         pitch_dist = 0.5
     
-    # Energy distance (normalized)
     known_energy = voiceprint.get("energy_rms", 0) or 0
     if cluster_energy > 0 and known_energy > 0:
         energy_dist = abs(cluster_energy - known_energy) / energy_per_unit
     else:
         energy_dist = 0.5
     
-    # Combined distance - always use weighted (simpler than dual-path)
-    combined = (
-        weights[0] * emb_dist +
-        weights[1] * min(pitch_dist, 1.0) +
-        weights[2] * min(energy_dist, 1.0)
-    )
+    spectral_dist = _compute_spectral_distance(cluster_features, voiceprint, norm)
+    mfcc_dist = _compute_mfcc_distance(cluster_features, voiceprint, norm)
+    
+    # Get extended weights if available
+    spectral_weight = cfg.get("spectral", 0.0)
+    mfcc_weight = cfg.get("mfcc", 0.0)
+    
+    # Combined distance - use extended weights if available
+    if spectral_weight > 0 or mfcc_weight > 0:
+        total_weight = weights[0] + weights[1] + weights[2] + spectral_weight + mfcc_weight
+        combined = (
+            weights[0] * emb_dist +
+            weights[1] * min(pitch_dist, 1.0) +
+            weights[2] * min(energy_dist, 1.0) +
+            spectral_weight * min(spectral_dist, 1.0) +
+            mfcc_weight * min(mfcc_dist, 1.0)
+        ) / total_weight
+    else:
+        combined = (
+            weights[0] * emb_dist +
+            weights[1] * min(pitch_dist, 1.0) +
+            weights[2] * min(energy_dist, 1.0)
+        )
     
     # Confidence (higher is better)
     confidence = max(0, 1 - (combined / conf_max_dist))
@@ -66,6 +136,8 @@ def compute_distance(
         "emb_dist": round(float(emb_dist), 3),
         "pitch_dist": round(pitch_dist, 3),
         "energy_dist": round(energy_dist, 3),
+        "spectral_dist": round(spectral_dist, 3),
+        "mfcc_dist": round(mfcc_dist, 3),
         "combined": round(float(combined), 3),
         "confidence": round(confidence, 3)
     }
@@ -76,7 +148,8 @@ def find_best_match(
     cluster_pitch: float,
     cluster_energy: float,
     voiceprints: Dict[str, Dict],
-    cfg: Dict = None
+    cfg: Dict = None,
+    cluster_features: Dict = None
 ) -> Tuple[Optional[str], float, float, Dict[str, Dict]]:
     """
     Find best matching voiceprint for a cluster.
@@ -94,7 +167,8 @@ def find_best_match(
             continue
         
         dist_info = compute_distance(
-            cluster_emb, cluster_pitch, cluster_energy, voiceprint
+            cluster_emb, cluster_pitch, cluster_energy, voiceprint,
+            cluster_features=cluster_features
         )
         
         matches.append((name, dist_info["combined"], dist_info["confidence"]))
@@ -145,7 +219,8 @@ def is_clear_winner(matches: List[Tuple], voiceprints: Dict, cfg: Dict = None) -
 def match_clusters(
     clusters: Dict[str, Dict],  # {cluster_id: {"embedding": [], "pitch_hz": float, "energy_rms": float}}
     voiceprints: Dict[str, Dict],
-    cfg: Dict = None
+    cfg: Dict = None,
+    all_cluster_features: Dict[str, Dict] = None
 ) -> Dict[str, Dict]:
     """
     Match all clusters to known voiceprints.
@@ -154,6 +229,9 @@ def match_clusters(
     """
     if cfg is None:
         cfg = get("matching")
+    
+    if all_cluster_features is None:
+        all_cluster_features = {}
     
     accept_threshold = cfg.get("accept_threshold", 0.35)
     embed_only_threshold = cfg.get("embed_only_threshold", 0.16)
@@ -165,12 +243,13 @@ def match_clusters(
         emb = cluster_data.get("embedding", [])
         pitch = cluster_data.get("pitch_hz", 0) or 0
         energy = cluster_data.get("energy_rms", 0) or 0
+        features = all_cluster_features.get(cluster_id, {})
         
         if not emb:
             continue
         
         best_name, best_dist, best_conf, all_distances = find_best_match(
-            emb, pitch, energy, voiceprints
+            emb, pitch, energy, voiceprints, cluster_features=features
         )
         
         # Build matches list for clear_winner check

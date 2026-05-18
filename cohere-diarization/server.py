@@ -56,6 +56,39 @@ from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 import structlog
 
+
+def collapse_same_speaker_segments(segments: list, max_gap: float = 0.0) -> list:
+    """Collapse adjacent segments with the same speaker.
+    
+    Args:
+        segments: List of segment dicts with 'speaker', 'start', 'end' keys
+        max_gap: Max time gap between segments to still consider them adjacent (default 0 = contiguous)
+    """
+    if not segments:
+        return []
+    segments = sorted(segments, key=lambda x: x["start"])
+    collapsed = [segments[0].copy()]
+    for seg in segments[1:]:
+        prev = collapsed[-1]
+        if seg["speaker"] == prev["speaker"] and seg["start"] - prev["end"] <= max_gap:
+            prev["end"] = max(prev["end"], seg["end"])
+        else:
+            collapsed.append(seg.copy())
+    return collapsed
+
+
+def merge_profiles(profiles: dict, target: str, source: str):
+    """Merge source profile into target profile, deleting source."""
+    if source not in profiles:
+        return
+    if target not in profiles:
+        profiles[target] = profiles.pop(source, {})
+        return
+    profiles[target]["speech_sec"] = profiles[target].get("speech_sec", 0) + profiles[source].get("speech_sec", 0)
+    profiles[target]["segment_count"] = profiles[target].get("segment_count", 0) + profiles[source].get("segment_count", 0)
+    del profiles[source]
+
+
 def ensure_embedding_model(repo_id: str, filename: str, token: str) -> str:
     """Downloads the ONNX embedding model from HF Hub if not present locally."""
     log.info("downloading_embedding_model", repo=repo_id, file=filename)
@@ -1377,7 +1410,7 @@ async def diarize_path_endpoint(
 
             # 5. Merge contiguous same-speaker windows
             #    Split on speaker change or gap > MAX_SPEAKER_GAP — no hard time cap.
-            MAX_SPEAKER_GAP = 1.0  # seconds (reduced from 2.0 to avoid over-merging)
+            MAX_SPEAKER_GAP = 1.0  # seconds
             all_segments_meta.sort(key=lambda x: x["start"])
             merged_segments = []
             current_segment = None
@@ -1400,9 +1433,7 @@ async def diarize_path_endpoint(
                 merged_segments.append(current_segment)
 
             # 6. Post-merge: absorb short isolated segments into surrounding speaker
-            #    If a segment is < MIN_ISLAND_DUR and is surrounded on both sides by the
-            #    same speaker, reassign it to that speaker and re-merge.
-            MIN_ISLAND_DUR = 1.0  # seconds (reduced from 2.1 to preserve short turns)
+            MIN_ISLAND_DUR = 1.0  # seconds
             changed = True
             while changed:
                 changed = False
@@ -1415,19 +1446,7 @@ async def diarize_path_endpoint(
                         seg["speaker"] = prev_spk
                         changed = True
                 if changed:
-                    new_merged = []
-                    cur = None
-                    for seg in merged_segments:
-                        if cur is None:
-                            cur = seg.copy()
-                        elif cur["speaker"] == seg["speaker"]:
-                            cur["end"] = max(cur["end"], seg["end"])
-                        else:
-                            new_merged.append(cur)
-                            cur = seg.copy()
-                    if cur:
-                        new_merged.append(cur)
-                    merged_segments = new_merged
+                    merged_segments = collapse_same_speaker_segments(merged_segments)
 
             # 6b. Boundary refinement — re-examine each speaker transition at fine
             #     granularity (0.5s sub-windows, 0.1s stride) to push the boundary
@@ -1492,73 +1511,58 @@ async def diarize_path_endpoint(
                     print(f"Cluster speakers: {list(speaker_centroids.keys())}")
                     print(f"Known speakers: {list(req.known_speakers.keys()) if req.known_speakers else 'None'}")
 
-                # Compute all possible matches for each cluster speaker
-                all_matches = {}  # spk -> [(name, distance, confidence), ...]
-                debug_matches = {}
-
-                # Cache config values before loops to avoid repeated lookups
-                norm_cfg = get("normalization", default={})
-                pitch_per_unit = norm_cfg.get("pitch_hz_per_unit", 50)
-                energy_per_unit = norm_cfg.get("energy_rms_per_unit", 0.05)
-                conf_max_dist = norm_cfg.get("confidence_max_distance", 0.5)
-                weights = get("weights", default={})
-                w_emb = weights.get("embedding", 0.7)
-                w_pitch = weights.get("pitch", 0.2)
-                w_energy = weights.get("energy", 0.1)
-                matching_cfg = get("matching", default={})
-                embed_only_thresh = matching_cfg.get("embed_only_threshold", 0.16)
-
+                # Build clusters dict for matcher module
+                clusters = {}
+                all_cluster_features = {}
                 for spk, emb_list in speaker_centroids.items():
                     if not emb_list:
                         continue
-
+                    
                     centroid = np.mean(emb_list, axis=0)
                     norm = np.linalg.norm(centroid)
                     if norm > 0:
                         centroid = centroid / norm
-
-                    # Get cluster's pitch and energy from profiles
-                    cluster_pitch = profiles.get(spk, {}).get("pitch_hz", 0) or 0
-                    cluster_energy = profiles.get(spk, {}).get("energy_rms", 0) or 0
-
-                    matches = []
+                    
+                    # Get cluster features from profiles
+                    prof = profiles.get(spk, {})
+                    clusters[spk] = {
+                        "embedding": centroid.tolist(),
+                        "pitch_hz": prof.get("pitch_hz", 0) or 0,
+                        "energy_rms": prof.get("energy_rms", 0) or 0,
+                    }
+                    
+                    # Collect spectral and MFCC features
+                    features = {"spectral_centroid": prof.get("spectral_centroid", 0) or 0,
+                                "spectral_rolloff": prof.get("spectral_rolloff", 0) or 0}
+                    for i in range(13):
+                        features[f"mfcc{i}_mean"] = prof.get(f"mfcc{i}_mean", 0) or 0
+                        features[f"mfcc{i}_std"] = prof.get(f"mfcc{i}_std", 0) or 0
+                    all_cluster_features[spk] = features
+                
+                # Use matcher module for distance computation and matching
+                match_results = match_clusters(clusters, req.known_speakers, 
+                                               all_cluster_features=all_cluster_features)
+                
+                # Build all_matches for post-processing (same format as before)
+                all_matches = {}  # spk -> [(name, distance, confidence), ...]
+                debug_matches = {}
+                
+                for spk, result in match_results.items():
+                    matches_list = []
                     debug_distances = {}
-                    for known_name, known_prof in req.known_speakers.items():
-                        if "embedding" not in known_prof:
-                            continue
-
-                        # Embedding distance
-                        emb_dist = cosine(centroid, known_prof["embedding"])
-
-                        # Pitch distance (normalize to 0-1 range) - using cached config values
-                        known_pitch = known_prof.get("pitch_hz", 0) or 0
-                        pitch_dist = abs(cluster_pitch - known_pitch) / pitch_per_unit if cluster_pitch > 0 and known_pitch > 0 else 0.5
-
-                        # Energy distance (normalize) - using cached config values
-                        known_energy = known_prof.get("energy_rms", 0) or 0
-                        energy_dist = abs(cluster_energy - known_energy) / energy_per_unit if cluster_energy > 0 and known_energy > 0 else 0.5
-
-                        # Combined distance: use weighted combination always (using cached weights)
-                        combined_dist = w_emb * emb_dist + w_pitch * min(pitch_dist, 1.0) + w_energy * min(energy_dist, 1.0)
-
-                        conf = max(0, 1 - (combined_dist / conf_max_dist))
-                        matches.append((known_name, combined_dist, conf))
-                        debug_distances[known_name] = {
-                            "emb_dist": round(float(emb_dist), 3),
-                            "pitch_dist": round(pitch_dist, 3),
-                            "energy_dist": round(energy_dist, 3),
-                            "combined": round(combined_dist, 3),
-                            "conf": round(conf, 3)
-                        }
-
-                    # Sort by distance ascending (best match = lowest distance)
-                    matches.sort(key=lambda x: x[1])
-                    all_matches[spk] = matches
+                    for name, dist_info in result.get("distances", {}).items():
+                        conf = dist_info.get("confidence", 0)
+                        matches_list.append((name, dist_info.get("combined", 1.0), conf))
+                        debug_distances[name] = dist_info
+                    matches_list.sort(key=lambda x: x[1])
+                    all_matches[spk] = matches_list
                     debug_matches[spk] = debug_distances
-
-                    if is_debug():
+                    
+                    if is_debug() and matches_list:
+                        cluster_pitch = clusters[spk].get("pitch_hz", 0)
+                        cluster_energy = clusters[spk].get("energy_rms", 0)
                         print(f"Cluster '{spk}' (pitch={cluster_pitch:.0f}Hz, energy={cluster_energy:.3f}) matches: {debug_distances}")
-
+                
                 if is_debug():
                     print("=== END DEBUG ===")
 
@@ -1642,11 +1646,7 @@ async def diarize_path_endpoint(
                         for seg in merged_segments:
                             if seg["speaker"] == extra:
                                 seg["speaker"] = speaker
-                        # Merge profiles
-                        if extra in profiles and primary in profiles:
-                            profiles[primary]["speech_sec"] = profiles[primary].get("speech_sec", 0) + profiles[extra].get("speech_sec", 0)
-                            profiles[primary]["segment_count"] = profiles[primary].get("segment_count", 0) + profiles[extra].get("segment_count", 0)
-                            del profiles[extra]
+                        merge_profiles(profiles, primary, extra)
 
             # Additional merge: clusters with similar distance profiles to known speakers
             # This catches cases where two clusters don't both meet threshold but are same speaker
@@ -1677,10 +1677,7 @@ async def diarize_path_endpoint(
                             for seg in merged_segments:
                                 if seg["speaker"] == cluster_ids[j]:
                                     seg["speaker"] = target_spk
-                            if cluster_ids[j] in profiles and target_spk in profiles:
-                                profiles[target_spk]["speech_sec"] = profiles[target_spk].get("speech_sec", 0) + profiles[cluster_ids[j]].get("speech_sec", 0)
-                                profiles[target_spk]["segment_count"] = profiles[target_spk].get("segment_count", 0) + profiles[cluster_ids[j]].get("segment_count", 0)
-                                del profiles[cluster_ids[j]]
+                            merge_profiles(profiles, target_spk, cluster_ids[j])
                             merged_already.add(cluster_ids[j])
 
             loop.call_soon_threadsafe(queue.put_nowait, json.dumps({
@@ -1741,15 +1738,7 @@ async def diarize_path_endpoint(
                             seg["speaker"] = best_neighbor
 
                 # Re-merge newly adjacent same-speaker segments
-                merged_segments.sort(key=lambda s: s["start"])
-                collapsed = [merged_segments[0]]
-                for seg in merged_segments[1:]:
-                    prev = collapsed[-1]
-                    if seg["speaker"] == prev["speaker"] and seg["start"] - prev["end"] <= 1.0:
-                        prev["end"] = seg["end"]
-                    else:
-                        collapsed.append(seg)
-                merged_segments = collapsed
+                merged_segments = collapse_same_speaker_segments(merged_segments, max_gap=1.0)
 
                 # Remove ghost speakers from profiles — their segments have been
                 # reassigned so they no longer appear in the final output.

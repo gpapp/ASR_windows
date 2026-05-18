@@ -660,6 +660,7 @@ def refine_voiceprint_from_segments(
     all_pitches   = []
     all_energies  = []
     pitch_durations = []
+    all_waveform_chunks = []  # For spectral/MFCC extraction
 
     print(f"[INFO] Loading {len(wav_files)} files...")
     for wav_file in tqdm(wav_files, desc=f"Loading {speaker_name}", unit="file"):
@@ -681,6 +682,9 @@ def refine_voiceprint_from_segments(
             if pitch > 0:
                 all_pitches.append(pitch)
                 pitch_durations.append(duration)
+            
+            # Collect waveform chunks for spectral/MFCC analysis
+            all_waveform_chunks.append(waveform.squeeze(0).numpy())
 
         except Exception as e:
             print(f"[WARN] Failed to load {wav_file.name}: {e}")
@@ -763,13 +767,29 @@ def refine_voiceprint_from_segments(
 
     new_pitch_std = pitch_std if pitch_std > 0 else prev_pitch_std
 
-    voiceprints[speaker_name] = {
+    voiceprint = {
         "pitch_hz": round(new_pitch, 1),
         "pitch_std": round(new_pitch_std, 1),
         "energy_rms": round(new_energy, 4),
         "total_speech_sec": round(new_duration, 1),
         "embedding": combined_emb
     }
+    
+    # Extract spectral and MFCC features from combined audio
+    if all_waveform_chunks:
+        from speaker.profiling import _extract_spectral_features, _extract_mfcc_stats
+        # Concatenate chunks for spectral analysis (limit to first 30s for efficiency)
+        combined_audio = np.concatenate(all_waveform_chunks)
+        max_samples = 30 * 16000  # 30 seconds max at 16kHz
+        if len(combined_audio) > max_samples:
+            combined_audio = combined_audio[:max_samples]
+        
+        spectral = _extract_spectral_features(combined_audio, 16000)
+        mfcc_stats = _extract_mfcc_stats(combined_audio, 16000)
+        voiceprint.update(spectral)
+        voiceprint.update(mfcc_stats)
+    
+    voiceprints[speaker_name] = voiceprint
 
     save_voiceprints(voiceprints, voiceprints_file)
 

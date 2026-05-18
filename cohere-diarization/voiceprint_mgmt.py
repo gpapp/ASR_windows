@@ -419,6 +419,12 @@ def cmd_create(args):
     else:
         pitch, pitch_std = pitch_result, 0.0
     energy = compute_energy(waveform)
+    
+    # Extract spectral and MFCC features
+    from speaker.profiling import _extract_spectral_features, _extract_mfcc_stats
+    waveform_np = waveform.squeeze(0).numpy()
+    spectral = _extract_spectral_features(waveform_np, sample_rate)
+    mfcc_stats = _extract_mfcc_stats(waveform_np, sample_rate)
 
     voiceprints = load_voiceprints(Path(args.output))
 
@@ -428,13 +434,19 @@ def cmd_create(args):
             wav_path.unlink()
         sys.exit(1)
 
-    voiceprints[args.name] = {
+    voiceprint = {
         "pitch_hz": round(pitch, 1) if pitch > 0 else 0.0,
         "pitch_std": round(pitch_std, 1),
         "energy_rms": round(energy, 4),
         "total_speech_sec": round(duration, 1),
         "embedding": embedding,
     }
+    # Add spectral features
+    voiceprint.update(spectral)
+    # Add MFCC features
+    voiceprint.update(mfcc_stats)
+    
+    voiceprints[args.name] = voiceprint
 
     save_voiceprints(voiceprints, Path(args.output))
 
@@ -538,7 +550,7 @@ efine voiceprint with additional samples."""
     new_pitch_std = pitch_std_new if pitch_std_new > 0 else existing.get("pitch_std", 0)
     new_energy = (existing.get("energy_rms", 0) + avg_energy) / 2
 
-    voiceprints[args.speaker] = {
+    voiceprint = {
         "pitch_hz": round(new_pitch, 1),
         "pitch_std": round(new_pitch_std, 1),
         "energy_rms": round(new_energy, 4),
@@ -546,6 +558,15 @@ efine voiceprint with additional samples."""
         "gender_hint": existing.get("gender_hint", "unknown"),
         "embedding": combined_emb,
     }
+    # Preserve existing spectral and MFCC features
+    for key in ["spectral_centroid", "spectral_rolloff"]:
+        if key in existing:
+            voiceprint[key] = existing[key]
+    for key in existing:
+        if key.startswith("mfcc"):
+            voiceprint[key] = existing[key]
+    
+    voiceprints[args.speaker] = voiceprint
 
     save_voiceprints(voiceprints, voiceprints_path)
 
@@ -646,7 +667,7 @@ efine voiceprint with additional samples."""
     new_pitch_std = pitch_std_new if pitch_std_new > 0 else existing.get("pitch_std", 0)
     new_energy = (existing.get("energy_rms", 0) + avg_energy) / 2
 
-    voiceprints[args.speaker] = {
+    voiceprint = {
         "pitch_hz": round(new_pitch, 1),
         "pitch_std": round(new_pitch_std, 1),
         "energy_rms": round(new_energy, 4),
@@ -654,6 +675,15 @@ efine voiceprint with additional samples."""
         "gender_hint": existing.get("gender_hint", "unknown"),
         "embedding": combined_emb,
     }
+    # Preserve existing spectral and MFCC features
+    for key in ["spectral_centroid", "spectral_rolloff"]:
+        if key in existing:
+            voiceprint[key] = existing[key]
+    for key in existing:
+        if key.startswith("mfcc"):
+            voiceprint[key] = existing[key]
+    
+    voiceprints[args.speaker] = voiceprint
 
     save_voiceprints(voiceprints, voiceprints_path)
 
