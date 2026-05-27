@@ -48,7 +48,7 @@ from speaker.audio import extract_fbank, generate_sliding_windows, refine_speake
 from speaker.vad import run_vad_chunked, run_vad_onnx, split_at_energy_dips
 from speaker.profiling import profile_speakers, relabel_by_pitch
 
-from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, Request, Security
+from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, Request, Security, WebSocket, WebSocketDisconnect
 from fastapi.security import APIKeyHeader
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -75,6 +75,90 @@ def collapse_same_speaker_segments(segments: list, max_gap: float = 0.0) -> list
         else:
             collapsed.append(seg.copy())
     return collapsed
+
+
+def absorb_islands(segments: list, min_island_dur: float = 1.0) -> list:
+    """Absorb short segments sandwiched between the same speaker on both sides.
+
+    Mirrors the batch pipeline step 6 island-absorption logic.
+    """
+    changed = True
+    while changed:
+        changed = False
+        for i in range(1, len(segments) - 1):
+            seg = segments[i]
+            dur = seg["end"] - seg["start"]
+            prev_spk = segments[i - 1]["speaker"]
+            next_spk = segments[i + 1]["speaker"]
+            if dur < min_island_dur and prev_spk == next_spk and seg["speaker"] != prev_spk:
+                seg["speaker"] = prev_spk
+                changed = True
+        if changed:
+            segments = collapse_same_speaker_segments(segments, max_gap=1.0)
+    return segments
+
+
+def eliminate_ghost_speakers(
+    segments: list,
+    profiles: dict | None = None,
+    ghost_threshold_sec: float = 10.0,
+) -> list:
+    """Reassign speakers whose total speech is below the ghost threshold.
+
+    Mirrors the batch pipeline ghost-speaker elimination logic.
+    Tries 'alternatives' stored on each segment first, then falls back to
+    the nearest temporal neighbour.
+    """
+    speaker_total: dict[str, float] = {}
+    for seg in segments:
+        spk = seg["speaker"]
+        speaker_total[spk] = speaker_total.get(spk, 0.0) + (seg["end"] - seg["start"])
+
+    ghost_speakers = {spk for spk, total in speaker_total.items() if total < ghost_threshold_sec}
+    if not ghost_speakers:
+        return segments
+
+    if is_debug():
+        print(f"GHOST SPEAKERS (< {ghost_threshold_sec}s total): {ghost_speakers}")
+
+    for seg in segments:
+        if seg["speaker"] not in ghost_speakers:
+            continue
+
+        reassigned = False
+        for alt in seg.get("alternatives", []):
+            alt_spk = alt["speaker"]
+            if alt_spk not in ghost_speakers:
+                if is_debug():
+                    print(f"  GHOST REASSIGN {seg['start']:.1f}-{seg['end']:.1f}: "
+                          f"{seg['speaker']} -> {alt_spk} (alt conf={alt['confidence']:.2f})")
+                seg["speaker"] = alt_spk
+                reassigned = True
+                break
+
+        if not reassigned:
+            seg_mid = (seg["start"] + seg["end"]) / 2
+            best_neighbor, best_dist_t = None, float("inf")
+            for other in segments:
+                if other is seg or other["speaker"] in ghost_speakers:
+                    continue
+                d = abs((other["start"] + other["end"]) / 2 - seg_mid)
+                if d < best_dist_t:
+                    best_dist_t = d
+                    best_neighbor = other["speaker"]
+            if best_neighbor:
+                if is_debug():
+                    print(f"  GHOST NEIGHBOUR {seg['start']:.1f}-{seg['end']:.1f}: "
+                          f"{seg['speaker']} -> {best_neighbor}")
+                seg["speaker"] = best_neighbor
+
+    segments = collapse_same_speaker_segments(segments, max_gap=1.0)
+
+    if profiles is not None:
+        for ghost in ghost_speakers:
+            profiles.pop(ghost, None)
+
+    return segments
 
 
 def merge_profiles(profiles: dict, target: str, source: str):
@@ -1433,20 +1517,7 @@ async def diarize_path_endpoint(
                 merged_segments.append(current_segment)
 
             # 6. Post-merge: absorb short isolated segments into surrounding speaker
-            MIN_ISLAND_DUR = 1.0  # seconds
-            changed = True
-            while changed:
-                changed = False
-                for i in range(1, len(merged_segments) - 1):
-                    seg = merged_segments[i]
-                    prev_spk = merged_segments[i-1]["speaker"]
-                    next_spk = merged_segments[i+1]["speaker"]
-                    dur = seg["end"] - seg["start"]
-                    if dur < MIN_ISLAND_DUR and prev_spk == next_spk and seg["speaker"] != prev_spk:
-                        seg["speaker"] = prev_spk
-                        changed = True
-                if changed:
-                    merged_segments = collapse_same_speaker_segments(merged_segments)
+            merged_segments = absorb_islands(merged_segments)
 
             # 6b. Boundary refinement — re-examine each speaker transition at fine
             #     granularity (0.5s sub-windows, 0.1s stride) to push the boundary
@@ -1684,66 +1755,8 @@ async def diarize_path_endpoint(
                 "type": "progress", "step": "Clustering", "completed": 1, "total": 1
             }))
 
-            # ------------------------------------------------------------------ #
-            # Ghost-speaker elimination: speakers with < 2s total speech are      #
-            # almost always mis-clustered boundary fragments. For each such        #
-            # segment, try the stored alternative speakers first; if none pass     #
-            # the match threshold, fall back to the temporally adjacent speaker.   #
-            # ------------------------------------------------------------------ #
-            ghost_threshold_sec = 10.0
-            speaker_total = {}
-            for seg in merged_segments:
-                spk = seg["speaker"]
-                speaker_total[spk] = speaker_total.get(spk, 0.0) + (seg["end"] - seg["start"])
-
-            ghost_speakers = {spk for spk, total in speaker_total.items() if total < ghost_threshold_sec}
-
-            if ghost_speakers:
-                if is_debug():
-                    print(f"GHOST SPEAKERS (< {ghost_threshold_sec}s total): {ghost_speakers}")
-
-                for seg in merged_segments:
-                    if seg["speaker"] not in ghost_speakers:
-                        continue
-
-                    # Try stored alternatives first (already sorted by confidence)
-                    reassigned = False
-                    for alt in seg.get("alternatives", []):
-                        alt_spk = alt["speaker"]
-                        if alt_spk not in ghost_speakers:
-                            if is_debug():
-                                print(f"  GHOST REASSIGN {seg['start']:.1f}-{seg['end']:.1f}: "
-                                      f"{seg['speaker']} -> {alt_spk} (alt conf={alt['confidence']:.2f})")
-                            seg["speaker"] = alt_spk
-                            reassigned = True
-                            break
-
-                    if not reassigned:
-                        # Fall back to nearest non-ghost neighbour in time
-                        seg_mid = (seg["start"] + seg["end"]) / 2
-                        best_neighbor = None
-                        best_dist_t = float("inf")
-                        for other in merged_segments:
-                            if other is seg or other["speaker"] in ghost_speakers:
-                                continue
-                            other_mid = (other["start"] + other["end"]) / 2
-                            d = abs(other_mid - seg_mid)
-                            if d < best_dist_t:
-                                best_dist_t = d
-                                best_neighbor = other["speaker"]
-                        if best_neighbor:
-                            if is_debug():
-                                print(f"  GHOST NEIGHBOUR {seg['start']:.1f}-{seg['end']:.1f}: "
-                                      f"{seg['speaker']} -> {best_neighbor}")
-                            seg["speaker"] = best_neighbor
-
-                # Re-merge newly adjacent same-speaker segments
-                merged_segments = collapse_same_speaker_segments(merged_segments, max_gap=1.0)
-
-                # Remove ghost speakers from profiles — their segments have been
-                # reassigned so they no longer appear in the final output.
-                for ghost in ghost_speakers:
-                    profiles.pop(ghost, None)
+            # Ghost-speaker elimination
+            merged_segments = eliminate_ghost_speakers(merged_segments, profiles=profiles)
 
             # Compute confidence for each segment based on embedding distances to all cluster centroids
             # For each embeddable window: compute distance to ALL centroids, measure assignment clarity
@@ -2090,6 +2103,563 @@ async def transcribe_paths(
 
 
 # ============================================================================
+# Streaming (WebSocket) — Real-Time Dual-Channel Transcription
+# ============================================================================
+
+VOICEPRINTS_PATH = Path(__file__).parent / "voiceprints.json"
+
+def _stream_load_voiceprints() -> dict:
+    if VOICEPRINTS_PATH.exists():
+        try:
+            with open(VOICEPRINTS_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def _stream_save_voiceprints(vp: dict):
+    try:
+        with open(VOICEPRINTS_PATH, "w", encoding="utf-8") as f:
+            json.dump(vp, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        log.warning("voiceprint_save_failed", error=str(e))
+
+def _estimate_embedding_from_audio(
+    audio_1d: np.ndarray,
+    sr: int = 16000,
+) -> np.ndarray | None:
+    """Extract a single L2-normalised speaker embedding from an audio chunk."""
+    if not state.embedding_session or len(audio_1d) < sr * 1.5:
+        return None
+    wav_t = torch.from_numpy(audio_1d).float().unsqueeze(0)
+    try:
+        windows, _ = generate_sliding_windows(wav_t, sr, window_sec=3.0, stride_sec=1.5)
+        fbanks = []
+        for w in windows:
+            if w.shape[-1] / sr >= 1.5:
+                if w.shape[-1] < 4800:
+                    w = torch.nn.functional.pad(w, (0, 4800 - w.shape[-1]))
+                fbanks.append(extract_fbank(w, sr))
+        if not fbanks:
+            return None
+        max_len = max(fb.shape[1] for fb in fbanks)
+        padded = []
+        for fb in fbanks:
+            if fb.shape[1] < max_len:
+                fb = torch.nn.functional.pad(fb, (0, 0, 0, max_len - fb.shape[1]))
+            padded.append(fb)
+        batch = torch.stack(padded, dim=0)
+        batch = (batch - batch.mean(dim=2, keepdim=True)).squeeze(1).numpy()
+        embs = state.embedding_session.run(None, {
+            state.embedding_session.get_inputs()[0].name: batch
+        })[0]
+        norms = np.linalg.norm(embs, axis=1, keepdims=True)
+        embs = embs / np.maximum(norms, 1e-12)
+        return embs.mean(axis=0)
+    except Exception as e:
+        log.warning("embedding_estimation_failed", error=str(e))
+        return None
+
+
+def _process_speaker_window(
+    audio_1d: np.ndarray,
+    voiceprints: dict,
+    window_start: float,
+    recording_ts: str,
+    session_new_speakers: dict,
+    sr: int = 16000,
+) -> tuple[list[dict], dict]:
+    """
+    Run VAD + energy-dip splitting + sliding-window diarization + ASR on a
+    mono float32 chunk of arbitrary length (typically one VAD-bounded utterance).
+    Returns (transcript_messages, updated_session_new_speakers).
+    """
+    results = []
+    ASR_MIN = int(sr * 3.0)   # minimum samples to feed ONNX ASR model
+
+    if len(audio_1d) < sr * 0.5:
+        return results, session_new_speakers
+
+    wav_t = torch.from_numpy(audio_1d).float().unsqueeze(0)
+
+    # 1. VAD
+    if not state.get_speech_timestamps or not state.vad_model:
+        return results, session_new_speakers
+
+    try:
+        speech_ts = state.get_speech_timestamps(
+            wav_t, state.vad_model,
+            sampling_rate=sr, return_seconds=True,
+            threshold=get_settings().vad_threshold,
+            min_speech_duration_ms=get_settings().vad_min_speech_duration_ms,
+        )
+    except Exception:
+        return results, session_new_speakers
+
+    if not speech_ts:
+        return results, session_new_speakers
+
+    # 1b. Energy-dip splitting to break segments at natural speaker boundaries
+    speech_ts = split_at_energy_dips(speech_ts, audio_1d, sample_rate=sr)
+
+    # 2. Sliding-window embedding extraction
+    MIN_EMBED_DUR = 1.5
+    all_fbanks = []
+    all_seg_meta = []
+    embeddable_idxs = []
+
+    for ts in speech_ts:
+        s = int(ts["start"] * sr)
+        e = int(ts["end"] * sr)
+        seg = wav_t[:, s:e]
+        windows, starts = generate_sliding_windows(seg, sr, window_sec=2.0, stride_sec=0.75)
+        for w, rel_start in zip(windows, starts):
+            dur = w.shape[-1] / sr
+            gs = ts["start"] + rel_start
+            ge = gs + dur
+            idx = len(all_seg_meta)
+            all_seg_meta.append({"start": gs, "end": ge})
+            if dur >= MIN_EMBED_DUR:
+                if w.shape[-1] < 1600:
+                    w = torch.nn.functional.pad(w, (0, 1600 - w.shape[-1]))
+                all_fbanks.append(extract_fbank(w, sr))
+                embeddable_idxs.append(idx)
+
+    if not all_fbanks or not state.embedding_session:
+        # Fallback: transcribe the whole utterance as one unknown speaker
+        asr_audio = audio_1d if len(audio_1d) >= ASR_MIN else np.pad(audio_1d, (0, ASR_MIN - len(audio_1d)))
+        result = transcribe_audio_sync(asr_audio)
+        text = result.get("text", "")
+        if text.strip():
+            results.append({
+                "type": "transcript",
+                "channel": "speakers",
+                "speaker": "SPEAKER_1",
+                "text": clean_transcript(text),
+                "start": round(window_start, 2),
+                "end": round(window_start + len(audio_1d) / sr, 2),
+                "confidence": 0.5,
+            })
+        return results, session_new_speakers
+
+    # Batch embedding
+    max_len = max(fb.shape[1] for fb in all_fbanks)
+    padded = []
+    for fb in all_fbanks:
+        if fb.shape[1] < max_len:
+            fb = torch.nn.functional.pad(fb, (0, 0, 0, max_len - fb.shape[1]))
+        padded.append(fb)
+    batch = torch.stack(padded, dim=0)
+    batch = (batch - batch.mean(dim=2, keepdim=True)).squeeze(1).numpy()
+
+    raw_embs = []
+    bs = 32
+    for i in range(0, len(batch), bs):
+        out = state.embedding_session.run(None, {"feats": batch[i:i+bs]})
+        raw_embs.append(out[0])
+    raw_embs = np.concatenate(raw_embs, axis=0)
+    norms = np.linalg.norm(raw_embs, axis=1, keepdims=True)
+    raw_embs = raw_embs / np.maximum(norms, 1e-12)
+
+    # 3. Clustering
+    settings = get_settings()
+    if len(raw_embs) > 1:
+        clusterer = AgglomerativeClustering(
+            n_clusters=None,
+            metric="cosine",
+            linkage="average",
+            distance_threshold=settings.diarization_threshold,
+        )
+        labels = clusterer.fit_predict(raw_embs)
+    else:
+        labels = np.array([0])
+
+    # 4. Map raw clusters to speaker names (try voiceprint match)
+    cluster_centroids = {}
+    for cid in set(labels):
+        mask = labels == cid
+        mean_emb = raw_embs[mask].mean(axis=0)
+        norm_emb = mean_emb / (np.linalg.norm(mean_emb) + 1e-12)
+        cluster_centroids[int(cid)] = norm_emb
+
+    # Assign raw labels to segments
+    for idx, label in zip(embeddable_idxs, labels):
+        all_seg_meta[idx]["raw_label"] = int(label)
+
+    # Assign short windows to nearest embeddable window
+    emb_mids = np.array([
+        (all_seg_meta[i]["start"] + all_seg_meta[i]["end"]) / 2
+        for i in embeddable_idxs
+    ])
+    for i, seg in enumerate(all_seg_meta):
+        if "raw_label" not in seg:
+            mid = (seg["start"] + seg["end"]) / 2
+            nearest = int(np.argmin(np.abs(emb_mids - mid)))
+            seg["raw_label"] = all_seg_meta[embeddable_idxs[nearest]]["raw_label"]
+
+    # Match clusters to voiceprints, then to session speakers
+    accept_thresh    = get("matching", "accept_threshold",           0.35)
+    clear_gap        = get("matching", "clear_winner_gap",            0.02)
+    embed_only_t     = get("matching", "embed_only_threshold",        0.16)
+    embed_only_acc   = get("matching", "embed_only_accept_threshold",  0.22)
+    conf_max_dist    = get("normalization", "confidence_max_distance", 0.5)
+    clust_thresh     = get("diarization", "default_threshold",         0.35)
+
+    speaker_map = {}   # raw_label -> speaker_name
+    next_spk_num = len(session_new_speakers) + 1
+
+    for raw_id, centroid in sorted(cluster_centroids.items()):
+        # --- voiceprint match ---
+        best_vp, best_vp_dist, second_vp_dist = None, 1.0, 1.0
+        for vp_name, vp_data in voiceprints.items():
+            if "embedding" not in vp_data:
+                continue
+            d = float(cosine(centroid.tolist(), vp_data["embedding"]))
+            if d < best_vp_dist:
+                second_vp_dist = best_vp_dist
+                best_vp_dist = d
+                best_vp = vp_name
+            elif d < second_vp_dist:
+                second_vp_dist = d
+
+        vp_gap = second_vp_dist - best_vp_dist
+        if best_vp and best_vp_dist < accept_thresh and (len(voiceprints) == 1 or vp_gap >= clear_gap):
+            speaker_map[raw_id] = best_vp
+            continue
+        if best_vp and best_vp_dist < embed_only_t and best_vp_dist < embed_only_acc:
+            speaker_map[raw_id] = best_vp
+            continue
+
+        # --- session speaker match (stable SPEAKER_N across utterances) ---
+        best_sess, best_sess_dist = None, 1.0
+        for sname, sdata in session_new_speakers.items():
+            se = np.array(sdata["embedding"])
+            d = float(1.0 - np.dot(centroid, se))
+            if d < best_sess_dist:
+                best_sess_dist = d
+                best_sess = sname
+
+        if best_sess and best_sess_dist < clust_thresh:
+            speaker_map[raw_id] = best_sess
+            # Update running-average centroid
+            n = session_new_speakers[best_sess].get("n_utterances", 1)
+            old = np.array(session_new_speakers[best_sess]["embedding"])
+            updated = (old * n + centroid) / (n + 1)
+            updated /= (np.linalg.norm(updated) + 1e-12)
+            session_new_speakers[best_sess]["embedding"] = updated.tolist()
+            session_new_speakers[best_sess]["n_utterances"] = n + 1
+        else:
+            spk_key = f"SPEAKER_{next_spk_num}"
+            next_spk_num += 1
+            speaker_map[raw_id] = spk_key
+            session_new_speakers[spk_key] = {
+                "embedding":      centroid.tolist(),
+                "audio_fragments": [],
+                "total_sec":       0.0,
+                "confidence_sum":  0.0,
+                "count":           0,
+                "n_utterances":    1,
+            }
+
+    # 5. Merge contiguous same-speaker windows into segments
+    merged = []
+    all_seg_meta.sort(key=lambda x: x["start"])
+    cur = None
+    for seg in all_seg_meta:
+        spk = speaker_map.get(seg.get("raw_label"), "SPEAKER_1")
+        if cur is None:
+            cur = {"start": seg["start"], "end": seg["end"], "speaker": spk}
+        elif cur["speaker"] == spk and seg["start"] <= cur["end"] + 1.0:
+            cur["end"] = max(cur["end"], seg["end"])
+        else:
+            merged.append(cur)
+            cur = {"start": seg["start"], "end": seg["end"], "speaker": spk}
+    if cur:
+        merged.append(cur)
+
+    # 5b. Island absorption + ghost-speaker elimination (same functions as batch pipeline)
+    merged = absorb_islands(merged)
+    merged = eliminate_ghost_speakers(merged, profiles=None)
+
+    # 6. Transcribe each merged segment
+    for seg in merged:
+        s = max(0, int(seg["start"] * sr))
+        e = min(len(audio_1d), int(seg["end"] * sr))
+        if e - s < int(sr * 0.3):
+            continue
+        seg_audio = audio_1d[s:e]
+
+        asr_audio = seg_audio if len(seg_audio) >= ASR_MIN else np.pad(seg_audio, (0, ASR_MIN - len(seg_audio)))
+        try:
+            result = transcribe_audio_sync(asr_audio)
+            text = result.get("text", "")
+            token_count = result.get("tokens_generated", 0)
+            dur = (e - s) / sr
+            conf_score = min(0.95, max(0.3, token_count / (dur * 10 + 1)))
+        except Exception:
+            text = ""
+            conf_score = 0.0
+
+        if not text.strip():
+            continue
+
+        spk = seg["speaker"]
+        results.append({
+            "type":       "transcript",
+            "channel":    "speakers",
+            "speaker":    spk,
+            "text":       clean_transcript(text),
+            "start":      round(window_start + seg["start"], 2),
+            "end":        round(window_start + seg["end"], 2),
+            "confidence": round(conf_score, 3),
+        })
+
+        # Accumulate audio for persistence
+        if spk in session_new_speakers:
+            session_new_speakers[spk]["audio_fragments"].append(seg_audio)
+            session_new_speakers[spk]["total_sec"] += dur
+            session_new_speakers[spk]["confidence_sum"] += conf_score
+            session_new_speakers[spk]["count"] += 1
+
+    return results, session_new_speakers
+
+
+def _persist_new_speakers(
+    session_new_speakers: dict,
+    voiceprints: dict,
+    recording_ts: str,
+    sr: int = 16000,
+    min_speech_sec: float = 30.0,
+    min_confidence: float = 0.8,
+):
+    """
+    Persist new speakers to voiceprints.json if they have enough data and confidence.
+    Uses naming pattern: recording_timestamp_SPEAKER_x
+    """
+    persisted = []
+    for spk_key, data in list(session_new_speakers.items()):
+        if data["total_sec"] < min_speech_sec:
+            continue
+        avg_conf = data["confidence_sum"] / max(1, data["count"])
+        if avg_conf < min_confidence:
+            continue
+
+        # Concatenate all audio fragments
+        if not data["audio_fragments"]:
+            continue
+        all_audio = np.concatenate(data["audio_fragments"])
+        dur = len(all_audio) / sr
+        if dur < 5.0:
+            continue
+
+        # Estimate embedding
+        emb = _estimate_embedding_from_audio(all_audio, sr)
+        if emb is None:
+            continue
+
+        # Generate speaker profile
+        wav_t = torch.from_numpy(all_audio).float().unsqueeze(0)
+        mock_segments = [{"start": 0.0, "end": dur, "speaker": spk_key}]
+        prof = profile_speakers(wav_t, mock_segments, sr)
+        speaker_prof = prof.get(spk_key, {})
+        speaker_prof["embedding"] = emb.tolist() if isinstance(emb, np.ndarray) else emb
+
+        # Assign persistent name
+        existing_names = [n for n in voiceprints.keys() if n.startswith(f"{recording_ts}_SPEAKER")]
+        next_n = len(existing_names) + 1
+        persistent_name = f"{recording_ts}_SPEAKER_{next_n}"
+
+        voiceprints[persistent_name] = speaker_prof
+        persisted.append(persistent_name)
+
+        # Clean up session tracking
+        del session_new_speakers[spk_key]
+
+    if persisted:
+        _stream_save_voiceprints(voiceprints)
+        for name in persisted:
+            log.info("new_speaker_persisted", name=name)
+
+
+@app.websocket("/ws/stream")
+async def stream_transcribe(websocket: WebSocket):
+    """
+    WebSocket endpoint for real-time dual-channel streaming transcription.
+
+    Client sends:
+    1. JSON config: {"my_name": "...", "recording_ts": "YYYYMMDD_HHMMSS"}
+    2. Binary PCM frames: 2-channel int16, 16kHz, interleaved [L=mic, R=speakers]
+
+    VAD detects sentence boundaries; each utterance is processed with the full
+    sliding-window diarization pipeline (energy-dip split → embed → cluster →
+    voiceprint match → ASR).  SPEAKER_N labels are stable across the session.
+    """
+    await websocket.accept()
+    log.info("stream_connected")
+
+    try:
+        raw = await websocket.receive_json()
+        my_name = raw.get("my_name", "[ME]")
+        recording_ts = raw.get("recording_ts", "")
+    except Exception:
+        my_name = "[ME]"
+        recording_ts = ""
+
+    SR = 16000
+    SILENCE_THRESH  = 0.5          # seconds of silence before flushing
+    MAX_UTT_SEC     = 15.0         # safety flush for very long speech
+    MIN_UTT_SEC     = 0.5          # discard utterances shorter than this
+    ASR_MIN         = int(SR * 3)  # minimum samples for ONNX ASR
+    SILENCE_SAMPLES = int(SILENCE_THRESH * SR)
+    MAX_UTT_SAMPLES = int(MAX_UTT_SEC * SR)
+
+    class ChannelState:
+        def __init__(self):
+            self.utt_buf       = np.array([], dtype=np.float32)
+            self.in_speech     = False
+            self.silence_samples = 0
+            self.offset        = 0.0   # session-time at start of utt_buf
+
+    mic_ch = ChannelState()
+    spk_ch = ChannelState()
+    session_time = 0.0
+
+    voiceprints = _stream_load_voiceprints()
+    session_new_speakers: dict = {}
+
+    # ------------------------------------------------------------------ #
+
+    def _vad_has_speech(audio: np.ndarray) -> bool:
+        if not state.get_speech_timestamps or not state.vad_model:
+            return True
+        try:
+            wav_t = torch.from_numpy(audio).float().unsqueeze(0)
+            ts = state.get_speech_timestamps(
+                wav_t, state.vad_model,
+                sampling_rate=SR, return_seconds=False,
+                threshold=get_settings().vad_threshold,
+                min_speech_duration_ms=get_settings().vad_min_speech_duration_ms,
+            )
+            return bool(ts)
+        except Exception:
+            return True
+
+    def _process_mic_utterance(audio: np.ndarray) -> list[dict]:
+        """Simple VAD-gated ASR for the mic channel (speaker is always MY_NAME)."""
+        asr_in = audio if len(audio) >= ASR_MIN else np.pad(audio, (0, ASR_MIN - len(audio)))
+        try:
+            result = transcribe_audio_sync(asr_in)
+            text = clean_transcript(result.get("text", ""))
+        except Exception:
+            text = ""
+        if not text.strip():
+            return []
+        return [{"type": "transcript", "channel": "mic", "speaker": my_name,
+                 "text": text, "confidence": 0.9}]
+
+    async def flush_utterance(ch: ChannelState, channel: str):
+        nonlocal session_new_speakers, voiceprints
+        audio = ch.utt_buf.copy()
+        ch.utt_buf       = np.array([], dtype=np.float32)
+        ch.in_speech     = False
+        ch.silence_samples = 0
+        start_time = ch.offset
+
+        if len(audio) < int(MIN_UTT_SEC * SR):
+            return
+
+        if channel == "mic":
+            msgs = await asyncio.to_thread(_process_mic_utterance, audio)
+            for msg in msgs:
+                msg.setdefault("start", round(start_time, 2))
+                msg.setdefault("end",   round(start_time + len(audio) / SR, 2))
+                try:
+                    await websocket.send_json(msg)
+                except Exception:
+                    pass
+        else:
+            msgs, session_new_speakers = await asyncio.to_thread(
+                _process_speaker_window,
+                audio, voiceprints, start_time, recording_ts, session_new_speakers,
+            )
+            for msg in msgs:
+                try:
+                    await websocket.send_json(msg)
+                except Exception:
+                    pass
+            await asyncio.to_thread(
+                _persist_new_speakers,
+                session_new_speakers, voiceprints, recording_ts,
+            )
+
+    async def process_chunk(ch: ChannelState, chunk: np.ndarray, channel: str):
+        has_speech = await asyncio.to_thread(_vad_has_speech, chunk)
+        if has_speech:
+            if not ch.in_speech:
+                ch.offset    = session_time - len(ch.utt_buf) / SR
+                ch.in_speech = True
+            ch.utt_buf       = np.concatenate([ch.utt_buf, chunk])
+            ch.silence_samples = 0
+            if len(ch.utt_buf) >= MAX_UTT_SAMPLES:
+                await flush_utterance(ch, channel)
+        else:
+            if ch.in_speech:
+                ch.silence_samples += len(chunk)
+                ch.utt_buf = np.concatenate([ch.utt_buf, chunk])
+                if ch.silence_samples >= SILENCE_SAMPLES:
+                    trim = len(ch.utt_buf) - ch.silence_samples
+                    ch.utt_buf = ch.utt_buf[:max(trim, 0)]
+                    await flush_utterance(ch, channel)
+
+    # ------------------------------------------------------------------ #
+
+    try:
+        while True:
+            msg = await websocket.receive()
+            if msg.get("type") == "websocket.disconnect":
+                raise WebSocketDisconnect(code=msg.get("code", 1000))
+
+            if "bytes" in msg:
+                data = msg["bytes"]
+                frame = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+                frame = frame.reshape(-1, 2)
+                session_time += len(frame) / SR
+                await process_chunk(mic_ch, frame[:, 0], "mic")
+                await process_chunk(spk_ch, frame[:, 1], "speakers")
+            elif "text" in msg:
+                try:
+                    payload = json.loads(msg["text"])
+                    if payload.get("type") == "eof":
+                        log.info("stream_eof_received")
+                        break
+                except Exception:
+                    pass
+
+        # Normal loop termination (e.g. eof received)
+        if len(mic_ch.utt_buf) > 0:
+            await flush_utterance(mic_ch, "mic")
+        if len(spk_ch.utt_buf) > 0:
+            await flush_utterance(spk_ch, "speakers")
+        log.info("stream_completed_gracefully", total_seconds=round(session_time, 1))
+
+    except WebSocketDisconnect:
+        if len(mic_ch.utt_buf) > 0:
+            await flush_utterance(mic_ch, "mic")
+        if len(spk_ch.utt_buf) > 0:
+            await flush_utterance(spk_ch, "speakers")
+        log.info("stream_disconnected", total_seconds=round(session_time, 1))
+    except Exception as e:
+        log.error("stream_error", error=str(e))
+        try:
+            await websocket.send_json({"type": "error", "message": str(e)})
+        except Exception:
+            pass
+
+
+
+
+
+# ============================================================================
 # Main
 # ============================================================================
 
@@ -2103,5 +2673,5 @@ if __name__ == "__main__":
         host=settings.host,
         port=settings.port,
         log_level="info",
-        access_log=False,  # We have our own logging
+        access_log=False,  # We have your own logging
     )

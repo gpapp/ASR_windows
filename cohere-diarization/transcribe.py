@@ -11,6 +11,7 @@ Features:
 
 import sys
 import os
+from datetime import datetime
 import re
 import wave
 import asyncio
@@ -297,6 +298,43 @@ def rms_check(wav_path: str, threshold: float) -> bool:
             rms = np.sqrt(np.mean(samples ** 2)) / 32768.0
             return rms >= threshold
     except Exception:
+        return False
+
+
+def extract_speaker_audio(wav_path: str, segments: list, speaker_name: str, output_path: str) -> bool:
+    """Extract concatenated audio for a specific speaker from segments."""
+    try:
+        with wave.open(wav_path, 'rb') as orig:
+            n_channels = orig.getnchannels()
+            sample_width = orig.getsampwidth()
+            frame_rate = orig.getframerate()
+            orig_frames = orig.readframes(orig.getnframes())
+        
+        # Filter segments for this speaker
+        speaker_segments = [s for s in segments if s["speaker"] == speaker_name]
+        if not speaker_segments:
+            return False
+        
+        # Extract audio chunks for this speaker
+        audio_chunks = []
+        for seg in speaker_segments:
+            start_frame = int(seg["start"] * frame_rate)
+            end_frame = int(seg["end"] * frame_rate)
+            chunk_size = sample_width * n_channels
+            start_byte = start_frame * chunk_size
+            end_byte = end_frame * chunk_size
+            audio_chunks.append(orig_frames[start_byte:end_byte])
+        
+        # Write concatenated audio
+        with wave.open(output_path, 'wb') as out:
+            out.setnchannels(n_channels)
+            out.setsampwidth(sample_width)
+            out.setframerate(frame_rate)
+            out.writeframes(b''.join(audio_chunks))
+        
+        return True
+    except Exception as e:
+        log.warn(f"Failed to extract speaker audio: {e}")
         return False
 
 
@@ -767,7 +805,8 @@ async def transcribe_file(
     input_path: str, 
     config: Config,
     client: TranscriptionClient,
-    progress_bar: Optional[tqdm] = None
+    progress_bar: Optional[tqdm] = None,
+    args = None
 ) -> Optional[str]:
     """
     Transcribe a single audio/video file.
@@ -801,7 +840,7 @@ async def transcribe_file(
         diarize_segments, speaker_profiles = await client.diarize_path(temp_wav)
 
         # Update voiceprints.json with new speakers (those with embeddings)
-        if speaker_profiles:
+        if speaker_profiles and diarize_segments:
             voiceprints_path = Path("voiceprints.json")
             existing_vp = {}
             if voiceprints_path.exists():
@@ -811,12 +850,47 @@ async def transcribe_file(
                 except:
                     pass
             
+            # Calculate total duration and speaker confidence from diarize_segments
+            speaker_durations = {}
+            speaker_confidence_sum = {}
+            speaker_counts = {}
+            for seg in diarize_segments:
+                spk = seg["speaker"]
+                dur = seg["end"] - seg["start"]
+                conf = float(seg.get("confidence", 0.5))
+                speaker_durations[spk] = speaker_durations.get(spk, 0.0) + dur
+                speaker_confidence_sum[spk] = speaker_confidence_sum.get(spk, 0.0) + conf
+                speaker_counts[spk] = speaker_counts.get(spk, 0) + 1
+
             updated = False
+            filename_prefix = re.sub(r'[^a-zA-Z0-9_-]', '_', p.stem)
+
             for name, profile in speaker_profiles.items():
-                if "embedding" in profile and name not in existing_vp:
-                    existing_vp[name] = profile
-                    updated = True
-                    print(f"[INFO] Added new voiceprint: {name}")
+                if "embedding" not in profile:
+                    continue
+                # Skip if already a known/existing voiceprint (or if we matched it)
+                if name in existing_vp:
+                    continue
+
+                # Filter by total duration and average confidence
+                total_dur = speaker_durations.get(name, 0.0)
+                if total_dur < 30.0:
+                    continue
+
+                avg_conf = speaker_confidence_sum.get(name, 0.0) / max(1, speaker_counts.get(name, 1))
+                if avg_conf < 0.8:
+                    continue
+
+                # Generate persistent speaker name using processed filename stem as prefix
+                existing_names = [n for n in existing_vp.keys() if n.startswith(f"{filename_prefix}_SPEAKER")]
+                next_n = len(existing_names) + 1
+                persistent_name = f"{filename_prefix}_SPEAKER_{next_n}"
+
+                profile["total_speech_sec"] = total_dur
+
+                existing_vp[persistent_name] = profile
+                updated = True
+                print(f"[INFO] Added new voiceprint: {persistent_name} (dur={total_dur:.1f}s, conf={avg_conf:.2%})")
             
             if updated:
                 try:
@@ -825,6 +899,107 @@ async def transcribe_file(
                     print(f"[INFO] Updated voiceprints.json with {len(existing_vp)} speakers")
                 except Exception as e:
                     log.warn(f"Failed to update voiceprints.json: {e}")
+        
+        # Post-process unknown speakers if requested
+        if args and getattr(args, 'post_process_unknowns', False) and diarize_segments and speaker_profiles:
+            voiceprints_path = Path("voiceprints.json")
+            existing_vp = {}
+            if voiceprints_path.exists():
+                try:
+                    with open(voiceprints_path, 'r', encoding='utf-8') as f:
+                        existing_vp = json.load(f)
+                except:
+                    pass
+            
+            # Identify unknown speakers (those without embeddings in current profiles)
+            known_speakers = set(speaker_profiles.keys())
+            unknown_speakers = set(s["speaker"] for s in diarize_segments) - known_speakers
+            
+            if unknown_speakers:
+                # Calculate stats for unknowns from diarize_segments
+                speaker_durations = {}
+                speaker_confidence_sum = {}
+                speaker_counts = {}
+                for seg in diarize_segments:
+                    if seg["speaker"] in unknown_speakers:
+                        spk = seg["speaker"]
+                        dur = seg["end"] - seg["start"]
+                        conf = float(seg.get("confidence", 0.5))
+                        speaker_durations[spk] = speaker_durations.get(spk, 0.0) + dur
+                        speaker_confidence_sum[spk] = speaker_confidence_sum.get(spk, 0.0) + conf
+                        speaker_counts[spk] = speaker_counts.get(spk, 0) + 1
+                
+                # Filter and extract clean voiceprints for unknown speakers
+                filename_prefix = re.sub(r'[^a-zA-Z0-9_-]', '_', p.stem)
+                
+                for spk in unknown_speakers:
+                    # Check quality gates
+                    total_dur = speaker_durations.get(spk, 0.0)
+                    if total_dur < 30.0:
+                        continue
+                    
+                    avg_conf = speaker_confidence_sum.get(spk, 0.0) / max(1, speaker_counts.get(spk, 1))
+                    if avg_conf < 0.8:
+                        continue
+                    
+                    # Extract clean audio for this speaker
+                    speaker_temp_wav = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+                    speaker_temp_path = speaker_temp_wav.name
+                    speaker_temp_wav.close()
+                    
+                    if not extract_speaker_audio(temp_wav, diarize_segments, spk, speaker_temp_path):
+                        try:
+                            os.unlink(speaker_temp_path)
+                        except:
+                            pass
+                        continue
+                    
+                    try:
+                        # Send extracted audio to server for embedding
+                        print(f"[INFO] Extracting clean voiceprint for unknown speaker {spk}...")
+                        clean_diarize_segments, clean_speaker_profiles = await client.diarize_path(speaker_temp_path)
+                        
+                        if clean_speaker_profiles:
+                            # The extracted audio should have one dominant speaker
+                            # Get the speaker with the most speech
+                            if clean_diarize_segments:
+                                spk_durations_clean = {}
+                                for seg in clean_diarize_segments:
+                                    s = seg["speaker"]
+                                    d = seg["end"] - seg["start"]
+                                    spk_durations_clean[s] = spk_durations_clean.get(s, 0.0) + d
+                                
+                                dominant_spk = max(spk_durations_clean.items(), key=lambda x: x[1])[0]
+                                
+                                if dominant_spk in clean_speaker_profiles and "embedding" in clean_speaker_profiles[dominant_spk]:
+                                    # Generate persistent speaker name
+                                    existing_names = [n for n in existing_vp.keys() if n.startswith(f"{filename_prefix}_post_SPEAKER")]
+                                    next_n = len(existing_names) + 1
+                                    persistent_name = f"{filename_prefix}_post_SPEAKER_{next_n}"
+                                    
+                                    # Create voiceprint with embedding and metadata
+                                    voiceprint_entry = clean_speaker_profiles[dominant_spk].copy()
+                                    voiceprint_entry["total_speech_sec"] = total_dur
+                                    
+                                    existing_vp[persistent_name] = voiceprint_entry
+                                    print(f"[INFO] Added post-processed voiceprint: {persistent_name} (dur={total_dur:.1f}s, conf={avg_conf:.2%})")
+                        
+                    except Exception as e:
+                        log.warn(f"Failed to extract voiceprint for {spk}: {e}")
+                    finally:
+                        try:
+                            os.unlink(speaker_temp_path)
+                        except:
+                            pass
+                
+                # Save updated voiceprints if any were added
+                if existing_vp:
+                    try:
+                        with open(voiceprints_path, 'w', encoding='utf-8') as f:
+                            json.dump(existing_vp, f, indent=2, ensure_ascii=False)
+                        print(f"[INFO] Updated voiceprints.json with post-processed speakers")
+                    except Exception as e:
+                        log.warn(f"Failed to save post-processed voiceprints: {e}")
         
         if not diarize_segments:
             log.warn("Diarization returned no segments. Assuming single speaker for fallback.", file=p.name)
@@ -970,7 +1145,7 @@ async def transcribe_file(
             pass
 
 
-async def transcribe_files(input_paths: list[str], config: Config):
+async def transcribe_files(input_paths: list[str], config: Config, args):
     """Transcribe multiple files."""
     client = TranscriptionClient(config)
     
@@ -992,7 +1167,7 @@ async def transcribe_files(input_paths: list[str], config: Config):
         
         for input_path in input_paths:
             with tqdm(unit="seg", leave=True, dynamic_ncols=True) as pbar:
-                result = await transcribe_file(input_path, config, client, pbar)
+                result = await transcribe_file(input_path, config, client, pbar, args)
                 results.append((input_path, result))
         
         # Summary
@@ -1138,6 +1313,11 @@ Examples:
         default=None,
         help="Path to JSON file with known voice profiles (embedding-based identification)"
     )
+    parser.add_argument(
+        "--post-process-unknowns",
+        action="store_true",
+        help="Extract clean voiceprints for unknown speakers with substantial talk (>= 30s, >= 0.8 confidence)"
+    )
 
     args = parser.parse_args()
     
@@ -1212,7 +1392,7 @@ Examples:
     log.info(f"Processing {len(input_files)} file(s)")
     
     # Run async
-    asyncio.run(transcribe_files(input_files, config))
+    asyncio.run(transcribe_files(input_files, config, args))
 
 
 if __name__ == "__main__":

@@ -25,10 +25,12 @@ structlog
 # Progress bars
 tqdm
 
-# Optional: Metrics
-prometheus-client
-
 # Optional: Rate limiting
 slowapi
 
 python-dotenv
+
+# Streaming
+sounddevice
+websockets
+pyaudiowpatch
