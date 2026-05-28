@@ -30,7 +30,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import torch
-import torchaudio
 import numpy as np
 import json
 import librosa
@@ -50,7 +49,7 @@ from speaker.profiling import profile_speakers, relabel_by_pitch
 
 from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, Request, Security, WebSocket, WebSocketDisconnect
 from fastapi.security import APIKeyHeader
-from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -221,7 +220,6 @@ class Settings(BaseSettings):
     cors_origins: str = "*"
     
     # Feature flags
-    enable_dml: bool = True
     enable_rate_limit: bool = True
     enable_diarization: bool = True
     hf_token: Optional[str] = None
@@ -263,6 +261,21 @@ def get_settings() -> Settings:
 
 def setup_logging():
     """Configure structured JSON logging."""
+    import logging
+    
+    # Configure stdlib logging with console handler
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG)
+    
+    # Remove any existing handlers
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+    
+    # Add console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.DEBUG)
+    root_logger.addHandler(console_handler)
+    
     structlog.configure(
         processors=[
             structlog.stdlib.filter_by_level,
@@ -388,7 +401,6 @@ class ModelState:
         self.pre_computed_prompt_ids: list[int] = []
         self.pre_computed_eos_id: int = -1
         self.pre_computed_prompt_array: Optional[np.ndarray] = None
-        self.use_dml: bool = False
         self.device: str = "cpu"
         self.status: str = "initializing"
         self.kv_pool: Optional[KVCachePool] = None
@@ -415,6 +427,9 @@ def ensure_model(settings: Settings) -> Path:
         "cohere-encoder.int8.onnx",
         "cohere-encoder.int8.onnx.data",
         "cohere-decoder.int8.onnx",
+        "cohere-encoder.fp16.onnx",
+        "cohere-encoder.fp16.onnx.data",
+        "cohere-decoder.fp16.onnx",
         "tokens.txt",
     ]
     
@@ -436,6 +451,27 @@ def ensure_model(settings: Settings) -> Path:
 
 
 def load_models(settings: Settings):
+    import site
+    # 1. Locate the active virtual environment's site-packages folder
+    site_packages_dirs = site.getsitepackages()
+
+    openvino_dll_path = None
+    for packages_dir in site_packages_dirs:
+        # Build the path targeting the internal openvino binary folder
+        potential_path = os.path.join(packages_dir, "openvino", "libs")
+        if os.path.exists(potential_path):
+            openvino_dll_path = potential_path
+            break
+
+    # 2. Tell Windows where to find the underlying OpenVINO C++ DLL files
+    if openvino_dll_path:
+        print(f"--> Linking OpenVINO Binaries from: {openvino_dll_path}")
+        os.add_dll_directory(openvino_dll_path)
+        # Add to standard PATH as a secondary fallback for older runtimes
+        os.environ["PATH"] = openvino_dll_path + os.path.pathsep + os.environ["PATH"]
+    else:
+        print("Warning: Could not locate the 'openvino' pip package directory.")
+
     """Load encoder and decoder models."""    
     model_dir = ensure_model(settings)
     
@@ -459,11 +495,23 @@ def load_models(settings: Settings):
     pre_computed_eos_id = token_to_id.get("<|endoftext|>", -1)
     pre_computed_prompt_array = np.array([pre_computed_prompt_ids], dtype=np.int64)
     
-    # Determine execution providers
-    # Per user request: Cohere ONNX runs best on CPU, not DirectML
-    use_dml = False
-    providers = ["CPUExecutionProvider"]
-    log.info("execution_providers", providers=providers, dml_enabled=use_dml)
+    # Determine execution providers    
+    providers = [                 
+                 "OpenVINOExecutionProvider",
+                 #"DmlExecutionProvider", 
+                 #"CPUExecutionProvider"
+                ]
+    # Configure OpenVINO to save compiled binaries to your disk
+    gpu_config = {
+        "GPU": {
+            #"ENABLE_INT8": "YES",    
+            "CACHE_DIR": r".\openvino_model_cache",  # Saves compiled kernels here
+            "PERFORMANCE_HINT": "LATENCY",
+        }
+    }
+
+    provider_options = [{"device_type": "AUTO:GPU,CPU", "load_config": json.dumps(gpu_config)}] # Forces use of the iGPU
+    log.info("execution_providers", providers=providers)
     
     # Session options
     opts = ort.SessionOptions()
@@ -473,32 +521,32 @@ def load_models(settings: Settings):
     
     # Load models
     log.info("loading_encoder")
-    encoder = ort.InferenceSession(
-        str(model_dir / "cohere-encoder.int8.onnx"), 
+    cohere_encoder = ort.InferenceSession(
+        str(model_dir / "cohere-encoder.fp16.onnx"), 
         opts, 
-        providers=providers
+        providers=providers,
+        provider_options=provider_options
     )
     
-    log.info("loading_decoder")
-    decoder = ort.InferenceSession(
-        str(model_dir / "cohere-decoder.int8.onnx"), 
+    cohere_decoder = ort.InferenceSession(
+        str(model_dir / "cohere-decoder.fp16.onnx"), 
         opts, 
-        providers=providers
+        providers=providers,
+        provider_options=provider_options
     )
     
     # Update state
-    device = "dml" if use_dml else "cpu"
+    device = "gpu" if "OpenVINOExecutionProvider" in providers else "cpu"
     
-    state.encoder = encoder
-    state.decoder = decoder
+    state.encoder = cohere_encoder
+    state.decoder = cohere_decoder  
     state.tokens = tokens
     state.token_to_id = token_to_id
     state.pre_computed_prompt_ids = pre_computed_prompt_ids
     state.pre_computed_eos_id = pre_computed_eos_id
     state.pre_computed_prompt_array = pre_computed_prompt_array
-    state.use_dml = use_dml
     state.device = device
-    state.kv_pool = KVCachePool(settings, device)
+    state.kv_pool = KVCachePool(settings, device=device)
 
     if settings.enable_diarization:
         log.info("loading_vad_model")
@@ -507,9 +555,8 @@ def load_models(settings: Settings):
         vad_onnx_path = str(Path(torch.hub.get_dir()) / "silero_vad" / "silero_vad.onnx")
         
         if Path(vad_onnx_path).exists():
-            try:
-                vad_providers = ["DMLExecutionProvider", "CPUExecutionProvider"]
-                state.vad_session = ort.InferenceSession(vad_onnx_path, opts, providers=vad_providers)
+            try:                
+                state.vad_session = ort.InferenceSession(vad_onnx_path, opts, providers=providers, provider_options=provider_options)
                 state.use_vad_onnx = True
                 state.vad_model = None
                 
@@ -557,7 +604,7 @@ def load_models(settings: Settings):
                 settings.embedding_model_filename,
                 settings.hf_token
             )
-            state.embedding_session = ort.InferenceSession(emb_path, opts, providers=providers)
+            state.embedding_session = ort.InferenceSession(emb_path, opts, providers=providers, provider_options=provider_options)
             log.info("embedding_model_loaded", path=emb_path)
         except Exception as e:
             log.error("embedding_model_failed", error=str(e))
@@ -2655,10 +2702,6 @@ async def stream_transcribe(websocket: WebSocket):
         except Exception:
             pass
 
-
-
-
-
 # ============================================================================
 # Main
 # ============================================================================
@@ -2672,6 +2715,6 @@ if __name__ == "__main__":
         app,
         host=settings.host,
         port=settings.port,
-        log_level="info",
-        access_log=False,  # We have your own logging
+        log_level="debug",
+        access_log=True,
     )
