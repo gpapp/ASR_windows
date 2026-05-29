@@ -166,7 +166,8 @@ def refine_speaker_boundaries(
             fb = torch.nn.functional.pad(fb, (0, 0, 0, max_len - fb.shape[1]))
         padded.append(fb.squeeze(0))                     # [T, 80]
 
-    batch    = torch.stack(padded).numpy()               # [N, T, 80]
+    # Ensure explicit float32 dtype for iGPU execution
+    batch    = torch.stack(padded).numpy().astype(np.float32)               # [N, T, 80]
     raw_embs = embedding_session.run(None, {input_name: batch})[0]  # [N, D]
     norms    = np.linalg.norm(raw_embs, axis=1, keepdims=True)
     embs     = raw_embs / np.maximum(norms, 1e-12)       # L2-normalised

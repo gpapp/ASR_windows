@@ -299,7 +299,8 @@ def identify_speakers_in_audio(
         batch = torch.stack(padded_fbanks)  # [N, 1, max_len, 80]
         # Apply CMN (Cepstral Mean Normalization) — critical for ECAPA-TDNN
         batch = batch - batch.mean(dim=2, keepdim=True)
-        batch = batch.squeeze(1).numpy()  # [N, max_len, 80]
+        # Ensure explicit float32 dtype for iGPU execution
+        batch = batch.squeeze(1).numpy().astype(np.float32)  # [N, max_len, 80]
 
         embeddings = embedding_session.run(None, {embedding_session.get_inputs()[0].name: batch})[0]
 

@@ -153,58 +153,79 @@ def run_vad_chunked(waveform_tensor, vad_model, get_speech_timestamps, sample_ra
     return merged
 
 
-def run_vad_onnx(waveform_tensor, vad_session, sample_rate=16000, 
-                 chunk_duration=30, overlap=5, threshold=0.5, min_speech_duration_ms=250):
-    """Run VAD using ONNX model with DirectML acceleration."""
-    import torch
+def run_vad_onnx_direct(waveform, vad_session, sample_rate=16000, threshold=0.5, min_speech_duration_ms=250):
+    """Runs VAD frame-by-frame on a 1D numpy array using the raw ONNX InferenceSession directly.
     
-    total_samples = waveform_tensor.shape[-1]
-    chunk_samples = int(chunk_duration * sample_rate)
-    stride_samples = int((chunk_duration - overlap) * sample_rate)
+    This is extremely fast and has zero external python dependencies or state wrappers.
+    """
+    # Initialize state
+    state = np.zeros((2, 1, 128), dtype=np.float32)
+    sr_input = np.array(sample_rate, dtype=np.int64)
     
-    all_speech_ts = []
+    # 512 samples frame size
+    frame_size = 512
+    total_samples = len(waveform)
     
-    for start in range(0, total_samples, stride_samples):
-        end = min(start + chunk_samples, total_samples)
-        chunk = waveform_tensor[..., start:end]
+    # Gather speech probabilities
+    probs = []
+    for start in range(0, total_samples, frame_size):
+        chunk = waveform[start : start + frame_size]
+        if len(chunk) < frame_size:
+            chunk = np.pad(chunk, (0, frame_size - len(chunk)))
         
-        # Convert to numpy and prepare input
-        chunk_np = chunk.squeeze(0).numpy().astype(np.float32)
+        chunk_input = np.expand_dims(chunk, axis=0).astype(np.float32) # [1, 512]
         
-        # Silero ONNX expects [batch, time] input
-        input_tensor = np.expand_dims(chunk_np, axis=0)
+        # Run ONNX inference
+        out = vad_session.run(None, {
+            "input": chunk_input,
+            "sr": sr_input,
+            "state": state
+        })
+        prob = out[0][0][0]
+        state = out[1] # [2, 1, 64]
+        probs.append(prob)
         
-        # Run inference
-        out = vad_session.run(None, {"input": input_tensor})
-        probs = out[0][0]  # [time]
-        
-        # Find speech segments
-        speech_mask = probs > threshold
-        
-        # Find contiguous segments
-        if speech_mask.any():
-            indices = np.where(np.diff(np.concatenate([[False], speech_mask, [False]])))[0]
-            for i in range(0, len(indices), 2):
-                if i + 1 < len(indices):
-                    seg_start = indices[i] / 100  # 100 Hz output
-                    seg_end = indices[i + 1] / 100
-                    seg_dur_ms = (seg_end - seg_start) * 1000
-                    if seg_dur_ms >= min_speech_duration_ms:
-                        all_speech_ts.append({
-                            "start": seg_start + start / sample_rate,
-                            "end": seg_end + start / sample_rate
-                        })
+    # Find contiguous speech segments based on trigger/neg-trigger thresholds
+    min_speech_frames = int(min_speech_duration_ms / 32)
+    min_silence_frames = int(100 / 32) # 100ms silence threshold to split segments
     
-    if not all_speech_ts:
+    speech_segments = []
+    triggered = False
+    temp_end = 0
+    current_speech = {}
+    
+    for i, prob in enumerate(probs):
+        if prob >= threshold:
+            if not triggered:
+                triggered = True
+                current_speech["start"] = (i * frame_size) / sample_rate
+            temp_end = 0
+        elif triggered:
+            temp_end += 1
+            if temp_end >= min_silence_frames:
+                triggered = False
+                current_speech["end"] = ((i - temp_end + 1) * frame_size) / sample_rate
+                # Check minimum duration
+                if (current_speech["end"] - current_speech["start"]) >= (min_speech_duration_ms / 1000.0):
+                    speech_segments.append(current_speech)
+                current_speech = {}
+                
+    # Close final segment if still triggered
+    if triggered:
+        current_speech["end"] = total_samples / sample_rate
+        if (current_speech["end"] - current_speech["start"]) >= (min_speech_duration_ms / 1000.0):
+            speech_segments.append(current_speech)
+            
+    # Merge overlapping or close segments
+    if not speech_segments:
         return []
-    
-    # Merge overlapping segments
-    all_speech_ts.sort(key=lambda x: x["start"])
-    merged = [all_speech_ts[0]]
-    for seg in all_speech_ts[1:]:
+        
+    speech_segments.sort(key=lambda x: x["start"])
+    merged = [speech_segments[0]]
+    for seg in speech_segments[1:]:
         if seg["start"] <= merged[-1]["end"] + 0.1:
             merged[-1]["end"] = max(merged[-1]["end"], seg["end"])
         else:
             merged.append(seg)
-    
+            
     return merged

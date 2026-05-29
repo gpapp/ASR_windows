@@ -13,960 +13,54 @@ Features:
 """
 
 import os
-import sys
 import time
-import threading
-import tempfile
-import signal
-import re
-from pathlib import Path
-from typing import Optional
-from functools import lru_cache
-from contextlib import contextmanager, asynccontextmanager
-from concurrent.futures import ThreadPoolExecutor
 import asyncio
+import tempfile
+from pathlib import Path
+from contextlib import asynccontextmanager
+from concurrent.futures import ThreadPoolExecutor
 
-from dotenv import load_dotenv
-load_dotenv()
-
-import torch
 import numpy as np
-import json
 import librosa
-import onnxruntime as ort
-from sklearn.cluster import AgglomerativeClustering
-from sklearn.metrics.pairwise import cosine_distances
-from scipy.spatial.distance import cosine
-
-TARGET_SAMPLES = 480000  # 30 seconds at 16kHz
-
-# Config and speaker modules
-from config import get, is_debug
-from speaker.matcher import match_clusters, merge_matched_clusters
-from speaker.audio import extract_fbank, generate_sliding_windows, refine_speaker_boundaries
-from speaker.vad import run_vad_chunked, run_vad_onnx, split_at_energy_dips
-from speaker.profiling import profile_speakers, relabel_by_pitch
-
-from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, Request, Security, WebSocket, WebSocketDisconnect
-from fastapi.security import APIKeyHeader
-from fastapi.responses import JSONResponse, StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
 import structlog
 
+from fastapi import FastAPI, File, UploadFile, Depends
+from fastapi.responses import JSONResponse, StreamingResponse
 
-def collapse_same_speaker_segments(segments: list, max_gap: float = 0.0) -> list:
-    """Collapse adjacent segments with the same speaker.
-    
-    Args:
-        segments: List of segment dicts with 'speaker', 'start', 'end' keys
-        max_gap: Max time gap between segments to still consider them adjacent (default 0 = contiguous)
-    """
-    if not segments:
-        return []
-    segments = sorted(segments, key=lambda x: x["start"])
-    collapsed = [segments[0].copy()]
-    for seg in segments[1:]:
-        prev = collapsed[-1]
-        if seg["speaker"] == prev["speaker"] and seg["start"] - prev["end"] <= max_gap:
-            prev["end"] = max(prev["end"], seg["end"])
-        else:
-            collapsed.append(seg.copy())
-    return collapsed
+from settings import get_settings
+from model_state import state, executor as global_executor
+from model_loader import load_models
+from transcriber import transcribe_audio_async, clean_transcript, TARGET_SAMPLES
+from diarization import Diarizer
+from streaming import stream_transcribe
+from api.schemas import (
+    DiarizePathsRequest, TranscribePathsRequest, TranscribeResult,
+    TranscribeResponse, HealthResponse
+)
+from api.security import verify_api_key, validate_path_security
+from api.middleware import apply_middleware
+from api.exceptions import register_exception_handlers, PathSecurityError
 
-
-def absorb_islands(segments: list, min_island_dur: float = 1.0) -> list:
-    """Absorb short segments sandwiched between the same speaker on both sides.
-
-    Mirrors the batch pipeline step 6 island-absorption logic.
-    """
-    changed = True
-    while changed:
-        changed = False
-        for i in range(1, len(segments) - 1):
-            seg = segments[i]
-            dur = seg["end"] - seg["start"]
-            prev_spk = segments[i - 1]["speaker"]
-            next_spk = segments[i + 1]["speaker"]
-            if dur < min_island_dur and prev_spk == next_spk and seg["speaker"] != prev_spk:
-                seg["speaker"] = prev_spk
-                changed = True
-        if changed:
-            segments = collapse_same_speaker_segments(segments, max_gap=1.0)
-    return segments
-
-
-def eliminate_ghost_speakers(
-    segments: list,
-    profiles: dict | None = None,
-    ghost_threshold_sec: float = 10.0,
-) -> list:
-    """Reassign speakers whose total speech is below the ghost threshold.
-
-    Mirrors the batch pipeline ghost-speaker elimination logic.
-    Tries 'alternatives' stored on each segment first, then falls back to
-    the nearest temporal neighbour.
-    """
-    speaker_total: dict[str, float] = {}
-    for seg in segments:
-        spk = seg["speaker"]
-        speaker_total[spk] = speaker_total.get(spk, 0.0) + (seg["end"] - seg["start"])
-
-    ghost_speakers = {spk for spk, total in speaker_total.items() if total < ghost_threshold_sec}
-    if not ghost_speakers:
-        return segments
-
-    if is_debug():
-        print(f"GHOST SPEAKERS (< {ghost_threshold_sec}s total): {ghost_speakers}")
-
-    for seg in segments:
-        if seg["speaker"] not in ghost_speakers:
-            continue
-
-        reassigned = False
-        for alt in seg.get("alternatives", []):
-            alt_spk = alt["speaker"]
-            if alt_spk not in ghost_speakers:
-                if is_debug():
-                    print(f"  GHOST REASSIGN {seg['start']:.1f}-{seg['end']:.1f}: "
-                          f"{seg['speaker']} -> {alt_spk} (alt conf={alt['confidence']:.2f})")
-                seg["speaker"] = alt_spk
-                reassigned = True
-                break
-
-        if not reassigned:
-            seg_mid = (seg["start"] + seg["end"]) / 2
-            best_neighbor, best_dist_t = None, float("inf")
-            for other in segments:
-                if other is seg or other["speaker"] in ghost_speakers:
-                    continue
-                d = abs((other["start"] + other["end"]) / 2 - seg_mid)
-                if d < best_dist_t:
-                    best_dist_t = d
-                    best_neighbor = other["speaker"]
-            if best_neighbor:
-                if is_debug():
-                    print(f"  GHOST NEIGHBOUR {seg['start']:.1f}-{seg['end']:.1f}: "
-                          f"{seg['speaker']} -> {best_neighbor}")
-                seg["speaker"] = best_neighbor
-
-    segments = collapse_same_speaker_segments(segments, max_gap=1.0)
-
-    if profiles is not None:
-        for ghost in ghost_speakers:
-            profiles.pop(ghost, None)
-
-    return segments
-
-
-def merge_profiles(profiles: dict, target: str, source: str):
-    """Merge source profile into target profile, deleting source."""
-    if source not in profiles:
-        return
-    if target not in profiles:
-        profiles[target] = profiles.pop(source, {})
-        return
-    profiles[target]["speech_sec"] = profiles[target].get("speech_sec", 0) + profiles[source].get("speech_sec", 0)
-    profiles[target]["segment_count"] = profiles[target].get("segment_count", 0) + profiles[source].get("segment_count", 0)
-    del profiles[source]
-
-
-def ensure_embedding_model(repo_id: str, filename: str, token: str) -> str:
-    """Downloads the ONNX embedding model from HF Hub if not present locally."""
-    log.info("downloading_embedding_model", repo=repo_id, file=filename)
-    try:
-        from huggingface_hub import hf_hub_download
-        path = hf_hub_download(repo_id=repo_id, filename=filename, token=token)
-        return path
-    except Exception as e:
-        log.error("embedding_download_failed", error=str(e))
-        raise
-
-
-# ============================================================================
-# Configuration
-# ============================================================================
-
-class Settings(BaseSettings):
-    """Application settings loaded from environment variables."""
-    
-    # Model settings
-    model_repo: str = "gn64/cohere-transcribe-onnx-int8"
-    model_dir: Path = Path(__file__).parent.parent / "models"
-    
-    # Model architecture constants
-    n_layers: int = 8
-    heads: int = 8
-    head_dim: int = 128
-    max_ctx: int = 1024
-    max_new_tokens: int = 448
-    
-    # Server settings
-    host: str = "127.0.0.1"
-    port: int = 8000
-    workers: int = 2
-    request_timeout: int = 120
-    max_request_size_mb: int = 200
-    
-    # Batch settings
-    max_batch_size: int = 10
-    max_audio_duration_sec: int = 600  # 10 minutes max per file
-    
-    # Security settings
-    allowed_audio_dir: Optional[Path] = None  # If set, only allow paths under this dir
-    api_keys: Optional[str] = None  # Comma-separated API keys, None = no auth
-    enable_cors: bool = True
-    cors_origins: str = "*"
-    
-    # Feature flags
-    enable_rate_limit: bool = True
-    enable_diarization: bool = True
-    hf_token: Optional[str] = None
-    rate_limit: str = "30/minute"
-    
-    # Diarization settings
-    diarization_threshold: float = Field(default=0.35, description="Distance threshold for AgglomerativeClustering - higher = fewer clusters")
-    vad_threshold: float = Field(default=0.5, description="Speech probability cutoff (0.0 to 1.0) for Silero VAD")
-    vad_min_speech_duration_ms: int = Field(default=250, description="Minimum speech chunk length (ms) for Silero VAD")
-    
-    # Embedding model settings
-    embedding_model_repo: str = Field(default="Wespeaker/wespeaker-ecapa-tdnn512-LM", description="HuggingFace repo for the embedding ONNX model")
-    embedding_model_filename: str = Field(default="voxceleb_ECAPA512_LM.onnx", description="Filename of the ONNX embedding model")
-    
-    # Cache settings
-    kv_cache_pool_size: int = 4
-
-    model_config = SettingsConfigDict(
-        env_prefix="TRANSCRIBE_",
-        env_file=".env",
-        extra="ignore"
-    )
-
-    @property
-    def api_key_set(self) -> set[str]:
-        if not self.api_keys:
-            return set()
-        return set(k.strip() for k in self.api_keys.split(",") if k.strip())
-
-
-@lru_cache
-def get_settings() -> Settings:
-    return Settings()
-
-
-# ============================================================================
-# Logging Setup
-# ============================================================================
-
-def setup_logging():
-    """Configure structured JSON logging."""
-    import logging
-    
-    # Configure stdlib logging with console handler
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG)
-    
-    # Remove any existing handlers
-    for handler in root_logger.handlers[:]:
-        root_logger.removeHandler(handler)
-    
-    # Add console handler
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.DEBUG)
-    root_logger.addHandler(console_handler)
-    
-    structlog.configure(
-        processors=[
-            structlog.stdlib.filter_by_level,
-            structlog.stdlib.add_logger_name,
-            structlog.stdlib.add_log_level,
-            structlog.stdlib.PositionalArgumentsFormatter(),
-            structlog.processors.TimeStamper(fmt="iso"),
-            structlog.processors.StackInfoRenderer(),
-            structlog.processors.format_exc_info,
-            structlog.processors.UnicodeDecoder(),
-            structlog.processors.JSONRenderer() if os.getenv("LOG_JSON") else structlog.dev.ConsoleRenderer()
-        ],
-        wrapper_class=structlog.stdlib.BoundLogger,
-        context_class=dict,
-        logger_factory=structlog.stdlib.LoggerFactory(),
-        cache_logger_on_first_use=True,
-    )
-
-setup_logging()
 log = structlog.get_logger()
 
-# ============================================================================
-# Custom Exceptions
-# ============================================================================
-
-class TranscriptionError(Exception):
-    """Base exception for transcription errors."""
-    def __init__(self, message: str, details: dict = None):
-        self.message = message
-        self.details = details or {}
-        super().__init__(message)
-
-
-class TimeoutError(TranscriptionError):
-    """Inference timeout error."""
-    pass
-
-
-class AudioValidationError(TranscriptionError):
-    """Invalid audio input error."""
-    pass
-
-
-class PathSecurityError(TranscriptionError):
-    """Path access security error."""
-    pass
-
 
 # ============================================================================
-# KV Cache Pool
-# ============================================================================
-
-class KVCachePool:
-    """
-    Pool of reusable KV caches to avoid repeated GPU memory allocations.
-    Thread-safe implementation with automatic growth.
-    """
-    
-    def __init__(self, settings: Settings, device: str = "cpu"):
-        self.settings = settings
-        self.device = device
-        self.pool: list[dict] = []
-        self.lock = threading.Lock()
-        self.created_count = 0
-        
-        # Pre-allocate initial pool
-        for _ in range(settings.kv_cache_pool_size):
-            self.pool.append(self._create_cache())
-    
-    def _create_cache(self) -> dict:
-        """Create a new KV cache pair."""
-        self.created_count += 1
-        s = self.settings
-        return {
-            "self_k": ort.OrtValue.ortvalue_from_numpy(
-                np.zeros((s.n_layers, 1, s.heads, s.max_ctx, s.head_dim), dtype=np.float32),
-                self.device, 0
-            ),
-            "self_v": ort.OrtValue.ortvalue_from_numpy(
-                np.zeros((s.n_layers, 1, s.heads, s.max_ctx, s.head_dim), dtype=np.float32),
-                self.device, 0
-            ),
-        }
-    
-    @contextmanager
-    def acquire(self):
-        """
-        Acquire a KV cache from the pool.
-        Creates a new one if pool is empty.
-        Returns cache to pool when done.
-        """
-        with self.lock:
-            if self.pool:
-                cache = self.pool.pop()
-            else:
-                log.warning("kv_cache_pool_empty", created_total=self.created_count)
-                cache = self._create_cache()
-        
-        try:
-            yield cache
-        finally:
-            with self.lock:
-                # Return to pool if under limit
-                if len(self.pool) < self.settings.kv_cache_pool_size * 2:
-                    self.pool.append(cache)
-
-
-# ============================================================================
-# Model State
-# ============================================================================
-
-class ModelState:
-    """Thread-safe container for model state."""
-
-    def __init__(self):
-        self.encoder: Optional[ort.InferenceSession] = None
-        self.decoder: Optional[ort.InferenceSession] = None
-        self.embedding_session: Optional[ort.InferenceSession] = None
-        self.vad_model = None
-        self.get_speech_timestamps = None
-        self.tokens: dict[int, str] = {}
-        self.token_to_id: dict[str, int] = {}
-        self.pre_computed_prompt_ids: list[int] = []
-        self.pre_computed_eos_id: int = -1
-        self.pre_computed_prompt_array: Optional[np.ndarray] = None
-        self.device: str = "cpu"
-        self.status: str = "initializing"
-        self.kv_pool: Optional[KVCachePool] = None
-        self.lock = threading.Lock()
-    
-    @property
-    def is_ready(self) -> bool:
-        return self.status == "ready"
-
-
-state = ModelState()
-executor: Optional[ThreadPoolExecutor] = None
-
-
-# ============================================================================
-# Model Loading
-# ============================================================================
-
-def ensure_model(settings: Settings) -> Path:
-    """Download model files if not present."""
-    from huggingface_hub import snapshot_download
-    
-    needed = [
-        "cohere-encoder.int8.onnx",
-        "cohere-encoder.int8.onnx.data",
-        "cohere-decoder.int8.onnx",
-        "cohere-encoder.fp16.onnx",
-        "cohere-encoder.fp16.onnx.data",
-        "cohere-decoder.fp16.onnx",
-        "tokens.txt",
-    ]
-    
-    if all((settings.model_dir / f).exists() for f in needed):
-        log.info("model_files_present", path=str(settings.model_dir))
-        return settings.model_dir
-    
-    log.info("downloading_model", repo=settings.model_repo, size_gb=2.9)
-    settings.model_dir.mkdir(parents=True, exist_ok=True)
-    
-    snapshot_download(
-        repo_id=settings.model_repo,
-        allow_patterns=["*.onnx", "*.onnx.data", "tokens.txt"],
-        local_dir=str(settings.model_dir),
-    )
-    
-    log.info("model_download_complete")
-    return settings.model_dir
-
-
-def load_models(settings: Settings):
-    import site
-    # 1. Locate the active virtual environment's site-packages folder
-    site_packages_dirs = site.getsitepackages()
-
-    openvino_dll_path = None
-    for packages_dir in site_packages_dirs:
-        # Build the path targeting the internal openvino binary folder
-        potential_path = os.path.join(packages_dir, "openvino", "libs")
-        if os.path.exists(potential_path):
-            openvino_dll_path = potential_path
-            break
-
-    # 2. Tell Windows where to find the underlying OpenVINO C++ DLL files
-    if openvino_dll_path:
-        print(f"--> Linking OpenVINO Binaries from: {openvino_dll_path}")
-        os.add_dll_directory(openvino_dll_path)
-        # Add to standard PATH as a secondary fallback for older runtimes
-        os.environ["PATH"] = openvino_dll_path + os.path.pathsep + os.environ["PATH"]
-    else:
-        print("Warning: Could not locate the 'openvino' pip package directory.")
-
-    """Load encoder and decoder models."""    
-    model_dir = ensure_model(settings)
-    
-    # Load vocabulary
-    tokens: dict[int, str] = {}
-    with open(model_dir / "tokens.txt", "r", encoding="utf-8") as f:
-        for line in f:
-            parts = line.strip().rsplit(" ", 1)
-            if len(parts) == 2:
-                tokens[int(parts[1])] = parts[0]
-    
-    token_to_id = {v: k for k, v in tokens.items()}
-    log.info("vocabulary_loaded", token_count=len(tokens))
-    
-    # Pre-compute prompt tokens for transcription
-    prompt_tokens = [
-        "<|startofcontext|>", "<|startoftranscript|>", "<|emo:undefined|>",
-        "<|en|>", "<|en|>", "<|pnc|>", "<|noitn|>", "<|notimestamp|>", "<|nodiarize|>",
-    ]
-    pre_computed_prompt_ids = [token_to_id[t] for t in prompt_tokens if t in token_to_id]
-    pre_computed_eos_id = token_to_id.get("<|endoftext|>", -1)
-    pre_computed_prompt_array = np.array([pre_computed_prompt_ids], dtype=np.int64)
-    
-    # Determine execution providers    
-    providers = [                 
-                 "OpenVINOExecutionProvider",
-                 #"DmlExecutionProvider", 
-                 #"CPUExecutionProvider"
-                ]
-    # Configure OpenVINO to save compiled binaries to your disk
-    gpu_config = {
-        "GPU": {
-            #"ENABLE_INT8": "YES",    
-            "CACHE_DIR": r".\openvino_model_cache",  # Saves compiled kernels here
-            "PERFORMANCE_HINT": "LATENCY",
-        }
-    }
-
-    provider_options = [{"device_type": "AUTO:GPU,CPU", "load_config": json.dumps(gpu_config)}] # Forces use of the iGPU
-    log.info("execution_providers", providers=providers)
-    
-    # Session options
-    opts = ort.SessionOptions()
-    opts.inter_op_num_threads = min(4, max(1, os.cpu_count() or 4))
-    opts.intra_op_num_threads = min(4, max(1, os.cpu_count() or 4))
-    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    
-    # Load models
-    log.info("loading_encoder")
-    cohere_encoder = ort.InferenceSession(
-        str(model_dir / "cohere-encoder.fp16.onnx"), 
-        opts, 
-        providers=providers,
-        provider_options=provider_options
-    )
-    
-    cohere_decoder = ort.InferenceSession(
-        str(model_dir / "cohere-decoder.fp16.onnx"), 
-        opts, 
-        providers=providers,
-        provider_options=provider_options
-    )
-    
-    # Update state
-    device = "gpu" if "OpenVINOExecutionProvider" in providers else "cpu"
-    
-    state.encoder = cohere_encoder
-    state.decoder = cohere_decoder  
-    state.tokens = tokens
-    state.token_to_id = token_to_id
-    state.pre_computed_prompt_ids = pre_computed_prompt_ids
-    state.pre_computed_eos_id = pre_computed_eos_id
-    state.pre_computed_prompt_array = pre_computed_prompt_array
-    state.device = device
-    state.kv_pool = KVCachePool(settings, device=device)
-
-    if settings.enable_diarization:
-        log.info("loading_vad_model")
-        
-        # First try: ONNX with DirectML
-        vad_onnx_path = str(Path(torch.hub.get_dir()) / "silero_vad" / "silero_vad.onnx")
-        
-        if Path(vad_onnx_path).exists():
-            try:                
-                state.vad_session = ort.InferenceSession(vad_onnx_path, opts, providers=providers, provider_options=provider_options)
-                state.use_vad_onnx = True
-                state.vad_model = None
-                
-                # Load utils for timestamps (they work with ONNX model too)
-                _, utils = torch.hub.load(
-                    repo_or_dir='snakers4/silero-vad',
-                    model='silero_vad',
-                    force_reload=False,
-                    onnx=True
-                )
-                state.get_speech_timestamps = utils[0]
-                log.info("vad_model_loaded_onnx_dml")
-            except Exception as e:
-                log.warning("vad_onnx_dml_failed", error=str(e))
-                state.vad_session = None
-                state.use_vad_onnx = False
-                model, utils = torch.hub.load(
-                    repo_or_dir='snakers4/silero-vad',
-                    model='silero_vad',
-                    force_reload=False,
-                    onnx=False
-                )
-                state.vad_model = model
-                state.get_speech_timestamps = utils[0]
-                log.info("vad_model_loaded_pytorch")
-        else:
-            # Fallback to PyTorch
-            model, utils = torch.hub.load(
-                repo_or_dir='snakers4/silero-vad',
-                model='silero_vad',
-                force_reload=False,
-                onnx=False
-            )
-            model = model.to(torch.device("cpu"))
-            state.vad_model = model
-            state.vad_session = None
-            state.use_vad_onnx = False
-            state.get_speech_timestamps = utils[0]
-            log.info("vad_model_loaded_pytorch")
-
-        log.info("loading_embedding_model")
-        try:
-            emb_path = ensure_embedding_model(
-                settings.embedding_model_repo,
-                settings.embedding_model_filename,
-                settings.hf_token
-            )
-            state.embedding_session = ort.InferenceSession(emb_path, opts, providers=providers, provider_options=provider_options)
-            log.info("embedding_model_loaded", path=emb_path)
-        except Exception as e:
-            log.error("embedding_model_failed", error=str(e))
-
-    state.status = "ready"
-    
-    log.info("model_ready", device=device)
-
-
-# ============================================================================
-# Inference
-# ============================================================================
-
-@contextmanager
-def inference_timeout(seconds: int):
-    """Context manager for inference timeout (Unix only)."""
-    if sys.platform == "win32":
-        yield  # Windows doesn't support SIGALRM
-        return
-    
-    def handler(signum, frame):
-        raise TimeoutError(f"Inference timed out after {seconds}s")
-    
-    old_handler = signal.signal(signal.SIGALRM, handler)
-    signal.alarm(seconds)
-    try:
-        yield
-    finally:
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, old_handler)
-
-
-# ---------------------------------------------------------------------------
-# Transcript hallucination cleaner
-# ---------------------------------------------------------------------------
-# Whisper-family models produce looping repetitions when fed laughter, noise,
-# or silence: e.g. "The police are the ones who are the ones who are ..."
-# repeated hundreds of times.
-#
-# The tricky part: the text before the detected repeat is often a *partial*
-# instance of the same phrase (the loop started mid-sentence), and the text
-# after may be a partial trailing instance.  We trim both.
-#
-# Example:
-#   "Right. The police are the ones who are the ones who are the ones."
-#   repeated unit  = "are the ones who"
-#   prefix before  = "Right. The police "  <- ends with suffix of unit
-#   suffix after   = " are the ones."      <- starts with prefix of unit
-#   result         = "Right. [inaudible]."
-
-_LOOP_RE = re.compile(
-    r'(.{4,120}?)(?:\s+\1){2,}',   # phrase repeated ≥3 times total
-    re.IGNORECASE,
-)
-
-def _trim_partial_prefix(before: str, unit: str) -> str:
-    """Remove a trailing suffix-of-unit bleed from `before`."""
-    words = unit.lower().split()
-    b = before.rstrip()
-    b_lower = b.lower()
-    for start in range(len(words)):           # try longest suffix first
-        suffix = " ".join(words[start:])
-        if b_lower.endswith(suffix):
-            return b[: len(b) - len(suffix)].rstrip()
-    return b
-
-def _trim_partial_suffix(after: str, unit: str) -> str:
-    """Remove a leading prefix-of-unit bleed from `after`."""
-    words = unit.lower().split()
-    a = after.lstrip()
-    a_lower = a.lower()
-    for end in range(len(words), 0, -1):      # try longest prefix first
-        prefix = " ".join(words[:end])
-        if a_lower.startswith(prefix):
-            return a[len(prefix):].lstrip()
-    return a
-
-def clean_transcript(text: str) -> str:
-    """Replace hallucinated looping repetitions with [inaudible]."""
-    prev = None
-    while prev != text:
-        prev = text
-        m = _LOOP_RE.search(text)
-        if not m:
-            break
-        unit   = m.group(1)
-        before = _trim_partial_prefix(text[:m.start()], unit)
-        after  = _trim_partial_suffix(text[m.end():], unit)
-        parts  = [p for p in (before, '[inaudible]', after) if p]
-        text   = ' '.join(parts)
-    # Collapse consecutive tags
-    text = re.sub(r'(\[inaudible\]\s*){2,}', '[inaudible] ', text)
-    # Drop short fragments sandwiched between [inaudible] tags — these are
-    # mutation-zone remnants where the loop phrase slowly morphed and the
-    # exact-repeat regex could not catch the transitional words (≤12 words).
-    text = re.sub(
-        r'\[inaudible\]\s+(?:\w[\w\s,\']{0,80}?)\s+\[inaudible\]',
-        '[inaudible]',
-        text,
-    )
-    return text.strip()
-
-
-def transcribe_audio_sync(
-    audio: np.ndarray, 
-    language: str = "en",
-    timeout_sec: int = 120
-) -> dict:
-    """
-    Synchronous transcription function.
-    Returns dict with text, token count, and timing info.
-    """
-    settings = get_settings()
-    start_time = time.perf_counter()
-    
-    if not state.is_ready:
-        raise TranscriptionError("Model not ready")
-    
-    # Validate audio
-    audio_duration = len(audio) / 16000
-    if audio_duration > settings.max_audio_duration_sec:
-        raise AudioValidationError(
-            f"Audio too long: {audio_duration:.1f}s > {settings.max_audio_duration_sec}s max"
-        )
-    
-    with inference_timeout(timeout_sec):
-        encoder = state.encoder
-        decoder = state.decoder
-        tokens = state.tokens
-        token_to_id = state.token_to_id
-        device = state.device
-        
-        # Use pre-computed prompt for default language (en)
-        prompt_ids = state.pre_computed_prompt_ids
-        eos_id = state.pre_computed_eos_id
-        
-        # Run encoder
-        enc_io = encoder.io_binding()
-        enc_io.bind_cpu_input("audio", audio.reshape(1, -1).astype(np.float32))
-        enc_io.bind_output("n_layer_cross_k", device)
-        enc_io.bind_output("n_layer_cross_v", device)
-        encoder.run_with_iobinding(enc_io)
-        
-        enc_out = enc_io.get_outputs()
-        cross_k_ov = enc_out[0]
-        cross_v_ov = enc_out[1]
-        
-        # Use pre-computed prompt and eos_id
-        prompt_ids = state.pre_computed_prompt_ids
-        eos_id = state.pre_computed_eos_id
-        
-        # Get KV cache from pool
-        with state.kv_pool.acquire() as kv_cache:
-            self_k_ov = kv_cache["self_k"]
-            self_v_ov = kv_cache["self_v"]
-            
-            generated = list(prompt_ids)
-            current = np.array([prompt_ids], dtype=np.int64)
-            offset = np.array(0, dtype=np.int64)
-            
-            # Pre-allocate reusable arrays to avoid repeated allocation in loop
-            current_buffer = np.zeros((1, 1), dtype=np.int64)
-            
-            dec_io = decoder.io_binding()
-            
-            for _ in range(settings.max_new_tokens):
-                dec_io.bind_cpu_input("tokens", current)
-                dec_io.bind_ortvalue_input("in_n_layer_self_k_cache", self_k_ov)
-                dec_io.bind_ortvalue_input("in_n_layer_self_v_cache", self_v_ov)
-                dec_io.bind_ortvalue_input("n_layer_cross_k", cross_k_ov)
-                dec_io.bind_ortvalue_input("n_layer_cross_v", cross_v_ov)
-                dec_io.bind_cpu_input("offset", offset)
-                dec_io.bind_output("logits", device)
-                dec_io.bind_output("out_n_layer_self_k_cache", device)
-                dec_io.bind_output("out_n_layer_self_v_cache", device)
-                
-                decoder.run_with_iobinding(dec_io)
-                
-                dec_out = dec_io.get_outputs()
-                logits = dec_out[0].numpy()
-                
-                # Handle potential scalar output from new torch version
-                if logits.ndim == 0:
-                    logits = logits.reshape(1, -1)
-                elif logits.ndim == 1:
-                    logits = logits.reshape(1, -1)
-                
-                self_k_ov = dec_out[1]
-                self_v_ov = dec_out[2]
-                
-                next_id = int(np.argmax(logits[0, -1, :]))
-                if next_id == eos_id:
-                    break
-                    
-                generated.append(next_id)
-                # offset is 0-d scalar for ONNX; use int() to extract value
-                offset = np.array(int(offset) + current.shape[1], dtype=np.int64)
-                current_buffer[0, 0] = next_id
-                current = current_buffer
-        
-        # Decode text and clean hallucinated repetition loops
-        text = "".join(
-            tokens.get(t, "").replace("\u2581", " ")
-            for t in generated[len(prompt_ids):]
-            if not tokens.get(t, "").startswith("<|")
-        ).strip()
-        text = clean_transcript(text)
-
-        tokens_generated = len(generated) - len(prompt_ids)
-        inference_time = time.perf_counter() - start_time
-
-        log.debug(
-            "transcription_complete",
-            audio_duration=f"{audio_duration:.2f}s",
-            tokens=tokens_generated,
-            inference_time=f"{inference_time:.2f}s"
-        )
-
-        return {
-            "text": text,
-            "tokens_generated": tokens_generated,
-            "audio_duration_sec": audio_duration,
-            "inference_time_sec": inference_time,
-        }
-
-
-async def transcribe_audio_async(
-    audio: np.ndarray, 
-    language: str = "en",
-    timeout_sec: int = 120
-) -> dict:
-    """Async wrapper for transcription."""
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(
-        executor, 
-        transcribe_audio_sync, 
-        audio, 
-        language,
-        timeout_sec
-    )
-
-
-# ============================================================================
-# Request/Response Models
-# ============================================================================
-
-
-class DiarizeResult(BaseModel):
-    start: float
-    end: float
-    speaker: str
-
-class DiarizeResponse(BaseModel):
-    segments: list[DiarizeResult]
-    total_time_sec: float
-    error: Optional[str] = None
-
-class DiarizePathsRequest(BaseModel):
-    wav_path: str = Field(..., description="Audio file path")
-    num_speakers: Optional[int] = Field(None, description="Exact number of speakers (if known)")
-    diarization_threshold: Optional[float] = Field(None, description="Distance threshold for clustering (overrides server default)")
-    vad_threshold: Optional[float] = Field(None, description="VAD speech probability cutoff (0.0-1.0)")
-    vad_min_speech_duration_ms: Optional[int] = Field(None, description="VAD minimum speech chunk length (ms)")
-    known_speakers: Optional[dict[str, dict]] = Field(None, description="Map of known speaker names to their profiles")
-
-class TranscribePathsRequest(BaseModel):
-    """Request model for path-based transcription."""
-    wav_paths: list[str] = Field(..., max_length=10, description="List of audio file paths")
-    language: str = Field(default="en", pattern=r"^[a-z]{2}$", description="ISO 639-1 language code")
-    
-    @field_validator("wav_paths")
-    @classmethod
-    def validate_paths(cls, v):
-        if not v:
-            raise ValueError("At least one path required")
-        return v
-
-
-class TranscribeResult(BaseModel):
-    """Single transcription result."""
-    text: str
-    audio_duration_sec: float
-    inference_time_sec: float
-    tokens_generated: int
-    error: Optional[str] = None
-
-
-class TranscribeResponse(BaseModel):
-    """Transcription response model."""
-    results: list[TranscribeResult]
-    total_time_sec: float
-
-
-class HealthResponse(BaseModel):
-    """Health check response."""
-    status: str
-    model_status: str
-    device: str
-    version: str = "1.0.0"
-
-
-# ============================================================================
-# Security
-# ============================================================================
-
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
-
-
-async def verify_api_key(
-    api_key: Optional[str] = Security(api_key_header),
-    settings: Settings = Depends(get_settings)
-) -> Optional[str]:
-    """Verify API key if authentication is enabled."""
-    if not settings.api_key_set:
-        return None  # No auth required
-    
-    if not api_key or api_key not in settings.api_key_set:
-        raise HTTPException(
-            status_code=403,
-            detail="Invalid or missing API key"
-        )
-    return api_key
-
-
-def validate_path_security(path: str, settings: Settings) -> Path:
-    """Validate that a path is allowed to be accessed."""
-    resolved = Path(path).resolve()
-    
-    if not resolved.exists():
-        raise PathSecurityError(f"File not found: {path}")
-    
-    if settings.allowed_audio_dir:
-        allowed = settings.allowed_audio_dir.resolve()
-        if not str(resolved).startswith(str(allowed)):
-            raise PathSecurityError(
-                f"Path not allowed. Must be under: {allowed}",
-                details={"path": path}
-            )
-    
-    # Check file extension
-    allowed_extensions = {".wav", ".mp3", ".mp4", ".m4a", ".flac", ".ogg", ".webm"}
-    if resolved.suffix.lower() not in allowed_extensions:
-        raise PathSecurityError(
-            f"File type not allowed: {resolved.suffix}",
-            details={"path": path, "allowed": list(allowed_extensions)}
-        )
-    
-    return resolved
-
-# ============================================================================
-# FastAPI Application
+# Application Lifespan
 # ============================================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager."""
-    global executor
+    global global_executor
     
     settings = get_settings()
        
     # Initialize thread pool
-    executor = ThreadPoolExecutor(max_workers=settings.workers)
+    global_executor = ThreadPoolExecutor(max_workers=settings.workers)
+    
+    # Assign to model_state module global
+    import model_state
+    model_state.executor = global_executor
     
     # Load models
     log.info("starting_server", host=settings.host, port=settings.port)
@@ -976,10 +70,15 @@ async def lifespan(app: FastAPI):
     
     # Cleanup
     log.info("shutting_down")
-    if executor:
-        executor.shutdown(wait=True)
+    if global_executor:
+        global_executor.shutdown(wait=True)
 
     state.status = "shutdown"
+
+
+# ============================================================================
+# FastAPI Application
+# ============================================================================
 
 app = FastAPI(
     title="Transcription Server",
@@ -988,100 +87,10 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# ============================================================================
-# Middleware
-# ============================================================================
+# Apply middleware and exception handlers
+apply_middleware(app)
+register_exception_handlers(app)
 
-@app.middleware("http")
-async def request_middleware(request: Request, call_next):
-    """Global request middleware for logging and size limits."""
-    settings = get_settings()
-    request_id = request.headers.get("X-Request-ID", str(time.time_ns()))
-    
-    # Check request size
-    content_length = request.headers.get("content-length")
-    max_size = settings.max_request_size_mb * 1024 * 1024
-    if content_length and int(content_length) > max_size:
-        return JSONResponse(
-            status_code=413,
-            content={"error": f"Request too large. Max: {settings.max_request_size_mb}MB"}
-        )
-    
-    # Log request
-    start = time.perf_counter()
-    
-    try:
-        response = await call_next(request)
-        elapsed = time.perf_counter() - start
-        
-        log.info(
-            "request",
-            request_id=request_id,
-            method=request.method,
-            path=request.url.path,
-            status=response.status_code,
-            duration_ms=f"{elapsed*1000:.1f}"
-        )
-        
-        response.headers["X-Request-ID"] = request_id
-        response.headers["X-Response-Time"] = f"{elapsed*1000:.1f}ms"
-        return response
-        
-    except Exception as e:
-        log.exception("request_error", request_id=request_id, error=str(e))
-        raise
-
-# CORS middleware
-settings = get_settings()
-if settings.enable_cors:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=settings.cors_origins.split(","),
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-
-# Rate limiting (optional)
-try:
-    from slowapi import Limiter, _rate_limit_exceeded_handler
-    from slowapi.util import get_remote_address
-    from slowapi.errors import RateLimitExceeded
-    
-    limiter = Limiter(key_func=get_remote_address)
-    app.state.limiter = limiter
-    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-    RATE_LIMIT_AVAILABLE = True
-except ImportError:
-    RATE_LIMIT_AVAILABLE = False
-    limiter = None
-    log.warning("rate_limiting_unavailable", reason="slowapi not installed")
-
-# ============================================================================
-# Exception Handlers
-# ============================================================================
-
-@app.exception_handler(TranscriptionError)
-async def transcription_error_handler(request: Request, exc: TranscriptionError):
-    """Handle transcription-specific errors."""
-    return JSONResponse(
-        status_code=400 if isinstance(exc, (AudioValidationError, PathSecurityError)) else 500,
-        content={
-            "error": exc.message,
-            "type": type(exc).__name__,
-            "details": exc.details
-        }
-    )
-
-@app.exception_handler(Exception)
-async def general_error_handler(request: Request, exc: Exception):
-    """Handle unexpected errors."""
-    log.exception("unhandled_error", path=request.url.path)
-    
-    return JSONResponse(
-        status_code=500,
-        content={"error": "Internal server error"}
-    )
 
 # ============================================================================
 # Endpoints
@@ -1096,9 +105,11 @@ async def health():
         device=state.device
     )
 
+
 async def delayed_shutdown():
     await asyncio.sleep(1.0)
     os._exit(0)
+
 
 @app.post("/shutdown")
 async def shutdown(_: str = Depends(verify_api_key)):
@@ -1107,24 +118,23 @@ async def shutdown(_: str = Depends(verify_api_key)):
     asyncio.create_task(delayed_shutdown())
     return {"status": "shutting down"}
 
-def get_rate_limit_decorator():
-    """Get rate limit decorator if available."""
-    settings = get_settings()
-    if RATE_LIMIT_AVAILABLE and settings.enable_rate_limit and limiter:
-        return limiter.limit(settings.rate_limit)
-    return lambda f: f  # No-op decorator
 
 @app.post("/diarize/path")
 async def diarize_path_endpoint(
     req: DiarizePathsRequest,
-    settings: Settings = Depends(get_settings),
+    settings = Depends(get_settings),
     _: str = Depends(verify_api_key)
 ):
     """
     Streams Pyannote diarization progress as NDJSON, then yields the final segments.
     """
-    start_time = time.perf_counter()
-    if not state.vad_model or not state.embedding_session:
+    if not state.vad_session:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Diarization not enabled or pipeline not loaded"}
+        )
+    
+    if not state.embedding_session:
         return JSONResponse(
             status_code=400,
             content={"error": "Diarization not enabled or pipeline not loaded"}
@@ -1140,812 +150,11 @@ async def diarize_path_endpoint(
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-    def run_diarization_thread():
-        try:
-            waveform, sr = librosa.load(str(resolved), sr=16000, mono=True)
-            waveform_tensor = torch.from_numpy(waveform).unsqueeze(0).float()
-
-            if not state.vad_model or not state.get_speech_timestamps or not state.embedding_session:
-                log.error("diarization_models_missing")
-                loop.call_soon_threadsafe(queue.put_nowait, json.dumps({
-                    "error": "Diarization models not fully loaded"
-                }))
-                return
-
-            # 1. Run VAD
-            loop.call_soon_threadsafe(queue.put_nowait, json.dumps({
-                "type": "progress", "step": "Voice Activity Detection", "completed": 0, "total": 1
-            }))
-
-            vad_thresh_val = req.vad_threshold if req.vad_threshold is not None else settings.vad_threshold
-            vad_min_dur_val = req.vad_min_speech_duration_ms if req.vad_min_speech_duration_ms is not None else settings.vad_min_speech_duration_ms
-
-            audio_duration = waveform_tensor.shape[-1] / 16000
-            
-            # Use ONNX VAD with DirectML if available, otherwise PyTorch
-            if getattr(state, 'use_vad_onnx', False) and getattr(state, 'vad_session', None):
-                log.info("vad_using_onnx_dml", duration=audio_duration)
-                speech_ts = run_vad_onnx(
-                    waveform_tensor,
-                    state.vad_session,
-                    sample_rate=16000,
-                    chunk_duration=30,
-                    overlap=5,
-                    threshold=vad_thresh_val,
-                    min_speech_duration_ms=vad_min_dur_val
-                )
-            elif audio_duration > 60:
-                log.info("vad_using_chunked", duration=audio_duration)
-                speech_ts = run_vad_chunked(
-                    waveform_tensor,
-                    state.vad_model,
-                    state.get_speech_timestamps,
-                    sample_rate=16000,
-                    chunk_duration=30,
-                    overlap=5,
-                    threshold=vad_thresh_val,
-                    min_speech_duration_ms=vad_min_dur_val
-                )
-            else:
-                speech_ts = state.get_speech_timestamps(
-                    waveform_tensor,
-                    state.vad_model,
-                    sampling_rate=16000,
-                    return_seconds=True,
-                    threshold=vad_thresh_val,
-                    min_speech_duration_ms=vad_min_dur_val
-                )
-
-            if not speech_ts:
-                log.info("vad_found_no_speech", path=req.wav_path)
-                loop.call_soon_threadsafe(queue.put_nowait, json.dumps({
-                    "type": "result", "segments": [], "profiles": {}
-                }))
-                loop.call_soon_threadsafe(queue.put_nowait, None)
-                return
-
-            # 1b. Split long VAD segments at energy dips to reduce cross-speaker
-            #     window contamination. When speakers alternate with minimal silence,
-            #     VAD treats the whole exchange as one segment. Sliding embedding
-            #     windows that straddle the boundary produce blended embeddings that
-            #     confuse clustering and cause the last words of one speaker to spill
-            #     into the next. Splitting at energy dips before window extraction
-            #     keeps each window within a single speaker turn.
-            waveform_np = waveform_tensor.squeeze(0).numpy()
-            speech_ts = split_at_energy_dips(
-                speech_ts,
-                waveform_np,
-                sample_rate=16000,
-            )
-            log.debug("vad_after_energy_split", n_segments=len(speech_ts))
-
-            loop.call_soon_threadsafe(queue.put_nowait, json.dumps({
-                "type": "progress", "step": "Voice Activity Detection", "completed": 1, "total": 1
-            }))
-
-            # 2. Extract chunks and features
-            # Windows shorter than MIN_EMBED_DURATION produce unreliable embeddings
-            # (backchannels: "Mm-hmm", "Okay", etc.). We cluster only long windows
-            # and assign short ones to their nearest long neighbour by time.
-            MIN_EMBED_DURATION = 1.5  # seconds
-
-            loop.call_soon_threadsafe(queue.put_nowait, json.dumps({
-                "type": "progress", "step": "Feature Extraction", "completed": 0, "total": len(speech_ts)
-            }))
-
-            all_fbanks = []
-            all_segments_meta = []   # metadata for ALL windows
-            embeddable_indices = []  # indices into all_segments_meta that have an embedding
-
-            for i, ts in enumerate(speech_ts):
-                start_sample = int(ts['start'] * 16000)
-                end_sample = int(ts['end'] * 16000)
-                segment_wav = waveform_tensor[:, start_sample:end_sample]
-
-                windows, start_times = generate_sliding_windows(segment_wav, 16000, window_sec=2.0, stride_sec=0.75)
-
-                for w, rel_start in zip(windows, start_times):
-                    chunk_duration = w.shape[-1] / 16000
-                    global_start = ts['start'] + rel_start
-                    global_end = global_start + chunk_duration
-                    meta_idx = len(all_segments_meta)
-                    all_segments_meta.append({"start": global_start, "end": global_end})
-
-                    if chunk_duration >= MIN_EMBED_DURATION:
-                        if w.shape[-1] < 1600:
-                            w = torch.nn.functional.pad(w, (0, 1600 - w.shape[-1]))
-                        all_fbanks.append(extract_fbank(w, 16000))
-                        embeddable_indices.append(meta_idx)
-
-                loop.call_soon_threadsafe(queue.put_nowait, json.dumps({
-                    "type": "progress", "step": "Feature Extraction", "completed": i + 1, "total": len(speech_ts)
-                }))
-
-            
-
-            if not all_fbanks:
-                fallback_segments = []
-                for ts in speech_ts:
-                    fallback_segments.append({
-                        "start": ts["start"],
-                        "end": ts["end"],
-                        "speaker": "SPEAKER1"
-                    })
-                loop.call_soon_threadsafe(queue.put_nowait, json.dumps({
-                    "type": "result", "segments": fallback_segments, "profiles": {}
-                }))
-                loop.call_soon_threadsafe(queue.put_nowait, None)
-                return
-
-            # 3. ONNX Embedding Extraction (Batched) — long windows only
-            loop.call_soon_threadsafe(queue.put_nowait, json.dumps({
-                "type": "progress", "step": "Embedding Extraction", "completed": 0, "total": 1
-            }))
-
-            # Apply CMN per sub-segment (critical for ECAPA-TDNN)
-            # Vectorized: pad first, then stack and apply CMN
-            if all_fbanks:
-                max_len = max(fb.shape[1] for fb in all_fbanks)
-                
-                # Pad each fb to max_len BEFORE stacking
-                padded_fbanks = []
-                for fb in all_fbanks:
-                    if fb.shape[1] < max_len:
-                        fb_padded = torch.nn.functional.pad(fb, (0, 0, 0, max_len - fb.shape[1]))
-                    else:
-                        fb_padded = fb
-                    padded_fbanks.append(fb_padded)
-                
-                batch = torch.stack(padded_fbanks, dim=0)  # [N, 1, max_len, 80]
-                cmn_batch = batch - batch.mean(dim=2, keepdim=True)  # CMN on all at once
-                
-                batch_fbanks = cmn_batch.squeeze(1).numpy()  # [N, max_len, 80]
-            else:
-                batch_fbanks = np.array([])
-
-            raw_embeddings = []
-            batch_size = 32
-            for i in range(0, len(batch_fbanks), batch_size):
-                out = state.embedding_session.run(None, {"feats": batch_fbanks[i:i+batch_size]})
-                raw_embeddings.append(out[0])
-
-            raw_embeddings = np.concatenate(raw_embeddings, axis=0)  # [N_long, D]
-            norms = np.linalg.norm(raw_embeddings, axis=1, keepdims=True)
-            raw_embeddings = raw_embeddings / np.maximum(norms, 1e-12)
-
-            loop.call_soon_threadsafe(queue.put_nowait, json.dumps({
-                "type": "progress", "step": "Embedding Extraction", "completed": 1, "total": 1
-            }))
-
-            # 4. Clustering on long windows only
-            loop.call_soon_threadsafe(queue.put_nowait, json.dumps({
-                "type": "progress", "step": "Clustering", "completed": 0, "total": 1
-            }))
-
-            n_clusters_val = req.num_speakers
-            # Only use threshold if num_speakers is not specified
-            if n_clusters_val is not None:
-                dist_thresh_val = None  # Force exact number of clusters
-            else:
-                dist_thresh_val = req.diarization_threshold if req.diarization_threshold is not None else settings.diarization_threshold
-
-            clusterer = AgglomerativeClustering(
-                n_clusters=n_clusters_val,
-                metric="cosine",
-                linkage="average",
-                distance_threshold=dist_thresh_val
-            )
-
-            if len(raw_embeddings) > 1:
-                long_labels = clusterer.fit_predict(raw_embeddings)
-            else:
-                long_labels = np.array([0])
-            
-            n_clusters = len(set(int(l) for l in long_labels))
-
-            # Cap at 15 clusters to preserve granularity before merging
-            max_clusters = 15
-            if n_clusters > max_clusters:
-                print(f"WARNING: {n_clusters} clusters created, capping at {max_clusters}")
-                # Re-cluster with exact number
-                clusterer = AgglomerativeClustering(
-                    n_clusters=max_clusters,
-                    metric="cosine",
-                    linkage="average"
-                )
-                if len(raw_embeddings) > 1:
-                    long_labels = clusterer.fit_predict(raw_embeddings)
-                n_clusters = max_clusters
-            
-            # Voiceprint-based speaker merging
-            # SKIP if user forced exact speaker count
-            if n_clusters > 1 and n_clusters_val is None:
-                cluster_ids = sorted(set(int(l) for l in long_labels))
-                cluster_avgs = {}
-                for cid in cluster_ids:
-                    mask = long_labels == cid
-                    cluster_avgs[cid] = np.mean(raw_embeddings[mask], axis=0)
-                
-                # Greedy merge: merge closest pairs below threshold
-                merge_threshold = 0.25  # Cosine distance threshold for voiceprint merging - P90 of earnings22 distances
-            
-                # Debug: print pairwise distances
-                ids = sorted(cluster_avgs.keys())
-                for i_idx in range(len(ids)):
-                    for j_idx in range(i_idx + 1, len(ids)):
-                        id_i, id_j = ids[i_idx], ids[j_idx]
-                        dist = cosine_distances(
-                            [cluster_avgs[id_i]], [cluster_avgs[id_j]]
-                        )[0][0]
-            
-                changed = True
-                while changed:
-                    changed = False
-                    ids = sorted(cluster_avgs.keys())
-                    for i_idx in range(len(ids)):
-                        for j_idx in range(i_idx + 1, len(ids)):
-                            id_i, id_j = ids[i_idx], ids[j_idx]
-                            if id_i not in cluster_avgs:
-                                continue
-                            if id_j not in cluster_avgs:  # Already merged
-                                continue
-                            dist = cosine_distances(
-                                [cluster_avgs[id_i]], [cluster_avgs[id_j]]
-                            )[0][0]
-                            if dist < merge_threshold:
-                                # Merge j into i
-                                long_labels[long_labels == id_j] = id_i
-                                # Update average embedding
-                                mask_i = long_labels == id_i
-                                cluster_avgs[id_i] = np.mean(raw_embeddings[mask_i], axis=0)
-                                del cluster_avgs[id_j]
-                                changed = True
-                                break
-                    if changed:
-                        break
-            
-                n_clusters = len(set(int(l) for l in long_labels))
-
-            # Compute normalized centroid vector for each raw cluster ID
-            cluster_centroids = {}
-            for cluster_id in set(long_labels):
-                mask = (long_labels == cluster_id)
-                mean_emb = raw_embeddings[mask].mean(axis=0)
-                norm_emb = mean_emb / (np.linalg.norm(mean_emb) + 1e-12)
-                cluster_centroids[int(cluster_id)] = norm_emb.tolist()
-
-            # Assign cluster labels to embeddable windows
-            for idx, label in zip(embeddable_indices, long_labels):
-                all_segments_meta[idx]["speaker_raw"] = int(label)
-
-            # Assign short windows to the nearest embeddable window by midpoint
-            emb_mids = np.array([
-                (all_segments_meta[i]["start"] + all_segments_meta[i]["end"]) / 2
-                for i in embeddable_indices
-            ])
-            for i, seg in enumerate(all_segments_meta):
-                if "speaker_raw" not in seg:
-                    mid = (seg["start"] + seg["end"]) / 2
-                    nearest = int(np.argmin(np.abs(emb_mids - mid)))
-                    seg["speaker_raw"] = all_segments_meta[embeddable_indices[nearest]]["speaker_raw"]
-
-            # Map raw cluster IDs to speaker names (with known speaker matching)
-            if req.known_speakers:
-                log.info("known_speakers_received", keys=list(req.known_speakers.keys()))
-                
-                # Temporarily populate raw cluster IDs as speaker names
-                for seg in all_segments_meta:
-                    seg["speaker"] = f"RAW_{seg['speaker_raw']}"
-                
-                # Match RAW profiles to known speakers
-                speaker_map: dict[str, str] = {}
-                unknown_idx = 1
-                match_thresh = 0.03  # Stricter - only match if very similar
-                close_match_thresh = 0.1  # If two clusters match same known speaker within this, merge them
-
-                # First pass: match all clusters
-                cluster_matches = {}
-                for raw_spk, centroid in cluster_centroids.items():
-                    raw_name = f"RAW_{raw_spk}"
-                    best_match = None
-                    best_dist = float('inf')
-
-                    for known_name, known_prof in req.known_speakers.items():
-                        if "embedding" not in known_prof:
-                            continue
-                        emb_dist = cosine(centroid, known_prof["embedding"])
-                        
-                        if emb_dist < best_dist:
-                            best_dist = emb_dist
-                            best_match = known_name
-
-                    cluster_matches[raw_spk] = {"name": best_match, "dist": best_dist, "centroid": centroid}
-
-                # Second pass: detect closely matching clusters to same known speaker
-                # If two clusters both match the same known speaker with very small distance, merge them
-                merged_clusters = set()
-                for raw_spk1, match1 in cluster_matches.items():
-                    if raw_spk1 in merged_clusters:
-                        continue
-                    if not match1["name"] or match1["dist"] > close_match_thresh:
-                        continue
-                    
-                    for raw_spk2, match2 in cluster_matches.items():
-                        if raw_spk2 == raw_spk1 or raw_spk2 in merged_clusters:
-                            continue
-                        if not match2["name"] or match2["dist"] > close_match_thresh:
-                            continue
-                        
-                        # Both closely match known speakers - check if they're the same
-                        if match1["name"] == match2["name"]:
-                            # Same known speaker, very close matches - merge
-                            dist_between = cosine(match1["centroid"], match2["centroid"])
-                            if dist_between < 0.2:
-                                long_labels[long_labels == raw_spk2] = raw_spk1
-                                merged_clusters.add(raw_spk2)
-
-                # Recompute cluster centroids after merging
-                cluster_centroids = {}
-                for cluster_id in set(long_labels):
-                    mask = (long_labels == cluster_id)
-                    mean_emb = raw_embeddings[mask].mean(axis=0)
-                    norm_emb = mean_emb / (np.linalg.norm(mean_emb) + 1e-12)
-                    cluster_centroids[int(cluster_id)] = norm_emb.tolist()
-
-                # Third pass: assign final names
-                for raw_spk, centroid in cluster_centroids.items():
-                    raw_name = f"RAW_{raw_spk}"
-                    best_match = None
-                    best_dist = float('inf')
-
-                    for known_name, known_prof in req.known_speakers.items():
-                        if "embedding" not in known_prof:
-                            continue
-                        emb_dist = cosine(centroid, known_prof["embedding"])
-                        
-                        if emb_dist < best_dist:
-                            best_dist = emb_dist
-                            best_match = known_name
-
-                    if best_match and best_dist <= match_thresh:
-                        speaker_map[raw_name] = best_match
-                    else:
-                        speaker_map[raw_name] = f"SPEAKER{unknown_idx}"
-                        unknown_idx += 1
-
-                # Update segments with final speaker names
-                for seg in all_segments_meta:
-                    raw_name = f"RAW_{seg['speaker_raw']}"
-                    seg["speaker"] = speaker_map.get(raw_name, seg["speaker"])
-                
-                # Extract profiles for known speakers
-                profiles = {}
-                for raw_name, matched_name in speaker_map.items():
-                    if matched_name.startswith("SPEAKER"):
-                        continue
-                    if matched_name in req.known_speakers:
-                        profiles[matched_name] = req.known_speakers[matched_name]
-                
-                if profiles:
-                    loop.call_soon_threadsafe(queue.put_nowait, json.dumps({
-                        "type": "progress", "step": "Speaker Profiling", "completed": 1, "total": 1
-                    }))
-            else:
-                # Original logic: Map raw cluster int -> SPEAKER1, SPEAKER2, ... in first-appearance order
-                speaker_map: dict[int, str] = {}
-                for seg in sorted(all_segments_meta, key=lambda x: x["start"]):
-                    raw = seg["speaker_raw"]
-                    if raw not in speaker_map:
-                        speaker_map[raw] = f"SPEAKER{len(speaker_map) + 1}"
-                    seg["speaker"] = speaker_map[raw]
-
-            # 5. Merge contiguous same-speaker windows
-            #    Split on speaker change or gap > MAX_SPEAKER_GAP — no hard time cap.
-            MAX_SPEAKER_GAP = 1.0  # seconds
-            all_segments_meta.sort(key=lambda x: x["start"])
-            merged_segments = []
-            current_segment = None
-
-            for seg in all_segments_meta:
-                if current_segment is None:
-                    current_segment = seg.copy()
-                elif (current_segment["speaker"] == seg["speaker"] and
-                      seg["start"] <= current_segment["end"] + MAX_SPEAKER_GAP):
-                    current_segment["end"] = max(current_segment["end"], seg["end"])
-                else:
-                    if seg["start"] < current_segment["end"]:
-                        mid = (seg["start"] + current_segment["end"]) / 2
-                        current_segment["end"] = mid
-                        seg = dict(seg, start=mid)
-                    merged_segments.append(current_segment)
-                    current_segment = seg.copy()
-
-            if current_segment:
-                merged_segments.append(current_segment)
-
-            # 6. Post-merge: absorb short isolated segments into surrounding speaker
-            merged_segments = absorb_islands(merged_segments)
-
-            # 6b. Boundary refinement — re-examine each speaker transition at fine
-            #     granularity (0.5s sub-windows, 0.1s stride) to push the boundary
-            #     to the exact point where the dominant speaker switches, correcting
-            #     the last-words spill-over caused by wide sliding windows.
-            if len(merged_segments) >= 2 and state.embedding_session:
-                # Build per-named-speaker centroids from the embeddings already computed.
-                # embeddable_indices[k] -> meta index; raw_embeddings[k] -> embedding.
-                spk_emb_lists: dict[str, list] = {}
-                for k, meta_idx in enumerate(embeddable_indices):
-                    spk = all_segments_meta[meta_idx].get("speaker")
-                    if spk:
-                        spk_emb_lists.setdefault(spk, []).append(raw_embeddings[k])
-
-                named_centroids_np: dict[str, np.ndarray] = {}
-                for spk, embs in spk_emb_lists.items():
-                    avg = np.mean(embs, axis=0)
-                    named_centroids_np[spk] = avg / (np.linalg.norm(avg) + 1e-12)
-
-                if named_centroids_np:
-                    merged_segments = refine_speaker_boundaries(
-                        merged_segments,
-                        waveform_tensor,
-                        state.embedding_session,
-                        named_centroids_np,
-                        sample_rate=16000,
-                    )
-                    log.debug("boundary_refinement_done", n_segments=len(merged_segments))
-
-            # 7. Speaker profiling — extract voice signatures per cluster
-            profiles = profile_speakers(waveform_tensor, merged_segments, sample_rate=16000)
-
-            # Re-label by pitch so SPEAKER1 = lowest pitch (stable across runs)
-            merged_segments, profiles = relabel_by_pitch(merged_segments, profiles)
-
-            # Apply known speaker matching AFTER relabeling
-            # Only match if we're very confident (distance < 0.1 = confidence > 0.8)
-            if req.known_speakers:
-                # Compute centroid for each final speaker
-                speaker_centroids = {}
-                for seg in merged_segments:
-                    spk = seg["speaker"]
-                    if spk not in speaker_centroids:
-                        speaker_centroids[spk] = []
-                    
-                    # Find embedding for this segment's time range
-                    seg_start = seg["start"]
-                    seg_end = seg["end"]
-                    for i, meta in enumerate(all_segments_meta):
-                        if meta["start"] >= seg_start - 0.1 and meta["end"] <= seg_end + 0.1:
-                            if "speaker_raw" in meta:
-                                raw_id = meta["speaker_raw"]
-                                if raw_id in cluster_centroids:
-                                    speaker_centroids[spk].append(np.array(cluster_centroids[raw_id]))
-                
-                # Match each speaker to known voiceprints
-                # Use config for threshold
-                match_thresh = get("matching", "accept_threshold", 0.35)
-
-                if is_debug():
-                    print(f"=== DEBUG SPEAKER MATCHING ===")
-                    print(f"Cluster speakers: {list(speaker_centroids.keys())}")
-                    print(f"Known speakers: {list(req.known_speakers.keys()) if req.known_speakers else 'None'}")
-
-                # Build clusters dict for matcher module
-                clusters = {}
-                all_cluster_features = {}
-                for spk, emb_list in speaker_centroids.items():
-                    if not emb_list:
-                        continue
-                    
-                    centroid = np.mean(emb_list, axis=0)
-                    norm = np.linalg.norm(centroid)
-                    if norm > 0:
-                        centroid = centroid / norm
-                    
-                    # Get cluster features from profiles
-                    prof = profiles.get(spk, {})
-                    clusters[spk] = {
-                        "embedding": centroid.tolist(),
-                        "pitch_hz": prof.get("pitch_hz", 0) or 0,
-                        "energy_rms": prof.get("energy_rms", 0) or 0,
-                    }
-                    
-                    # Collect spectral and MFCC features
-                    features = {"spectral_centroid": prof.get("spectral_centroid", 0) or 0,
-                                "spectral_rolloff": prof.get("spectral_rolloff", 0) or 0}
-                    for i in range(13):
-                        features[f"mfcc{i}_mean"] = prof.get(f"mfcc{i}_mean", 0) or 0
-                        features[f"mfcc{i}_std"] = prof.get(f"mfcc{i}_std", 0) or 0
-                    all_cluster_features[spk] = features
-                
-                # Use matcher module for distance computation and matching
-                match_results = match_clusters(clusters, req.known_speakers, 
-                                               all_cluster_features=all_cluster_features)
-                
-                # Build all_matches for post-processing (same format as before)
-                all_matches = {}  # spk -> [(name, distance, confidence), ...]
-                debug_matches = {}
-                
-                for spk, result in match_results.items():
-                    matches_list = []
-                    debug_distances = {}
-                    for name, dist_info in result.get("distances", {}).items():
-                        conf = dist_info.get("confidence", 0)
-                        matches_list.append((name, dist_info.get("combined", 1.0), conf))
-                        debug_distances[name] = dist_info
-                    matches_list.sort(key=lambda x: x[1])
-                    all_matches[spk] = matches_list
-                    debug_matches[spk] = debug_distances
-                    
-                    if is_debug() and matches_list:
-                        cluster_pitch = clusters[spk].get("pitch_hz", 0)
-                        cluster_energy = clusters[spk].get("energy_rms", 0)
-                        print(f"Cluster '{spk}' (pitch={cluster_pitch:.0f}Hz, energy={cluster_energy:.3f}) matches: {debug_distances}")
-                
-                if is_debug():
-                    print("=== END DEBUG ===")
-
-                # Apply best match if distance below threshold, store alternatives
-                for spk, emb_list in speaker_centroids.items():
-                    if not emb_list or spk not in all_matches:
-                        continue
-
-                    matches = all_matches[spk]
-                    if not matches:
-                        continue
-
-                    best_match, best_dist, best_conf = matches[0]
-                    
-                    # Check if it's a clear winner
-                    clear_winner = True
-                    matching_cfg = get("matching", default={})
-                    gap_threshold = matching_cfg.get("clear_winner_gap", 0.02)
-                    embed_only_thresh = matching_cfg.get("embed_only_threshold", 0.16)
-                    
-                    if len(matches) > 1:
-                        second_dist = matches[1][1]
-                        gap = second_dist - best_dist
-                        if gap < gap_threshold:
-                            # When gap is small, prefer speaker with more training data
-                            first_dur = req.known_speakers.get(matches[0][0], {}).get("total_speech_sec", 0)
-                            second_dur = req.known_speakers.get(matches[1][0], {}).get("total_speech_sec", 0)
-                            
-                            # If best has significantly more data, use it despite small gap
-                            if first_dur > second_dur * 2 and best_dist < embed_only_thresh:
-                                clear_winner = True
-                                if is_debug():
-                                    print(f"  -> Using {matches[0][0]} (more training data: {first_dur:.0f}s vs {second_dur:.0f}s)")
-                            else:
-                                clear_winner = False
-
-                    # Debug: show why this match was chosen
-                    if is_debug():
-                        print(f"Cluster '{spk}' -> best_match='{best_match}' best_dist={best_dist:.3f} match_thresh={match_thresh:.3f} clear_winner={clear_winner} -> {'MATCH' if best_dist <= match_thresh and clear_winner else 'NO MATCH'}")
-
-                    # Store alternatives in each segment
-                    alternatives = []
-                    for name, dist, conf in matches[1:4]:  # Top 3 alternatives
-                        conf_thresh = matching_cfg.get("confidence_threshold", 0.3)
-                        if conf >= conf_thresh:
-                            alternatives.append({"speaker": name, "confidence": round(conf, 2)})
-
-                    if best_match and best_dist <= match_thresh and clear_winner:
-                        # Update all segments with this speaker
-                        for seg in merged_segments:
-                            if seg["speaker"] == spk:
-                                seg["speaker"] = best_match
-                                seg["alternatives"] = alternatives
-                                # Store debug for logging and output
-                                seg["debug"] = {"from_cluster": spk, "confidence": best_conf, "distances": debug_matches[spk]}
-                        # Update profiles
-                        profiles[best_match] = profiles.pop(spk)
-                        profiles[best_match]["matched_from"] = spk
-                        profiles[best_match]["match_confidence"] = best_conf
-
-            # Post-match merging: combine clusters that both matched to the same speaker
-            # This handles cases where one speaker's voice was split into multiple clusters
-            speaker_to_clusters = {}
-            for spk, matches_list in all_matches.items():
-                if not matches_list:
-                    continue
-                best_match, best_dist, _ = matches_list[0]
-                if best_match and best_dist <= match_thresh:
-                    if best_match not in speaker_to_clusters:
-                        speaker_to_clusters[best_match] = []
-                    speaker_to_clusters[best_match].append(spk)
-
-            # Merge clusters with same speaker match
-            for speaker, cluster_list in speaker_to_clusters.items():
-                if len(cluster_list) > 1:
-                    if is_debug():
-                        print(f"MERGING: {cluster_list} -> {speaker}")
-                    primary = cluster_list[0]
-                    for extra in cluster_list[1:]:
-                        # Update all segments from extra cluster to primary speaker
-                        for seg in merged_segments:
-                            if seg["speaker"] == extra:
-                                seg["speaker"] = speaker
-                        merge_profiles(profiles, primary, extra)
-
-            # Additional merge: clusters with similar distance profiles to known speakers
-            # This catches cases where two clusters don't both meet threshold but are same speaker
-            cluster_ids = list(all_matches.keys())
-            merged_already = set()
-            for i in range(len(cluster_ids)):
-                if cluster_ids[i] in merged_already:
-                    continue
-                for j in range(i + 1, len(cluster_ids)):
-                    if cluster_ids[j] in merged_already:
-                        continue
-                    # Compare distance vectors
-                    matches_i = all_matches[cluster_ids[i]]
-                    matches_j = all_matches[cluster_ids[j]]
-                    if not matches_i or not matches_j:
-                        continue
-                    # Build distance vectors for same speakers
-                    dist_vec_i = {m[0]: m[1] for m in matches_i}
-                    dist_vec_j = {m[0]: m[1] for m in matches_j}
-                    common_speakers = set(dist_vec_i.keys()) & set(dist_vec_j.keys())
-                    if len(common_speakers) >= 3:
-                        # Check if distances are similar (within 0.05)
-                        max_diff = max(abs(dist_vec_i[s] - dist_vec_j[s]) for s in common_speakers)
-                        if max_diff < 0.05:
-                            print(f"PROFILE MERGE: {cluster_ids[i]} and {cluster_ids[j]} (similar profiles)")
-                            # Merge j into i
-                            target_spk = cluster_ids[i]
-                            for seg in merged_segments:
-                                if seg["speaker"] == cluster_ids[j]:
-                                    seg["speaker"] = target_spk
-                            merge_profiles(profiles, target_spk, cluster_ids[j])
-                            merged_already.add(cluster_ids[j])
-
-            loop.call_soon_threadsafe(queue.put_nowait, json.dumps({
-                "type": "progress", "step": "Clustering", "completed": 1, "total": 1
-            }))
-
-            # Ghost-speaker elimination
-            merged_segments = eliminate_ghost_speakers(merged_segments, profiles=profiles)
-
-            # Compute confidence for each segment based on embedding distances to all cluster centroids
-            # For each embeddable window: compute distance to ALL centroids, measure assignment clarity
-            # Clarity = distance_to_assigned / distance_to_2nd_closest (lower = clearer assignment)
-
-            # First compute per-window distances to centroids
-            if cluster_centroids and raw_embeddings is not None:
-                centroid_arrays = {cid: np.array(centroid) for cid, centroid in cluster_centroids.items()}
-
-                # For each embeddable window, store distances to all centroids
-                for idx, (meta_idx, label) in enumerate(zip(embeddable_indices, long_labels)):
-                    if meta_idx < len(raw_embeddings):
-                        emb = raw_embeddings[meta_idx]
-                        all_dists = {}
-                        for cid, centroid in centroid_arrays.items():
-                            dist = cosine(emb, centroid)
-                            all_dists[cid] = dist
-
-                        # Get sorted distances to measure clarity
-                        sorted_dists = sorted(all_dists.values())
-                        assigned_dist = all_dists.get(int(label), 1.0)
-
-                        # Clarity: ratio of assigned distance to 2nd closest (lower = more confident)
-                        if len(sorted_dists) > 1:
-                            second_closest = sorted_dists[1]
-                            clarity = assigned_dist / second_closest if second_closest > 0 else 0.0
-                        else:
-                            clarity = 0.0  # Only one cluster
-
-                        # Store in metadata: distance to assigned cluster and clarity score
-                        all_segments_meta[meta_idx]["assigned_dist"] = assigned_dist
-                        all_segments_meta[meta_idx]["clarity"] = min(1.0, clarity)
-                        all_segments_meta[meta_idx]["all_dists"] = all_dists
-
-            # Now compute segment-level confidence
-            segment_confidences = []
-            for seg in merged_segments:
-                seg_start = seg["start"]
-                seg_end = seg["end"]
-
-                clarities = []
-                assigned_dists = []
-                window_count = 0
-                embeddable_count = 0
-                speaker_consistency = {}  # count per speaker in this segment
-
-                for meta in all_segments_meta:
-                    if meta["start"] >= seg_start - 0.1 and meta["end"] <= seg_end + 0.1:
-                        window_count += 1
-                        if "speaker_raw" in meta:
-                            embeddable_count += 1
-                            raw_spk = meta["speaker_raw"]
-                            speaker_consistency[raw_spk] = speaker_consistency.get(raw_spk, 0) + 1
-
-                            # Collect clarity and distance if available
-                            if "clarity" in meta:
-                                clarities.append(meta["clarity"])
-                            if "assigned_dist" in meta:
-                                assigned_dists.append(meta["assigned_dist"])
-
-                # Confidence components:
-                # 1. Clarity score (average assignment clarity) - lower ratio = clearer
-                clarity_conf = 0.5  # default
-                if clarities:
-                    avg_clarity = sum(clarities) / len(clarities)
-                    # Convert clarity ratio to confidence: 0.0 = perfect, 1.0 = ambiguous
-                    # confidence = 1 - clarity (so high clarity = high confidence)
-                    clarity_conf = max(0, 1 - avg_clarity)
-
-                # 2. Embedding distance to centroid (closer = higher confidence)
-                dist_conf = 0.5  # default
-                if assigned_dists:
-                    avg_dist = sum(assigned_dists) / len(assigned_dists)
-                    # Convert distance to confidence: 0.5 is max expected, scale to 0-1
-                    dist_conf = max(0, 1 - (avg_dist / 0.5))
-
-                # 3. Speaker consistency (do all windows agree?)
-                consistency_conf = 0.5
-                if speaker_consistency:
-                    max_count = max(speaker_consistency.values())
-                    total = sum(speaker_consistency.values())
-                    consistency_conf = max_count / total if total > 0 else 0.5
-
-                # 4. Duration factor (longer segments = more reliable)
-                seg_dur = seg_end - seg_start
-                dur_conf = min(1.0, seg_dur / 5.0)  # 5+ seconds = full confidence
-
-                # Aggregate: weighted combination
-                # Weight clarity and distance more heavily
-                final_conf = (
-                    clarity_conf * 0.3 +
-                    dist_conf * 0.3 +
-                    consistency_conf * 0.25 +
-                    dur_conf * 0.15
-                )
-
-                # Boost if known speaker matching (inferred from profiles)
-                if req.known_speakers and seg["speaker"] in req.known_speakers:
-                    final_conf = min(1.0, final_conf + 0.15)  # Known speaker gets boost
-
-                segment_confidences.append(final_conf)
-
-            # Format final response — include profiles, confidence, and alternatives
-            final_data = []
-            for i, seg in enumerate(merged_segments):
-                if seg["end"] <= seg["start"]:
-                    continue
-                seg_data = {
-                    "start": round(float(seg["start"]), 3),
-                    "end": round(float(seg["end"]), 3),
-                    "speaker": seg["speaker"],
-                    "confidence": round(segment_confidences[i], 3) if i < len(segment_confidences) else 0.5
-                }
-                # Add alternatives if present
-                if "alternatives" in seg and seg["alternatives"]:
-                    seg_data["alternatives"] = seg["alternatives"]
-                final_data.append(seg_data)
-
-            # Debug: log each segment's assignment
-            for i, seg in enumerate(merged_segments):
-                debug = seg.get("debug", {})
-                conf = segment_confidences[i] if i < len(segment_confidences) else 0.5
-                print(f"SEGMENT {seg['start']:.1f}-{seg['end']:.1f}: assigned='{seg['speaker']}' conf={conf:.2f}")
-
-            # Ensure sorted by start time
-            final_data.sort(key=lambda x: x["start"])
-
-            unique_speakers = list(set(s["speaker"] for s in final_data))
-            log.info("diarization_complete", unique_speakers=unique_speakers, num_segments=len(final_data))
-
-            msg = {"type": "result", "segments": final_data, "profiles": profiles}
-            loop.call_soon_threadsafe(queue.put_nowait, json.dumps(msg))
-            loop.call_soon_threadsafe(queue.put_nowait, None)
-
-        except Exception as e:
-            log.error("diarization_failed", error=str(e), exc_info=True)
-            err_msg = {"error": f"Diarization processing failed: {str(e)}"}
-            loop.call_soon_threadsafe(queue.put_nowait, json.dumps(err_msg))
-            loop.call_soon_threadsafe(queue.put_nowait, None)
-
-    # Start thread
-    task = asyncio.create_task(asyncio.to_thread(run_diarization_thread))
+    # Start diarization in thread
+    diarizer = Diarizer(state, settings)
+    task = asyncio.create_task(
+        asyncio.to_thread(diarizer.run, req, queue, loop, str(resolved))
+    )
 
     async def event_generator():
         while True:
@@ -1955,7 +164,7 @@ async def diarize_path_endpoint(
             yield msg + "\n"
 
             # Stop if we hit a terminal message
-            if '"type": "result"' in msg or '"type": "error"' in msg:
+            if '"type": "result"' in msg or '"error"' in msg:
                 break
 
     return StreamingResponse(event_generator(), media_type="application/x-ndjson")
@@ -1977,110 +186,27 @@ async def transcribe_upload(
     start_time = time.perf_counter()
     
     if len(files) > settings.max_batch_size:
-        raise HTTPException(
+        return JSONResponse(
             status_code=400, 
-            detail=f"Too many files. Max: {settings.max_batch_size}"
+            content={"error": f"Too many files. Max: {settings.max_batch_size}"}
         )
       
     results = []
     
-    with contextmanager(lambda: (yield))():
-        for file in files:
-            try:
-                # Save to temp file
-                with tempfile.NamedTemporaryFile(
-                    suffix=Path(file.filename or "audio.wav").suffix,
-                    delete=True
-                ) as tmp:
-                    content = await file.read()
-                    tmp.write(content)
-                    tmp.flush()
-                    
-                    # Load audio
-                    audio, _ = await asyncio.to_thread(
-                        librosa.load, tmp.name, sr=16000, mono=True
-                    )
-                    
-                    # Process audio in 30s chunks (model expects fixed-length input)
-                    full_text = ""
-                    total_duration = 0
-                    total_inference = 0
-                    total_tokens = 0
-                    
-                    chunk_samples = TARGET_SAMPLES  # 30s at 16kHz
-                    for start in range(0, len(audio), chunk_samples):
-                        chunk = audio[start:start + chunk_samples]
-                        
-                        # Pad short final chunk to exactly 30s
-                        if len(chunk) < chunk_samples:
-                            chunk = np.pad(chunk, (0, chunk_samples - len(chunk)), mode='constant')
-                        
-                        result = await transcribe_audio_async(
-                            chunk, 
-                            language, 
-                            settings.request_timeout
-                        )
-                        
-                        full_text += result["text"] + " "
-                        total_duration += result["audio_duration_sec"]
-                        total_inference += result["inference_time_sec"]
-                        total_tokens += result["tokens_generated"]
-                    
-                    result = {
-                        "text": clean_transcript(full_text.strip()),
-                        "audio_duration_sec": len(audio) / 16000,
-                        "inference_time_sec": total_inference,
-                        "tokens_generated": total_tokens
-                    }
-                    
-                    results.append(TranscribeResult(
-                        text=result["text"],
-                        audio_duration_sec=result["audio_duration_sec"],
-                        inference_time_sec=result["inference_time_sec"],
-                        tokens_generated=result["tokens_generated"]
-                    ))
-                    
-            except Exception as e:
-                log.error("transcription_failed", filename=file.filename, error=str(e))
-                results.append(TranscribeResult(
-                    text="",
-                    audio_duration_sec=0,
-                    inference_time_sec=0,
-                    tokens_generated=0,
-                    error=str(e)
-                ))
-    
-    return TranscribeResponse(
-        results=results,
-        total_time_sec=time.perf_counter() - start_time
-    )
-
-
-@app.post("/transcribe/paths", response_model=TranscribeResponse)
-async def transcribe_paths(
-    req: TranscribePathsRequest,
-    settings: Settings = Depends(get_settings),
-    _: str = Depends(verify_api_key)
-):
-    """
-    Transcribe audio files by path.
-    
-    Paths must be accessible by the server and within allowed directories
-    if TRANSCRIBE_ALLOWED_AUDIO_DIR is set.
-    """
-    start_time = time.perf_counter()
-    
-    results = []
-    
-    with contextmanager(lambda: (yield))():
-        for path in req.wav_paths:
-            try:
-                # Validate path
-                resolved = validate_path_security(path, settings)
+    for file in files:
+        try:
+            # Save to temp file
+            with tempfile.NamedTemporaryFile(
+                suffix=Path(file.filename or "audio.wav").suffix,
+                delete=True
+            ) as tmp:
+                content = await file.read()
+                tmp.write(content)
+                tmp.flush()
                 
                 # Load audio
                 audio, _ = await asyncio.to_thread(
-                    librosa.load, str(resolved), sr=16000, mono=True
+                    librosa.load, tmp.name, sr=16000, mono=True
                 )
                 
                 # Process audio in 30s chunks (model expects fixed-length input)
@@ -2099,7 +225,7 @@ async def transcribe_paths(
                     
                     result = await transcribe_audio_async(
                         chunk, 
-                        req.language, 
+                        language, 
                         settings.request_timeout
                     )
                     
@@ -2117,590 +243,121 @@ async def transcribe_paths(
                 
                 results.append(TranscribeResult(
                     text=result["text"],
-                    audio_duration_sec=result["audio_duration_sec"],
-                    inference_time_sec=result["inference_time_sec"],
-                    tokens_generated=result["tokens_generated"],
-                    speakers=result.get("speakers")
+                    audio_duration_sec=str(result["audio_duration_sec"]),
+                    inference_time_sec=str(result["inference_time_sec"]),
+                    tokens_generated=str(result["tokens_generated"])
                 ))
                 
-            except PathSecurityError as e:
-                log.warning("path_security_error", path=path, error=str(e))
-                results.append(TranscribeResult(
-                    text="",
-                    audio_duration_sec=0,
-                    inference_time_sec=0,
-                    tokens_generated=0,
-                    error=f"Access denied: {e.message}"
-                ))
-                
-            except Exception as e:
-                log.error("transcription_failed", path=path, error=str(e))
-                results.append(TranscribeResult(
-                    text="",
-                    audio_duration_sec=0,
-                    inference_time_sec=0,
-                    tokens_generated=0,
-                    error=str(e)
-                ))
-        
+        except Exception as e:
+            log.error("transcription_failed", filename=file.filename, error=str(e))
+            results.append(TranscribeResult(
+                text="",
+                audio_duration_sec="0",
+                inference_time_sec="0",
+                tokens_generated="0",
+                error=str(e)
+            ))
+    
     return TranscribeResponse(
         results=results,
-        total_time_sec=time.perf_counter() - start_time
+        total_time_sec=str(time.perf_counter() - start_time)
     )
 
 
-# ============================================================================
-# Streaming (WebSocket) — Real-Time Dual-Channel Transcription
-# ============================================================================
-
-VOICEPRINTS_PATH = Path(__file__).parent / "voiceprints.json"
-
-def _stream_load_voiceprints() -> dict:
-    if VOICEPRINTS_PATH.exists():
-        try:
-            with open(VOICEPRINTS_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
-
-def _stream_save_voiceprints(vp: dict):
-    try:
-        with open(VOICEPRINTS_PATH, "w", encoding="utf-8") as f:
-            json.dump(vp, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        log.warning("voiceprint_save_failed", error=str(e))
-
-def _estimate_embedding_from_audio(
-    audio_1d: np.ndarray,
-    sr: int = 16000,
-) -> np.ndarray | None:
-    """Extract a single L2-normalised speaker embedding from an audio chunk."""
-    if not state.embedding_session or len(audio_1d) < sr * 1.5:
-        return None
-    wav_t = torch.from_numpy(audio_1d).float().unsqueeze(0)
-    try:
-        windows, _ = generate_sliding_windows(wav_t, sr, window_sec=3.0, stride_sec=1.5)
-        fbanks = []
-        for w in windows:
-            if w.shape[-1] / sr >= 1.5:
-                if w.shape[-1] < 4800:
-                    w = torch.nn.functional.pad(w, (0, 4800 - w.shape[-1]))
-                fbanks.append(extract_fbank(w, sr))
-        if not fbanks:
-            return None
-        max_len = max(fb.shape[1] for fb in fbanks)
-        padded = []
-        for fb in fbanks:
-            if fb.shape[1] < max_len:
-                fb = torch.nn.functional.pad(fb, (0, 0, 0, max_len - fb.shape[1]))
-            padded.append(fb)
-        batch = torch.stack(padded, dim=0)
-        batch = (batch - batch.mean(dim=2, keepdim=True)).squeeze(1).numpy()
-        embs = state.embedding_session.run(None, {
-            state.embedding_session.get_inputs()[0].name: batch
-        })[0]
-        norms = np.linalg.norm(embs, axis=1, keepdims=True)
-        embs = embs / np.maximum(norms, 1e-12)
-        return embs.mean(axis=0)
-    except Exception as e:
-        log.warning("embedding_estimation_failed", error=str(e))
-        return None
-
-
-def _process_speaker_window(
-    audio_1d: np.ndarray,
-    voiceprints: dict,
-    window_start: float,
-    recording_ts: str,
-    session_new_speakers: dict,
-    sr: int = 16000,
-) -> tuple[list[dict], dict]:
-    """
-    Run VAD + energy-dip splitting + sliding-window diarization + ASR on a
-    mono float32 chunk of arbitrary length (typically one VAD-bounded utterance).
-    Returns (transcript_messages, updated_session_new_speakers).
-    """
-    results = []
-    ASR_MIN = int(sr * 3.0)   # minimum samples to feed ONNX ASR model
-
-    if len(audio_1d) < sr * 0.5:
-        return results, session_new_speakers
-
-    wav_t = torch.from_numpy(audio_1d).float().unsqueeze(0)
-
-    # 1. VAD
-    if not state.get_speech_timestamps or not state.vad_model:
-        return results, session_new_speakers
-
-    try:
-        speech_ts = state.get_speech_timestamps(
-            wav_t, state.vad_model,
-            sampling_rate=sr, return_seconds=True,
-            threshold=get_settings().vad_threshold,
-            min_speech_duration_ms=get_settings().vad_min_speech_duration_ms,
-        )
-    except Exception:
-        return results, session_new_speakers
-
-    if not speech_ts:
-        return results, session_new_speakers
-
-    # 1b. Energy-dip splitting to break segments at natural speaker boundaries
-    speech_ts = split_at_energy_dips(speech_ts, audio_1d, sample_rate=sr)
-
-    # 2. Sliding-window embedding extraction
-    MIN_EMBED_DUR = 1.5
-    all_fbanks = []
-    all_seg_meta = []
-    embeddable_idxs = []
-
-    for ts in speech_ts:
-        s = int(ts["start"] * sr)
-        e = int(ts["end"] * sr)
-        seg = wav_t[:, s:e]
-        windows, starts = generate_sliding_windows(seg, sr, window_sec=2.0, stride_sec=0.75)
-        for w, rel_start in zip(windows, starts):
-            dur = w.shape[-1] / sr
-            gs = ts["start"] + rel_start
-            ge = gs + dur
-            idx = len(all_seg_meta)
-            all_seg_meta.append({"start": gs, "end": ge})
-            if dur >= MIN_EMBED_DUR:
-                if w.shape[-1] < 1600:
-                    w = torch.nn.functional.pad(w, (0, 1600 - w.shape[-1]))
-                all_fbanks.append(extract_fbank(w, sr))
-                embeddable_idxs.append(idx)
-
-    if not all_fbanks or not state.embedding_session:
-        # Fallback: transcribe the whole utterance as one unknown speaker
-        asr_audio = audio_1d if len(audio_1d) >= ASR_MIN else np.pad(audio_1d, (0, ASR_MIN - len(audio_1d)))
-        result = transcribe_audio_sync(asr_audio)
-        text = result.get("text", "")
-        if text.strip():
-            results.append({
-                "type": "transcript",
-                "channel": "speakers",
-                "speaker": "SPEAKER_1",
-                "text": clean_transcript(text),
-                "start": round(window_start, 2),
-                "end": round(window_start + len(audio_1d) / sr, 2),
-                "confidence": 0.5,
-            })
-        return results, session_new_speakers
-
-    # Batch embedding
-    max_len = max(fb.shape[1] for fb in all_fbanks)
-    padded = []
-    for fb in all_fbanks:
-        if fb.shape[1] < max_len:
-            fb = torch.nn.functional.pad(fb, (0, 0, 0, max_len - fb.shape[1]))
-        padded.append(fb)
-    batch = torch.stack(padded, dim=0)
-    batch = (batch - batch.mean(dim=2, keepdim=True)).squeeze(1).numpy()
-
-    raw_embs = []
-    bs = 32
-    for i in range(0, len(batch), bs):
-        out = state.embedding_session.run(None, {"feats": batch[i:i+bs]})
-        raw_embs.append(out[0])
-    raw_embs = np.concatenate(raw_embs, axis=0)
-    norms = np.linalg.norm(raw_embs, axis=1, keepdims=True)
-    raw_embs = raw_embs / np.maximum(norms, 1e-12)
-
-    # 3. Clustering
-    settings = get_settings()
-    if len(raw_embs) > 1:
-        clusterer = AgglomerativeClustering(
-            n_clusters=None,
-            metric="cosine",
-            linkage="average",
-            distance_threshold=settings.diarization_threshold,
-        )
-        labels = clusterer.fit_predict(raw_embs)
-    else:
-        labels = np.array([0])
-
-    # 4. Map raw clusters to speaker names (try voiceprint match)
-    cluster_centroids = {}
-    for cid in set(labels):
-        mask = labels == cid
-        mean_emb = raw_embs[mask].mean(axis=0)
-        norm_emb = mean_emb / (np.linalg.norm(mean_emb) + 1e-12)
-        cluster_centroids[int(cid)] = norm_emb
-
-    # Assign raw labels to segments
-    for idx, label in zip(embeddable_idxs, labels):
-        all_seg_meta[idx]["raw_label"] = int(label)
-
-    # Assign short windows to nearest embeddable window
-    emb_mids = np.array([
-        (all_seg_meta[i]["start"] + all_seg_meta[i]["end"]) / 2
-        for i in embeddable_idxs
-    ])
-    for i, seg in enumerate(all_seg_meta):
-        if "raw_label" not in seg:
-            mid = (seg["start"] + seg["end"]) / 2
-            nearest = int(np.argmin(np.abs(emb_mids - mid)))
-            seg["raw_label"] = all_seg_meta[embeddable_idxs[nearest]]["raw_label"]
-
-    # Match clusters to voiceprints, then to session speakers
-    accept_thresh    = get("matching", "accept_threshold",           0.35)
-    clear_gap        = get("matching", "clear_winner_gap",            0.02)
-    embed_only_t     = get("matching", "embed_only_threshold",        0.16)
-    embed_only_acc   = get("matching", "embed_only_accept_threshold",  0.22)
-    conf_max_dist    = get("normalization", "confidence_max_distance", 0.5)
-    clust_thresh     = get("diarization", "default_threshold",         0.35)
-
-    speaker_map = {}   # raw_label -> speaker_name
-    next_spk_num = len(session_new_speakers) + 1
-
-    for raw_id, centroid in sorted(cluster_centroids.items()):
-        # --- voiceprint match ---
-        best_vp, best_vp_dist, second_vp_dist = None, 1.0, 1.0
-        for vp_name, vp_data in voiceprints.items():
-            if "embedding" not in vp_data:
-                continue
-            d = float(cosine(centroid.tolist(), vp_data["embedding"]))
-            if d < best_vp_dist:
-                second_vp_dist = best_vp_dist
-                best_vp_dist = d
-                best_vp = vp_name
-            elif d < second_vp_dist:
-                second_vp_dist = d
-
-        vp_gap = second_vp_dist - best_vp_dist
-        if best_vp and best_vp_dist < accept_thresh and (len(voiceprints) == 1 or vp_gap >= clear_gap):
-            speaker_map[raw_id] = best_vp
-            continue
-        if best_vp and best_vp_dist < embed_only_t and best_vp_dist < embed_only_acc:
-            speaker_map[raw_id] = best_vp
-            continue
-
-        # --- session speaker match (stable SPEAKER_N across utterances) ---
-        best_sess, best_sess_dist = None, 1.0
-        for sname, sdata in session_new_speakers.items():
-            se = np.array(sdata["embedding"])
-            d = float(1.0 - np.dot(centroid, se))
-            if d < best_sess_dist:
-                best_sess_dist = d
-                best_sess = sname
-
-        if best_sess and best_sess_dist < clust_thresh:
-            speaker_map[raw_id] = best_sess
-            # Update running-average centroid
-            n = session_new_speakers[best_sess].get("n_utterances", 1)
-            old = np.array(session_new_speakers[best_sess]["embedding"])
-            updated = (old * n + centroid) / (n + 1)
-            updated /= (np.linalg.norm(updated) + 1e-12)
-            session_new_speakers[best_sess]["embedding"] = updated.tolist()
-            session_new_speakers[best_sess]["n_utterances"] = n + 1
-        else:
-            spk_key = f"SPEAKER_{next_spk_num}"
-            next_spk_num += 1
-            speaker_map[raw_id] = spk_key
-            session_new_speakers[spk_key] = {
-                "embedding":      centroid.tolist(),
-                "audio_fragments": [],
-                "total_sec":       0.0,
-                "confidence_sum":  0.0,
-                "count":           0,
-                "n_utterances":    1,
-            }
-
-    # 5. Merge contiguous same-speaker windows into segments
-    merged = []
-    all_seg_meta.sort(key=lambda x: x["start"])
-    cur = None
-    for seg in all_seg_meta:
-        spk = speaker_map.get(seg.get("raw_label"), "SPEAKER_1")
-        if cur is None:
-            cur = {"start": seg["start"], "end": seg["end"], "speaker": spk}
-        elif cur["speaker"] == spk and seg["start"] <= cur["end"] + 1.0:
-            cur["end"] = max(cur["end"], seg["end"])
-        else:
-            merged.append(cur)
-            cur = {"start": seg["start"], "end": seg["end"], "speaker": spk}
-    if cur:
-        merged.append(cur)
-
-    # 5b. Island absorption + ghost-speaker elimination (same functions as batch pipeline)
-    merged = absorb_islands(merged)
-    merged = eliminate_ghost_speakers(merged, profiles=None)
-
-    # 6. Transcribe each merged segment
-    for seg in merged:
-        s = max(0, int(seg["start"] * sr))
-        e = min(len(audio_1d), int(seg["end"] * sr))
-        if e - s < int(sr * 0.3):
-            continue
-        seg_audio = audio_1d[s:e]
-
-        asr_audio = seg_audio if len(seg_audio) >= ASR_MIN else np.pad(seg_audio, (0, ASR_MIN - len(seg_audio)))
-        try:
-            result = transcribe_audio_sync(asr_audio)
-            text = result.get("text", "")
-            token_count = result.get("tokens_generated", 0)
-            dur = (e - s) / sr
-            conf_score = min(0.95, max(0.3, token_count / (dur * 10 + 1)))
-        except Exception:
-            text = ""
-            conf_score = 0.0
-
-        if not text.strip():
-            continue
-
-        spk = seg["speaker"]
-        results.append({
-            "type":       "transcript",
-            "channel":    "speakers",
-            "speaker":    spk,
-            "text":       clean_transcript(text),
-            "start":      round(window_start + seg["start"], 2),
-            "end":        round(window_start + seg["end"], 2),
-            "confidence": round(conf_score, 3),
-        })
-
-        # Accumulate audio for persistence
-        if spk in session_new_speakers:
-            session_new_speakers[spk]["audio_fragments"].append(seg_audio)
-            session_new_speakers[spk]["total_sec"] += dur
-            session_new_speakers[spk]["confidence_sum"] += conf_score
-            session_new_speakers[spk]["count"] += 1
-
-    return results, session_new_speakers
-
-
-def _persist_new_speakers(
-    session_new_speakers: dict,
-    voiceprints: dict,
-    recording_ts: str,
-    sr: int = 16000,
-    min_speech_sec: float = 30.0,
-    min_confidence: float = 0.8,
+@app.post("/transcribe/paths", response_model=TranscribeResponse)
+async def transcribe_paths(
+    req: TranscribePathsRequest,
+    settings = Depends(get_settings),
+    _: str = Depends(verify_api_key)
 ):
     """
-    Persist new speakers to voiceprints.json if they have enough data and confidence.
-    Uses naming pattern: recording_timestamp_SPEAKER_x
+    Transcribe audio files by path.
+    
+    Paths must be accessible by the server and within allowed directories
+    if TRANSCRIBE_ALLOWED_AUDIO_DIR is set.
     """
-    persisted = []
-    for spk_key, data in list(session_new_speakers.items()):
-        if data["total_sec"] < min_speech_sec:
-            continue
-        avg_conf = data["confidence_sum"] / max(1, data["count"])
-        if avg_conf < min_confidence:
-            continue
-
-        # Concatenate all audio fragments
-        if not data["audio_fragments"]:
-            continue
-        all_audio = np.concatenate(data["audio_fragments"])
-        dur = len(all_audio) / sr
-        if dur < 5.0:
-            continue
-
-        # Estimate embedding
-        emb = _estimate_embedding_from_audio(all_audio, sr)
-        if emb is None:
-            continue
-
-        # Generate speaker profile
-        wav_t = torch.from_numpy(all_audio).float().unsqueeze(0)
-        mock_segments = [{"start": 0.0, "end": dur, "speaker": spk_key}]
-        prof = profile_speakers(wav_t, mock_segments, sr)
-        speaker_prof = prof.get(spk_key, {})
-        speaker_prof["embedding"] = emb.tolist() if isinstance(emb, np.ndarray) else emb
-
-        # Assign persistent name
-        existing_names = [n for n in voiceprints.keys() if n.startswith(f"{recording_ts}_SPEAKER")]
-        next_n = len(existing_names) + 1
-        persistent_name = f"{recording_ts}_SPEAKER_{next_n}"
-
-        voiceprints[persistent_name] = speaker_prof
-        persisted.append(persistent_name)
-
-        # Clean up session tracking
-        del session_new_speakers[spk_key]
-
-    if persisted:
-        _stream_save_voiceprints(voiceprints)
-        for name in persisted:
-            log.info("new_speaker_persisted", name=name)
-
-
-@app.websocket("/ws/stream")
-async def stream_transcribe(websocket: WebSocket):
-    """
-    WebSocket endpoint for real-time dual-channel streaming transcription.
-
-    Client sends:
-    1. JSON config: {"my_name": "...", "recording_ts": "YYYYMMDD_HHMMSS"}
-    2. Binary PCM frames: 2-channel int16, 16kHz, interleaved [L=mic, R=speakers]
-
-    VAD detects sentence boundaries; each utterance is processed with the full
-    sliding-window diarization pipeline (energy-dip split → embed → cluster →
-    voiceprint match → ASR).  SPEAKER_N labels are stable across the session.
-    """
-    await websocket.accept()
-    log.info("stream_connected")
-
-    try:
-        raw = await websocket.receive_json()
-        my_name = raw.get("my_name", "[ME]")
-        recording_ts = raw.get("recording_ts", "")
-    except Exception:
-        my_name = "[ME]"
-        recording_ts = ""
-
-    SR = 16000
-    SILENCE_THRESH  = 0.5          # seconds of silence before flushing
-    MAX_UTT_SEC     = 15.0         # safety flush for very long speech
-    MIN_UTT_SEC     = 0.5          # discard utterances shorter than this
-    ASR_MIN         = int(SR * 3)  # minimum samples for ONNX ASR
-    SILENCE_SAMPLES = int(SILENCE_THRESH * SR)
-    MAX_UTT_SAMPLES = int(MAX_UTT_SEC * SR)
-
-    class ChannelState:
-        def __init__(self):
-            self.utt_buf       = np.array([], dtype=np.float32)
-            self.in_speech     = False
-            self.silence_samples = 0
-            self.offset        = 0.0   # session-time at start of utt_buf
-
-    mic_ch = ChannelState()
-    spk_ch = ChannelState()
-    session_time = 0.0
-
-    voiceprints = _stream_load_voiceprints()
-    session_new_speakers: dict = {}
-
-    # ------------------------------------------------------------------ #
-
-    def _vad_has_speech(audio: np.ndarray) -> bool:
-        if not state.get_speech_timestamps or not state.vad_model:
-            return True
+    start_time = time.perf_counter()
+    
+    results = []
+    
+    for path in req.wav_paths:
         try:
-            wav_t = torch.from_numpy(audio).float().unsqueeze(0)
-            ts = state.get_speech_timestamps(
-                wav_t, state.vad_model,
-                sampling_rate=SR, return_seconds=False,
-                threshold=get_settings().vad_threshold,
-                min_speech_duration_ms=get_settings().vad_min_speech_duration_ms,
+            # Validate path
+            resolved = validate_path_security(path, settings)
+            
+            # Load audio
+            audio, _ = await asyncio.to_thread(
+                librosa.load, str(resolved), sr=16000, mono=True
             )
-            return bool(ts)
-        except Exception:
-            return True
+            
+            # Process audio in 30s chunks
+            full_text = ""
+            total_duration = 0
+            total_inference = 0
+            total_tokens = 0
+            
+            chunk_samples = TARGET_SAMPLES  # 30s at 16kHz
+            for start in range(0, len(audio), chunk_samples):
+                chunk = audio[start:start + chunk_samples]
+                
+                # Pad short final chunk to exactly 30s
+                if len(chunk) < chunk_samples:
+                    chunk = np.pad(chunk, (0, chunk_samples - len(chunk)), mode='constant')
+                
+                result = await transcribe_audio_async(
+                    chunk, 
+                    req.language, 
+                    settings.request_timeout
+                )
+                
+                full_text += result["text"] + " "
+                total_duration += result["audio_duration_sec"]
+                total_inference += result["inference_time_sec"]
+                total_tokens += result["tokens_generated"]
+            
+            result = {
+                "text": clean_transcript(full_text.strip()),
+                "audio_duration_sec": len(audio) / 16000,
+                "inference_time_sec": total_inference,
+                "tokens_generated": total_tokens
+            }
+            
+            results.append(TranscribeResult(
+                text=result["text"],
+                audio_duration_sec=str(result["audio_duration_sec"]),
+                inference_time_sec=str(result["inference_time_sec"]),
+                tokens_generated=str(result["tokens_generated"])
+            ))
+            
+        except PathSecurityError as e:
+            log.warning("path_security_error", path=path, error=str(e))
+            results.append(TranscribeResult(
+                text="",
+                audio_duration_sec="0",
+                inference_time_sec="0",
+                tokens_generated="0",
+                error=f"Access denied: {e.message}"
+            ))
+            
+        except Exception as e:
+            log.error("transcription_failed", path=path, error=str(e))
+            results.append(TranscribeResult(
+                text="",
+                audio_duration_sec="0",
+                inference_time_sec="0",
+                tokens_generated="0",
+                error=str(e)
+            ))
+        
+    return TranscribeResponse(
+        results=results,
+        total_time_sec=str(time.perf_counter() - start_time)
+    )
 
-    def _process_mic_utterance(audio: np.ndarray) -> list[dict]:
-        """Simple VAD-gated ASR for the mic channel (speaker is always MY_NAME)."""
-        asr_in = audio if len(audio) >= ASR_MIN else np.pad(audio, (0, ASR_MIN - len(audio)))
-        try:
-            result = transcribe_audio_sync(asr_in)
-            text = clean_transcript(result.get("text", ""))
-        except Exception:
-            text = ""
-        if not text.strip():
-            return []
-        return [{"type": "transcript", "channel": "mic", "speaker": my_name,
-                 "text": text, "confidence": 0.9}]
 
-    async def flush_utterance(ch: ChannelState, channel: str):
-        nonlocal session_new_speakers, voiceprints
-        audio = ch.utt_buf.copy()
-        ch.utt_buf       = np.array([], dtype=np.float32)
-        ch.in_speech     = False
-        ch.silence_samples = 0
-        start_time = ch.offset
+# WebSocket endpoint for streaming
+app.add_api_websocket_route("/ws/stream", stream_transcribe)
 
-        if len(audio) < int(MIN_UTT_SEC * SR):
-            return
-
-        if channel == "mic":
-            msgs = await asyncio.to_thread(_process_mic_utterance, audio)
-            for msg in msgs:
-                msg.setdefault("start", round(start_time, 2))
-                msg.setdefault("end",   round(start_time + len(audio) / SR, 2))
-                try:
-                    await websocket.send_json(msg)
-                except Exception:
-                    pass
-        else:
-            msgs, session_new_speakers = await asyncio.to_thread(
-                _process_speaker_window,
-                audio, voiceprints, start_time, recording_ts, session_new_speakers,
-            )
-            for msg in msgs:
-                try:
-                    await websocket.send_json(msg)
-                except Exception:
-                    pass
-            await asyncio.to_thread(
-                _persist_new_speakers,
-                session_new_speakers, voiceprints, recording_ts,
-            )
-
-    async def process_chunk(ch: ChannelState, chunk: np.ndarray, channel: str):
-        has_speech = await asyncio.to_thread(_vad_has_speech, chunk)
-        if has_speech:
-            if not ch.in_speech:
-                ch.offset    = session_time - len(ch.utt_buf) / SR
-                ch.in_speech = True
-            ch.utt_buf       = np.concatenate([ch.utt_buf, chunk])
-            ch.silence_samples = 0
-            if len(ch.utt_buf) >= MAX_UTT_SAMPLES:
-                await flush_utterance(ch, channel)
-        else:
-            if ch.in_speech:
-                ch.silence_samples += len(chunk)
-                ch.utt_buf = np.concatenate([ch.utt_buf, chunk])
-                if ch.silence_samples >= SILENCE_SAMPLES:
-                    trim = len(ch.utt_buf) - ch.silence_samples
-                    ch.utt_buf = ch.utt_buf[:max(trim, 0)]
-                    await flush_utterance(ch, channel)
-
-    # ------------------------------------------------------------------ #
-
-    try:
-        while True:
-            msg = await websocket.receive()
-            if msg.get("type") == "websocket.disconnect":
-                raise WebSocketDisconnect(code=msg.get("code", 1000))
-
-            if "bytes" in msg:
-                data = msg["bytes"]
-                frame = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
-                frame = frame.reshape(-1, 2)
-                session_time += len(frame) / SR
-                await process_chunk(mic_ch, frame[:, 0], "mic")
-                await process_chunk(spk_ch, frame[:, 1], "speakers")
-            elif "text" in msg:
-                try:
-                    payload = json.loads(msg["text"])
-                    if payload.get("type") == "eof":
-                        log.info("stream_eof_received")
-                        break
-                except Exception:
-                    pass
-
-        # Normal loop termination (e.g. eof received)
-        if len(mic_ch.utt_buf) > 0:
-            await flush_utterance(mic_ch, "mic")
-        if len(spk_ch.utt_buf) > 0:
-            await flush_utterance(spk_ch, "speakers")
-        log.info("stream_completed_gracefully", total_seconds=round(session_time, 1))
-
-    except WebSocketDisconnect:
-        if len(mic_ch.utt_buf) > 0:
-            await flush_utterance(mic_ch, "mic")
-        if len(spk_ch.utt_buf) > 0:
-            await flush_utterance(spk_ch, "speakers")
-        log.info("stream_disconnected", total_seconds=round(session_time, 1))
-    except Exception as e:
-        log.error("stream_error", error=str(e))
-        try:
-            await websocket.send_json({"type": "error", "message": str(e)})
-        except Exception:
-            pass
 
 # ============================================================================
 # Main

@@ -5,8 +5,12 @@ pydantic
 pydantic-settings
 numpy
 librosa
-onnxruntime
-onnxruntime-directml
+python-dotenv
+# cpu only: onnxruntime==1.24.1
+onnxruntime-directml==1.24.1
+#onnxruntime-openvino==1.24.1
+#openvino==2025.4.1
+tokenizers
 huggingface-hub
 
 # Diarization
@@ -28,7 +32,8 @@ tqdm
 # Optional: Rate limiting
 slowapi
 
-python-dotenv
+# Testing
+pytest
 
 # Streaming
 sounddevice

@@ -1029,12 +1029,15 @@ async def transcribe_file(
         # Initialize writer
         writer = TranscriptWriter(output_path, config.output_format)
 
-        # Process in batches
-        total_batches = (len(segments) + config.batch_size - 1) // config.batch_size
+        # Calculate total audio duration for progress tracking (time-based, not chunk-based)
+        total_duration = sum(seg[1] - seg[0] for seg in segments)
+        processed_duration = 0.0
+        displayed_duration = 0  # Keep track of integer seconds sent to progress bar to avoid floats in UI
 
         if progress_bar is not None:
-            progress_bar.total = len(segments)
+            progress_bar.total = int(round(total_duration))
             progress_bar.set_description(p.name[:30])
+            progress_bar.unit = "s"  # Time unit instead of segments
 
         # Clear output file and write speaker legend header if profiles available
         with open(output_path, "w", encoding="utf-8") as f:
@@ -1056,6 +1059,7 @@ async def transcribe_file(
             batch = segments[batch_idx:batch_idx + config.batch_size]
             chunk_files = []
             chunk_info = []  # (path, start, end, speaker, confidence, alternatives)
+            batch_duration = 0.0  # Track duration of chunks in this batch
 
             # Extract chunks
             for j, seg in enumerate(batch):
@@ -1071,21 +1075,28 @@ async def transcribe_file(
 
                 chunk_path = os.path.join(temp_dir, f"chunk_{batch_idx + j}.wav")
                 duration = end - start
+                batch_duration += duration  # Accumulate batch duration
 
                 if extract_chunk(temp_wav, start, duration, chunk_path, config.sample_rate):
                     if rms_check(chunk_path, config.rms_silence_threshold):
                         chunk_files.append(chunk_path)
                         chunk_info.append((chunk_path, start, end, speaker, confidence, alternatives))
                     else:
-                        # Silent chunk, skip
+                        # Silent chunk, skip - but still count towards progress
                         try:
                             os.remove(chunk_path)
                         except OSError:
                             pass
 
             if not chunk_files:
+                # No chunks to process in this batch, but still advance progress by batch duration
+                processed_duration += batch_duration
                 if progress_bar is not None:
-                    progress_bar.update(len(batch))
+                    new_displayed = int(round(processed_duration))
+                    step = new_displayed - displayed_duration
+                    if step > 0:
+                        progress_bar.update(step)
+                        displayed_duration = new_displayed
                 continue
 
             # Transcribe batch
@@ -1124,8 +1135,17 @@ async def transcribe_file(
                     except OSError:
                         pass
             
+            processed_duration += batch_duration
             if progress_bar is not None:
-                progress_bar.update(len(batch))
+                new_displayed = int(round(processed_duration))
+                step = new_displayed - displayed_duration
+                if step > 0:
+                    progress_bar.update(step)
+                    displayed_duration = new_displayed
+
+        # Ensure we reach exactly 100% on the progress bar upon completion
+        if progress_bar is not None and displayed_duration < progress_bar.total:
+            progress_bar.update(progress_bar.total - displayed_duration)
         
         # Write output
         writer.write()

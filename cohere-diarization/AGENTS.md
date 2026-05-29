@@ -3,6 +3,54 @@
 ## Project Overview
 This is a custom ONNX-based speaker diarization pipeline with voiceprint recognition.
 
+## Code Structure
+
+The codebase is organized into specialized modules:
+
+### Core Modules
+- **`server.py`** (80 lines) — Thin FastAPI app: lifespan, endpoints, middleware wiring
+- **`settings.py`** — Application settings (Pydantic BaseSettings) and logging configuration
+- **`model_state.py`** — Global model state (encoder, decoder, VAD, embeddings) and KV cache pool
+- **`model_loader.py`** — Model downloading and initialization (HuggingFace Hub integration)
+- **`transcriber.py`** — ASR inference (sync/async), hallucination cleaner, timeout wrapper
+
+### API Package (`api/`)
+- **`schemas.py`** — Pydantic request/response models for all endpoints
+- **`security.py`** — API key authentication and path validation
+- **`exceptions.py`** — Custom exception hierarchy and FastAPI error handlers
+- **`middleware.py`** — Request logging, CORS, rate limiting setup
+
+### Diarization Package (`diarization/`)
+- **`pipeline.py`** — `Diarizer` class: full VAD → embed → cluster → match → refine pipeline
+- **`clustering.py`** — Greedy merge, cluster capping, known-speaker matching logic
+- **`segment_ops.py`** — Segment post-processing: collapse, absorb islands, eliminate ghosts
+
+### Speaker Package (`speaker/`)
+Pre-existing utilities:
+- **`audio.py`** — fbank extraction, sliding windows, boundary refinement
+- **`vad.py`** — Silero VAD wrappers (chunked, ONNX, energy-dip splitting)
+- **`profiling.py`** — Pitch/energy extraction, relabeling by pitch
+- **`matcher.py`** — Voiceprint distance computation (embedding + pitch + energy)
+- **`embedding.py`** — ONNX embedding extraction, batch processing
+
+### Streaming
+- **`streaming.py`** — WebSocket endpoint for dual-channel real-time transcription + diarization
+
+### Import Chain
+```
+server.py
+├── settings → model_state → model_loader
+├── transcriber → api/exceptions
+├── diarization → diarization/pipeline → diarization/clustering → speaker/*
+└── streaming → transcriber + diarization/segment_ops + speaker/*
+```
+
+### Adding New Features
+- **New endpoint**: Add to `server.py`, create schema in `api/schemas.py`
+- **New pipeline stage**: Add method to `Diarizer` class in `diarization/pipeline.py`
+- **New segment operation**: Add function to `diarization/segment_ops.py`
+- **New clustering logic**: Add to `diarization/clustering.py`
+
 ## Server Management
 
 ### Starting the Server
