@@ -202,13 +202,14 @@ def load_models(settings: Settings):
             providers=["CPUExecutionProvider"]
         )
     
+    cpu_opts = ort.SessionOptions()
+    cpu_opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+
     log.info("loading_decoder_model")
     try:
         # Decoder: Use CPU provider due to DirectML compatibility issues with multi-head attention
         # DirectML has known issues with certain attention patterns in this model configuration
         # CPU execution is still very fast for token-by-token generation
-        cpu_opts = ort.SessionOptions()
-        cpu_opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
 
         cohere_decoder = ort.InferenceSession(
             str(model_dir / f"onnx/decoder_model_merged{settings.decoder_model_type}.onnx"),
@@ -243,22 +244,13 @@ def load_models(settings: Settings):
         # Direct loading of the optimized VAD session
         state.vad_session = ort.InferenceSession(
             vad_onnx_path,
-            sess_options=opts,
-            providers=providers,
-            provider_options=provider_options if provider_options else None
+            sess_options=cpu_opts,
+            providers=["CPUExecutionProvider"]
         )
-        log.info("vad_model_loaded", backend="onnx", provider=PROVIDER_SELECTION)
+        log.info("vad_model_loaded", provider="cpu")
     except Exception as e:
-        log.error("vad_loading_failed", error=str(e), fallback="CPU")
-        try:
-            state.vad_session = ort.InferenceSession(
-                vad_onnx_path,
-                providers=["CPUExecutionProvider"]
-            )
-            log.info("vad_model_loaded", backend="onnx", provider="CPU")
-        except Exception as e2:
-            log.error("vad_cpu_fallback_failed", error=str(e2))
-            raise
+        log.error("vad_cpu_load_failed", error=str(e))
+        raise
     
     # Load embedding model with iGPU using ensure_embedding_model
     log.info("loading_embedding_model")

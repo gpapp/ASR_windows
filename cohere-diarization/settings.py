@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     provider_type: str = "DirectML"  # Options: "DirectML", "OpenVINO", "CPU"
     model_repo: str = "onnx-community/cohere-transcribe-03-2026-ONNX"
     model_dir: Path = Path(__file__).parent.parent / "models/cohere-transcribe-onnx"
-    encoder_model_type: str = "_fp16"  # options: _fp16, _quantized, _q4, _q4f16, 
+    encoder_model_type: str = ""  # options: _fp16, _quantized, _q4, _q4f16, 
     encoder_dtype: type = np.float16 if encoder_model_type in ["_fp16", "_q4f16"] else np.float32 if encoder_model_type in ["_quantized", "_q4"] else np.float32
 
     # Decoder model ALWAYS on CPU for maximum compatibility, as it's only used for short sequences and token-by-token 
@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     # q4           DNF      2212s       1737s       Extremely slow on all, not recommended
 
     # VAD model settings
+    # VAD models are always run on CPU for maximum compatibility, as they are only used for short audio chunks and we want to avoid any DirectML issues. We can still use quantized/FP16 models for VAD to save memory, but we'll run them on CPU.
     vad_model_repo: str = Field(default="onnx-community/silero-vad", description="HuggingFace repo for the Silero VAD model")
     vad_model_dir: Path = Path(__file__).parent.parent / "models/silero-vad-onnx"
     vad_model_type: str = ""  # options: _bnb4, _fp16, _int8, _uint8, _quantized, _q4, _q4f16, 

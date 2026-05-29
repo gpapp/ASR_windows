@@ -189,7 +189,7 @@ class Diarizer:
             end_sample = int(ts['end'] * 16000)
             segment_wav = waveform_tensor[:, start_sample:end_sample]
             
-            windows, start_times = generate_sliding_windows(segment_wav, 16000, window_sec=2.0, stride_sec=0.75)
+            windows, start_times = generate_sliding_windows(segment_wav, 16000, window_sec=2.0, stride_sec=1.2)
             
             for w, rel_start in zip(windows, start_times):
                 chunk_duration = w.shape[-1] / 16000
@@ -211,38 +211,74 @@ class Diarizer:
         return all_fbanks, all_segments_meta, embeddable_indices
     
     def _extract_embeddings(self, all_fbanks, queue, loop):
-        """Extract speaker embeddings via ONNX."""
+        """Extract speaker embeddings via ONNX with memory cache."""
         loop.call_soon_threadsafe(queue.put_nowait, json.dumps({
             "type": "progress", "step": "Embedding Extraction", "completed": 0, "total": 1
         }))
         
-        # Apply CMN per sub-segment (critical for ECAPA-TDNN)
-        max_len = max(fb.shape[1] for fb in all_fbanks)
+        import hashlib
         
-        padded_fbanks = []
-        for fb in all_fbanks:
-            if fb.shape[1] < max_len:
-                fb_padded = torch.nn.functional.pad(fb, (0, 0, 0, max_len - fb.shape[1]))
-            else:
-                fb_padded = fb
-            padded_fbanks.append(fb_padded)
+        # Hash each unpadded filterbank to uniquely identify the audio chunk
+        fb_hashes = [hashlib.md5(fb.numpy().tobytes()).hexdigest() for fb in all_fbanks]
         
-        batch = torch.stack(padded_fbanks, dim=0)  # [N, 1, max_len, 80]
-        cmn_batch = batch - batch.mean(dim=2, keepdim=True)  # CMN on all at once
+        # Check cache for existing embeddings
+        cached_embeddings = {}
+        miss_indices = []
         
-        # Ensure explicit float32 dtype for iGPU execution
-        batch_fbanks = cmn_batch.squeeze(1).numpy().astype(np.float32)  # [N, max_len, 80]
+        with self.state.lock:
+            for idx, h in enumerate(fb_hashes):
+                if h in self.state.embedding_cache:
+                    cached_embeddings[idx] = self.state.embedding_cache[h]
+                else:
+                    miss_indices.append(idx)
         
-        raw_embeddings = []
-        batch_size = 32
-        for i in range(0, len(batch_fbanks), batch_size):
-            audio_input = batch_fbanks[i:i+batch_size].astype(np.float32)
-            out = self.state.embedding_session.run(None, {"feats": audio_input})
-            raw_embeddings.append(out[0])
+        # If we have cache misses, compute them via ONNX in batch
+        if miss_indices:
+            miss_fbanks = [all_fbanks[idx] for idx in miss_indices]
+            
+            # Apply CMN per sub-segment (critical for ECAPA-TDNN)
+            max_len = max(fb.shape[1] for fb in miss_fbanks)
+            padded_fbanks = []
+            for fb in miss_fbanks:
+                if fb.shape[1] < max_len:
+                    fb_padded = torch.nn.functional.pad(fb, (0, 0, 0, max_len - fb.shape[1]))
+                else:
+                    fb_padded = fb
+                padded_fbanks.append(fb_padded)
+            
+            batch = torch.stack(padded_fbanks, dim=0)  # [N_miss, 1, max_len, 80]
+            cmn_batch = batch - batch.mean(dim=2, keepdim=True)  # CMN on all at once
+            
+            # Ensure explicit float32 dtype for iGPU execution
+            batch_fbanks = cmn_batch.squeeze(1).numpy().astype(np.float32)  # [N_miss, max_len, 80]
+            
+            computed_embeddings = []
+            batch_size = 32
+            for i in range(0, len(batch_fbanks), batch_size):
+                audio_input = batch_fbanks[i:i+batch_size].astype(np.float32)
+                out = self.state.embedding_session.run(None, {"feats": audio_input})
+                computed_embeddings.append(out[0])
+            
+            computed_embeddings = np.concatenate(computed_embeddings, axis=0)
+            
+            # Store newly computed embeddings in the global cache
+            with self.state.lock:
+                for local_idx, idx in enumerate(miss_indices):
+                    emb = computed_embeddings[local_idx]
+                    h = fb_hashes[idx]
+                    self.state.embedding_cache[h] = emb
+                    cached_embeddings[idx] = emb
         
-        raw_embeddings = np.concatenate(raw_embeddings, axis=0)  # [N_long, D]
+        # Reconstruct the full sequence of raw embeddings from cache/computed
+        raw_embeddings = np.array([cached_embeddings[idx] for idx in range(len(all_fbanks))])
+        
+        # Perform L2-normalization
         norms = np.linalg.norm(raw_embeddings, axis=1, keepdims=True)
         raw_embeddings = raw_embeddings / np.maximum(norms, 1e-12)
+        
+        # Log cache efficiency
+        hits = len(all_fbanks) - len(miss_indices)
+        log.info("embedding_cache_status", total=len(all_fbanks), hits=hits, misses=len(miss_indices))
         
         loop.call_soon_threadsafe(queue.put_nowait, json.dumps({
             "type": "progress", "step": "Embedding Extraction", "completed": 1, "total": 1

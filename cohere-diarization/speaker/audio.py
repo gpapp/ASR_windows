@@ -63,9 +63,9 @@ def refine_speaker_boundaries(
     embedding_session,
     cluster_centroids: dict,
     sample_rate: int = 16000,
-    search_sec: float = 1.5,
+    search_sec: float = 1.2,
     sub_window_sec: float = 0.5,
-    sub_stride_sec: float = 0.1,
+    sub_stride_sec: float = 0.2,
     min_segment_dur: float = 0.3,
 ) -> list[dict]:
     """Refine speaker boundaries after initial clustering.
@@ -157,18 +157,44 @@ def refine_speaker_boundaries(
         return refined
 
     # ------------------------------------------------------------------ #
-    # Pass 2: single batched ONNX inference over all sub-windows.
+    # Pass 2: single batched ONNX inference over all sub-windows with cache.
     # ------------------------------------------------------------------ #
-    max_len = max(fb.shape[1] for fb in all_fbanks)
-    padded  = []
-    for fb in all_fbanks:
-        if fb.shape[1] < max_len:
-            fb = torch.nn.functional.pad(fb, (0, 0, 0, max_len - fb.shape[1]))
-        padded.append(fb.squeeze(0))                     # [T, 80]
+    from model_state import state
+    import hashlib
 
-    # Ensure explicit float32 dtype for iGPU execution
-    batch    = torch.stack(padded).numpy().astype(np.float32)               # [N, T, 80]
-    raw_embs = embedding_session.run(None, {input_name: batch})[0]  # [N, D]
+    # Hash each sub-window filterbank to uniquely identify it
+    fb_hashes = [hashlib.md5(fb.numpy().tobytes()).hexdigest() for fb in all_fbanks]
+
+    cached_embeddings = {}
+    miss_indices = []
+
+    with state.lock:
+        for idx, h in enumerate(fb_hashes):
+            if h in state.embedding_cache:
+                cached_embeddings[idx] = state.embedding_cache[h]
+            else:
+                miss_indices.append(idx)
+
+    if miss_indices:
+        miss_fbanks = [all_fbanks[idx] for idx in miss_indices]
+        max_len = max(fb.shape[1] for fb in miss_fbanks)
+        padded = []
+        for fb in miss_fbanks:
+            if fb.shape[1] < max_len:
+                fb = torch.nn.functional.pad(fb, (0, 0, 0, max_len - fb.shape[1]))
+            padded.append(fb.squeeze(0))
+
+        batch = torch.stack(padded).numpy().astype(np.float32)
+        raw_embs_miss = embedding_session.run(None, {input_name: batch})[0]
+
+        with state.lock:
+            for local_idx, idx in enumerate(miss_indices):
+                emb = raw_embs_miss[local_idx]
+                h = fb_hashes[idx]
+                state.embedding_cache[h] = emb
+                cached_embeddings[idx] = emb
+
+    raw_embs = np.array([cached_embeddings[idx] for idx in range(len(all_fbanks))])
     norms    = np.linalg.norm(raw_embs, axis=1, keepdims=True)
     embs     = raw_embs / np.maximum(norms, 1e-12)       # L2-normalised
 

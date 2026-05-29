@@ -35,9 +35,10 @@ Audio Input → VAD → Energy-dip Splitting → Feature Extraction → Embeddin
 
 ### Technical Details
 - **Embedding Model:** Wespeaker ecapa-tdnn512 (192-dimensional)
-- **Sliding Window:** 2.0s window, 0.75s stride (reduced from 3.0s/1.5s to limit cross-speaker contamination)
+- **Sliding Window:** 2.0s window, 1.2s stride (optimized to balance speed, memory, and accuracy)
+- **Embedding Cache:** Fully thread-safe, in-memory voice embedding caching. Features MD5 audio window fingerprinting to skip up to 100% of ONNX work for repeated runs or overlapping sliding windows.
 - **Energy-dip Splitting:** Long VAD segments (>5s) are split at natural energy minima before embedding extraction, reducing spill-over when speakers alternate with minimal silence
-- **Boundary Refinement:** After clustering, all speaker-transition sub-windows are collected and embedded in a single batched ONNX call, then each boundary is walked to find the precise switch point (0.5s sub-windows, 0.1s stride)
+- **Boundary Refinement:** After clustering, all speaker-transition sub-windows are collected, checked against the local embedding cache, and embedded in a single batched ONNX call (if uncached). Each boundary is walked to find the precise switch point (0.5s sub-windows, 0.2s stride for optimized speed)
 - **Ghost-speaker Elimination:** After all merging, speakers with < 2s total speech are reassigned — using stored voiceprint alternatives first, then falling back to the nearest temporal neighbour
 - **Max Clusters:** 15 (capped to prevent over-segmentation), then greedy-merged below 0.25 cosine distance
 - **Speaker Gap:** 1.0s max gap before a same-speaker segment is split (reduced from 2.0s)

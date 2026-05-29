@@ -109,6 +109,7 @@ class ModelState:
         self.device: str = "cpu"
         self.status: str = "initializing"
         self.kv_pool: Optional[KVCachePool] = None
+        self.embedding_cache: dict[str, np.ndarray] = {}
         self.lock = threading.Lock()
     
     @property

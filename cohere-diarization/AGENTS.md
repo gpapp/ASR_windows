@@ -177,12 +177,12 @@ Uses `Wespeaker/wespeaker-ecapa-tdnn512-LM` for speaker embeddings (192-dimensio
 ### Diarization Pipeline
 1. **VAD** — Silero VAD (ONNX/DirectML with CPU fallback) detects speech segments, chunked in 30s with 5s overlap.
 2. **Energy-dip splitting** (`speaker/vad.py:split_at_energy_dips`) — Long segments (>5s) are split at local RMS energy minima (dip_ratio=0.35, min_dip_dur=0.15s) to reduce cross-speaker window contamination.
-3. **Sliding-window embedding** (`speaker/audio.py:generate_sliding_windows`) — 2.0s windows, 0.75s stride. CMN applied per window inside `extract_embedding`.
+3. **Sliding-window embedding** (`speaker/audio.py:generate_sliding_windows`) — 2.0s windows, 1.2s stride. Check global in-memory embedding cache (using MD5 audio fingerprints) first to avoid redundant ONNX passes. CMN applied per window inside `extract_embedding`.
 4. **Agglomerative clustering** — Default cosine threshold 0.35, max 15 clusters.
 5. **Greedy merge** — Clusters with centroid cosine distance < 0.25 are merged.
 6. **Speaker profiling** (`speaker/profiling.py:profile_speakers`) — Autocorrelation pitch + RMS energy per speaker.
 7. **Relabelling** (`speaker/profiling.py:relabel_by_pitch`) — SPEAKER1 = lowest pitch, ascending.
-8. **Boundary refinement** (`speaker/audio.py:refine_speaker_boundaries`) — All transition sub-windows across the entire file are collected first, then embedded in a single batched ONNX call. Each boundary is then walked to the precise speaker-switch point (0.5s sub-windows, 0.1s stride).
+8. **Boundary refinement** (`speaker/audio.py:refine_speaker_boundaries`) — All transition sub-windows across the entire file are collected first, checked against the global embedding cache (to skip matching sub-windows), and remaining sub-windows are embedded in a single batched ONNX call. Each boundary is then walked to the precise speaker-switch point (0.5s sub-windows, 0.2s stride).
 9. **Island absorption** — Isolated segments < 1.0s surrounded by the same speaker are absorbed.
 10. **Voiceprint matching** (`speaker/matcher.py`) — Combined distance (emb 0.7 + pitch 0.2 + energy 0.1); clear winner gap 0.02.
 11. **Ghost-speaker elimination** — Speakers with < 2s total speech across the whole file are reassigned: stored voiceprint alternatives are tried first; if none qualify, the segment is merged into the nearest temporal neighbour. Adjacent same-speaker segments are then re-collapsed.
