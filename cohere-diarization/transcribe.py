@@ -939,7 +939,7 @@ async def transcribe_file(
                         continue
                     
                     avg_conf = speaker_confidence_sum.get(spk, 0.0) / max(1, speaker_counts.get(spk, 1))
-                    if avg_conf < 0.8:
+                    if avg_conf < 0.7:
                         continue
                     
                     # Extract clean audio for this speaker

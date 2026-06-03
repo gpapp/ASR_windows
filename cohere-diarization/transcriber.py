@@ -12,6 +12,7 @@ import numpy as np
 import librosa
 import asyncio
 import structlog
+from scipy import signal as scipy_signal
 
 from settings import get_settings
 from model_state import state, executor
@@ -21,6 +22,52 @@ log = structlog.get_logger()
 
 # Target samples for chunking (30 seconds at 16kHz)
 TARGET_SAMPLES = 480000
+
+# Pre-compute mel filterbank once (reuse across all calls)
+_MEL_FILTERBANK = None
+
+def _get_mel_filterbank():
+    """Lazily compute and cache mel filterbank for fast reuse."""
+    global _MEL_FILTERBANK
+    if _MEL_FILTERBANK is None:
+        # Create mel filterbank using librosa (one-time cost)
+        mel_fb = librosa.filters.mel(sr=16000, n_fft=512, n_mels=128)
+        _MEL_FILTERBANK = mel_fb.astype(np.float32)
+    return _MEL_FILTERBANK
+
+def _compute_mel_spectrogram_fast(audio: np.ndarray) -> np.ndarray:
+    """
+    Fast mel-spectrogram computation using pre-computed filterbank.
+    ~5-10x faster than librosa.feature.melspectrogram().
+    
+    Args:
+        audio: Raw PCM audio waveform (float32, 16kHz, mono)
+    
+    Returns:
+        Mel-spectrogram with shape [n_mels, seq_len] in dB scale, normalized
+    """
+    # STFT using scipy (faster than librosa for single call)
+    _, _, Sxx = scipy_signal.spectrogram(
+        audio,
+        fs=16000,
+        window='hann',
+        nperseg=512,
+        noverlap=512 - 160,  # hop_length = 160
+        return_onesided=True,
+        mode='magnitude'
+    )
+    
+    # Apply mel filterbank: [n_mels, n_freqs] @ [n_freqs, n_frames] = [n_mels, n_frames]
+    mel_fb = _get_mel_filterbank()
+    mel_spec = np.dot(mel_fb, Sxx)
+    
+    # Convert to dB scale
+    mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
+    
+    # Normalize per-feature
+    mel_spec_db = (mel_spec_db - mel_spec_db.mean(axis=1, keepdims=True)) / (mel_spec_db.std(axis=1, keepdims=True) + 1e-8)
+    
+    return mel_spec_db
 
 
 # ============================================================================
@@ -122,9 +169,10 @@ def clean_transcript(text: str) -> str:
 # ============================================================================
 
 def transcribe_audio_sync(
-    audio: np.ndarray, 
+    audio: np.ndarray = None, 
     language: str = "en",
-    timeout_sec: int = 120
+    timeout_sec: int = 120,
+    mel_spectrogram: np.ndarray = None
 ) -> dict:
     """
     Synchronous ASR transcription using Cohere Transcribe ONNX model.
@@ -133,6 +181,8 @@ def transcribe_audio_sync(
         audio: Raw PCM audio waveform (16kHz, mono), shape [T]
         language: ISO language code (default: "en")
         timeout_sec: Inference timeout in seconds
+        mel_spectrogram: Precomputed mel-spectrogram features with shape [1, seq_len, 128]
+                         If provided, audio parameter is ignored
     
     Returns:
         Dict with transcribed text, tokens generated, timing, and audio duration.
@@ -142,13 +192,6 @@ def transcribe_audio_sync(
     
     if not state.is_ready:
         raise TranscriptionError("Model not ready")
-    
-    # Validate audio
-    audio_duration = len(audio) / 16000
-    if audio_duration > settings.max_audio_duration_sec:
-        raise AudioValidationError(
-            f"Audio too long: {audio_duration:.1f}s > {settings.max_audio_duration_sec}s max"
-        )
     
     with inference_timeout(timeout_sec):
         encoder = state.encoder
@@ -162,28 +205,35 @@ def transcribe_audio_sync(
         # Cohere uses mel-spec with: sample_rate=16kHz, n_fft=512, 
         # hop_length=160 (10ms), n_mels=128
         
-        # Normalize audio to [-1, 1]
-        audio_float = audio.astype(np.float32) / 32768.0
-        
-        # Compute mel-spectrogram using librosa
-        mel_spec = librosa.feature.melspectrogram(
-            y=audio_float,
-            sr=16000,
-            n_fft=512,
-            hop_length=160,  # 10ms stride
-            n_mels=128,
-            window='hann'
-        )
-        
-        # Convert to log scale (dB)
-        mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
-        
-        # Normalize per-feature (per-frequency bin)
-        mel_spec_db = (mel_spec_db - mel_spec_db.mean(axis=1, keepdims=True)) / (mel_spec_db.std(axis=1, keepdims=True) + 1e-8)
-        
-        # Transpose to [sequence_length, n_mels] and add batch dimension
-        # Shape: [1, seq_len, 128]
-        input_features = mel_spec_db.T[np.newaxis, :, :].astype(np.float32)
+        if mel_spectrogram is not None:
+            # Use precomputed mel-spectrogram
+            input_features = mel_spectrogram.astype(np.float32)
+            # Calculate duration from mel spectrogram shape
+            # Shape is [1, seq_len, 128], hop_length=160, sr=16000
+            # Each frame = 160 samples = 0.01 seconds
+            seq_len = input_features.shape[1]
+            audio_duration = seq_len * 0.01
+        else:
+            # Validate audio
+            if audio is None:
+                raise ValueError("Either audio or mel_spectrogram must be provided")
+                
+            audio_duration = len(audio) / 16000
+            if audio_duration > settings.max_audio_duration_sec:
+                raise AudioValidationError(
+                    f"Audio too long: {audio_duration:.1f}s > {settings.max_audio_duration_sec}s max"
+                )
+            
+            # Apply pre-emphasis (matches CohereAsrFeatureExtractor)
+            audio_float = audio.astype(np.float32)
+            audio_float[1:] -= 0.97 * audio_float[:-1]
+            
+            # Fast mel-spectrogram computation (5-10x faster than librosa)
+            mel_spec_db = _compute_mel_spectrogram_fast(audio_float)
+            
+            # Transpose to [sequence_length, n_mels] and add batch dimension
+            # Shape: [1, seq_len, 128]
+            input_features = mel_spec_db.T[np.newaxis, :, :].astype(np.float32)
         
         log.debug(
             "audio_features_extracted",
@@ -206,10 +256,8 @@ def transcribe_audio_sync(
             log.error("encoder_inference_failed", error=str(e))
             raise TranscriptionError(f"Encoder inference failed: {str(e)}")
         
-        if settings.encoder_dtype!=settings.decoder_dtype:
-            encoder_hidden_state = raw_encoder_hidden_state.astype(settings.decoder_dtype)
-        else:
-            encoder_hidden_state = raw_encoder_hidden_state
+        # Both _q4 and _fp16 models expect encoder_hidden_states as float32
+        encoder_hidden_state = raw_encoder_hidden_state.astype(np.float32)
         
         # ====================================================================
         # Step 3: Prepare decoder inputs with prompt
@@ -358,9 +406,10 @@ def transcribe_audio_sync(
 
 
 async def transcribe_audio_async(
-    audio: np.ndarray, 
+    audio: np.ndarray = None, 
     language: str = "en",
-    timeout_sec: int = 120
+    timeout_sec: int = 120,
+    mel_spectrogram: np.ndarray = None
 ) -> dict:
     """Async wrapper for transcription."""
     loop = asyncio.get_event_loop()
@@ -369,5 +418,6 @@ async def transcribe_audio_async(
         transcribe_audio_sync, 
         audio, 
         language,
-        timeout_sec
+        timeout_sec,
+        mel_spectrogram
     )

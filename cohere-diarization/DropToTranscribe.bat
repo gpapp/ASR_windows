@@ -11,7 +11,7 @@ if not exist ".venv\Scripts\python.exe" (
 )
 
 :: Default options - use voiceprints from parent folder if exists
-set DEFAULT_ARGS=--diarization-threshold 0.7
+set DEFAULT_ARGS=--diarization-threshold 0.7 --post-process-unknowns
 set VOICEPRINTS_ARG=
 
 if exist "voiceprints.json" (
