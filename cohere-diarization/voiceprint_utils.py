@@ -11,8 +11,12 @@ Includes:
 """
 
 import json
+import os
+import re
 import subprocess
 import sys
+import tempfile
+import wave
 from pathlib import Path
 from typing import Optional
 
@@ -25,6 +29,43 @@ from tqdm import tqdm
 
 # Re-export from speaker module for backwards compatibility
 from speaker.embedding import extract_embedding, compute_pitch, compute_energy
+
+
+def extract_speaker_audio(wav_path: str, segments: list, speaker_name: str, output_path: str) -> bool:
+    """Extract concatenated audio for a specific speaker from segments."""
+    try:
+        with wave.open(wav_path, 'rb') as orig:
+            n_channels = orig.getnchannels()
+            sample_width = orig.getsampwidth()
+            frame_rate = orig.getframerate()
+            orig_frames = orig.readframes(orig.getnframes())
+        
+        # Filter segments for this speaker
+        speaker_segments = [s for s in segments if s["speaker"] == speaker_name]
+        if not speaker_segments:
+            return False
+        
+        # Extract audio chunks for this speaker
+        audio_chunks = []
+        for seg in speaker_segments:
+            start_frame = int(seg["start"] * frame_rate)
+            end_frame = int(seg["end"] * frame_rate)
+            chunk_size = sample_width * n_channels
+            start_byte = start_frame * chunk_size
+            end_byte = end_frame * chunk_size
+            audio_chunks.append(orig_frames[start_byte:end_byte])
+        
+        # Write concatenated audio
+        with wave.open(output_path, 'wb') as out:
+            out.setnchannels(n_channels)
+            out.setsampwidth(sample_width)
+            out.setframerate(frame_rate)
+            out.writeframes(b''.join(audio_chunks))
+        
+        return True
+    except Exception as e:
+        print(f"[WARN] Failed to extract speaker audio: {e}")
+        return False
 
 
 def parse_time(time_str: str) -> float:
@@ -113,13 +154,9 @@ def get_embedding_session(settings) -> ort.InferenceSession:
     """Get cached ONNX embedding session. Creates once, reuses for all calls."""
     global _cached_embedding_session, _cached_embedding_path
     
-    from server import ensure_embedding_model
+    from model_loader import ensure_embedding_model
     
-    emb_path = ensure_embedding_model(
-        settings.embedding_model_repo,
-        settings.embedding_model_filename,
-        settings.hf_token
-    )
+    emb_path = ensure_embedding_model(settings)
     
     # Return cached session if already created for this path
     if _cached_embedding_session is not None and _cached_embedding_path == emb_path:
@@ -596,6 +633,173 @@ def extract_speaker_segments(
     return extracted
 
 
+def extract_missing_voiceprints(
+    audio_file: str,
+    diarization_file: str,
+    voiceprints_file: Path,
+    output_file: Optional[Path] = None,
+    min_duration: float = 30.0,
+    min_confidence: float = 0.7,
+) -> tuple[dict, dict]:
+    """
+    Extract voiceprints for speakers in diarization that don't have existing voiceprints.
+    Implements the same logic as the --post-process-unknowns flag in transcribe.py.
+    
+    Args:
+        audio_file: Path to original audio/video file
+        diarization_file: Path to diarization JSON output
+        voiceprints_file: Path to voiceprints.json file
+        output_file: Path to save updated voiceprints (defaults to voiceprints_file)
+        min_duration: Minimum speaker duration in seconds (default: 30.0)
+        min_confidence: Minimum average confidence (default: 0.7)
+        
+    Returns:
+        Tuple of (updated_voiceprints, newly_identified_speakers) where:
+        - updated_voiceprints: Dict of all voiceprints (original + newly added)
+        - newly_identified_speakers: Dict of only the speakers identified and added in this run
+    """
+    from settings import Settings
+    from speaker.embedding import extract_embedding
+    
+    audio_file = Path(audio_file)
+    diarization_file = Path(diarization_file)
+    voiceprints_file = Path(voiceprints_file)
+    if output_file is None:
+        output_file = voiceprints_file
+    
+    # Load diarization
+    with open(diarization_file, "r", encoding="utf-8") as f:
+        diarization = json.load(f)
+    
+    segments = diarization.get("segments", [])
+    if not segments:
+        print(f"[WARN] No segments found in {diarization_file}")
+        return load_voiceprints(voiceprints_file)
+    
+    # Load existing voiceprints
+    existing_vp = load_voiceprints(voiceprints_file)
+    
+    # Identify speakers in diarization
+    speaker_durations = {}
+    speaker_confidence_sum = {}
+    speaker_counts = {}
+    
+    for seg in segments:
+        spk = seg.get("speaker", "")
+        if not spk:
+            continue
+            
+        dur = seg.get("end", 0) - seg.get("start", 0)
+        conf = float(seg.get("confidence", 0.5))
+        
+        speaker_durations[spk] = speaker_durations.get(spk, 0.0) + dur
+        speaker_confidence_sum[spk] = speaker_confidence_sum.get(spk, 0.0) + conf
+        speaker_counts[spk] = speaker_counts.get(spk, 0) + 1
+    
+    # Identify unknown speakers (not in existing voiceprints)
+    known_speakers = set(existing_vp.keys())
+    unknown_speakers = set(speaker_durations.keys()) - known_speakers
+    
+    print(f"[INFO] Found {len(known_speakers)} known speakers: {sorted(known_speakers)}")
+    print(f"[INFO] Found {len(unknown_speakers)} unknown speakers: {sorted(unknown_speakers)}")
+    
+    if not unknown_speakers:
+        print(f"[INFO] No unknown speakers to process")
+        return existing_vp
+    
+    # Process each unknown speaker
+    updated = False
+    filename_prefix = re.sub(r'[^a-zA-Z0-9_-]', '_', audio_file.stem)
+    
+    for spk in unknown_speakers:
+        # Check quality gates
+        total_dur = speaker_durations.get(spk, 0.0)
+        if total_dur < min_duration:
+            print(f"[SKIP] Speaker {spk}: duration {total_dur:.1f}s < {min_duration}s")
+            continue
+        
+        avg_conf = speaker_confidence_sum.get(spk, 0.0) / max(1, speaker_counts.get(spk, 1))
+        if avg_conf < min_confidence:
+            print(f"[SKIP] Speaker {spk}: confidence {avg_conf:.2%} < {min_confidence:.0%}")
+            continue
+        
+        # Extract clean audio for this speaker
+        print(f"[INFO] Extracting audio for unknown speaker {spk} ({total_dur:.1f}s, {avg_conf:.2%} confidence)...")
+        
+        # Create temporary WAV file for extracted speaker audio
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_wav:
+            speaker_temp_path = tmp_wav.name
+        
+        try:
+            # Load original audio
+            wav_path = ensure_wav(audio_file)
+            
+            # Extract speaker audio
+            if not extract_speaker_audio(str(wav_path), segments, spk, speaker_temp_path):
+                print(f"[WARN] Failed to extract audio for speaker {spk}")
+                continue
+            
+            # Compute embedding locally (instead of calling server)
+            print(f"[INFO] Computing embedding for speaker {spk}...")
+            waveform, sample_rate = load_audio_segment(speaker_temp_path, 0, None)
+            
+            settings = Settings()
+            embedding_session = init_embedding_session(settings)
+            embedding = extract_embedding(waveform, sample_rate, embedding_session)
+            
+            if embedding is None:
+                print(f"[WARN] Failed to compute embedding for speaker {spk}")
+                continue
+            
+            # Compute pitch and energy
+            pitch, pitch_std = compute_pitch(waveform, sample_rate)
+            energy = compute_energy(waveform)
+            
+            # Generate persistent speaker name
+            existing_names = [n for n in existing_vp.keys() if n.startswith(f"{filename_prefix}_post_SPEAKER")]
+            next_n = len(existing_names) + 1
+            persistent_name = f"{filename_prefix}_post_SPEAKER_{next_n}"
+            
+            # Create voiceprint entry
+            voiceprint_entry = {
+                "pitch_hz": round(pitch, 1) if pitch > 0 else 0.0,
+                "pitch_std": round(pitch_std, 1),
+                "energy_rms": round(energy, 4),
+                "total_speech_sec": round(total_dur, 1),
+                "embedding": embedding,
+            }
+            
+            existing_vp[persistent_name] = voiceprint_entry
+            newly_identified[persistent_name] = voiceprint_entry
+            updated = True
+            print(f"[INFO] Added post-processed voiceprint: {persistent_name} (dur={total_dur:.1f}s, conf={avg_conf:.2%})")
+            
+        except Exception as e:
+            print(f"[WARN] Failed to process speaker {spk}: {e}")
+        finally:
+            # Clean up temp file
+            try:
+                os.unlink(speaker_temp_path)
+            except:
+                pass
+    
+    # Keep track of newly identified speakers
+    newly_identified = {}
+    
+    # Save updated voiceprints if any were added
+    if updated:
+        try:
+            save_voiceprints(existing_vp, output_file)
+            print(f"[INFO] Updated voiceprints saved to {output_file}")
+        except Exception as e:
+            print(f"[WARN] Failed to save voiceprints: {e}")
+    else:
+        print(f"[INFO] No voiceprints were added")
+    
+    # Return both the updated voiceprints and the newly identified speakers
+    return existing_vp, newly_identified
+
+
 def refine_voiceprint_from_segments(
     voiceprints_file: Path,
     speaker_name: str,
@@ -620,7 +824,8 @@ def refine_voiceprint_from_segments(
     Returns:
         Updated voiceprint dict
     """
-    from server import Settings, state
+    from settings import Settings
+    from model_loader import ensure_embedding_model, state
     from speaker.embedding import batch_embed_files
 
     voiceprints = load_voiceprints(voiceprints_file)

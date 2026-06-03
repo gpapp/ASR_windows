@@ -22,6 +22,10 @@ Usage:
     python voiceprint_mgmt.py mass_refine segments/ --voiceprints voiceprints.json
     python voiceprint_mgmt.py mass_refine segments/ --voiceprints voiceprints.json --skip-existing  # Skip existing
 
+    # Extract voiceprints for unknown speakers from diarization (same logic as --post-process-unknowns):
+    python voiceprint_mgmt.py extract-missing meeting.mp4 diarization.json --voiceprints voiceprints.json
+    python voiceprint_mgmt.py extract-missing meeting.mp4 diarization.json --min-duration 20 --min-confidence 0.6
+
     # Create new voiceprint from audio segment:
     python voiceprint_mgmt.py create meeting.mp4 00:05:30 00:06:15 "John"
 
@@ -43,6 +47,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from voiceprint_utils import (
     extract_speaker_segments,
     refine_voiceprint_from_segments,
+    extract_missing_voiceprints,
     parse_time,
     format_time,
     ensure_wav,
@@ -54,7 +59,7 @@ from voiceprint_utils import (
     load_voiceprints,
     save_voiceprints,
 )
-from server import Settings
+from settings import Settings
 
 
 def format_time_short(seconds: float) -> str:
@@ -772,6 +777,120 @@ def cmd_mass_refine(args):
     print(f"\n[SUCCESS] Summary: {success_count} succeeded, {error_count} errors")
 
 
+def cmd_extract_missing(args):
+    """Extract voiceprints for unknown speakers from diarization."""
+    import asyncio
+    import aiohttp
+    from voiceprint_utils import extract_missing_voiceprints, load_voiceprints
+    from transcribe import TranscriptionClient, Config
+    
+    audio_path = Path(args.audio)
+    if not audio_path.exists():
+        print(f"[ERROR] Audio file not found: {audio_path}")
+        sys.exit(1)
+    
+    # If diarize file is not provided, run diarization via server
+    if not args.diarize:
+        print(f"[INFO] No diarization file provided - running diarization via server...")
+        
+        # Load config
+        config = Config()
+        if args.server:
+            config.server_url = args.server
+        if args.api_key:
+            config.api_key = args.api_key
+            
+        # Override config from environment if needed
+        config = Config.from_env()
+        
+        # Run diarization
+        async def run_diarization():
+            client = TranscriptionClient(config)
+            try:
+                # Check server health
+                if not await client.health_check():
+                    print(f"[ERROR] Server not ready at {config.server_url}")
+                    print("[INFO] Start the server with: python server.py")
+                    return None
+                
+                # Get diarization
+                print(f"[INFO] Running diarization on {audio_path.name}...")
+                diarize_segments, speaker_profiles = await client.diarize_path(str(audio_path))
+                
+                if not diarize_segments:
+                    print(f"[WARN] Diarization returned no segments")
+                    return None
+                
+                # Save diarization to temporary file
+                import tempfile
+                import json
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+                    diarization_data = {
+                        "segments": diarize_segments,
+                        "profiles": speaker_profiles
+                    }
+                    json.dump(diarization_data, f, indent=2)
+                    diarization_path = Path(f.name)
+                
+                print(f"[INFO] Diarization completed and saved to {diarization_path}")
+                return diarization_path, client
+            except Exception as e:
+                print(f"[ERROR] Diarization failed: {e}")
+                return None
+        
+        # Run the async function
+        result = asyncio.run(run_diarization())
+        if result is None:
+            sys.exit(1)
+        
+        diarization_path, client = result
+        cleanup_temp_file = True
+    else:
+        diarization_path = Path(args.diarize)
+        if not diarization_path.exists():
+            print(f"[ERROR] Diarization file not found: {diarization_path}")
+            sys.exit(1)
+        cleanup_temp_file = False
+        client = None
+    
+    voiceprints_path = Path(args.voiceprints)
+    output_path = Path(args.output) if args.output else voiceprints_path
+    
+    print(f"[INFO] Extracting missing voiceprints from {diarization_path.name}")
+    print(f"[INFO] Using audio: {audio_path.name}")
+    print(f"[INFO] Voiceprints: {voiceprints_path.name}")
+    print(f"[INFO] Output: {output_path.name}")
+    
+    updated_voiceprints, newly_identified = extract_missing_voiceprints(
+        audio_file=str(audio_path),
+        diarization_file=str(diarization_path),
+        voiceprints_file=voiceprints_path,
+        output_file=output_path,
+        min_duration=args.min_duration,
+        min_confidence=args.min_confidence,
+    )
+    
+    # Cleanup temporary diarization file if we created one
+    if cleanup_temp_file and diarization_path.exists():
+        try:
+            diarization_path.unlink()
+            print(f"[INFO] Cleaned up temporary diarization file")
+        except:
+            pass
+    
+    # Close client if we created one
+    if client:
+        try:
+            asyncio.run(client.close())
+        except:
+            pass
+    
+    print(f"[SUCCESS] Processed {len(updated_voiceprints)} total voiceprints")
+    print(f"[SUCCESS] Added {len(newly_identified)} new voiceprints:")
+    for speaker_name in newly_identified.keys():
+        print(f"  - {speaker_name}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Voiceprint management utilities",
@@ -841,6 +960,18 @@ def main():
     p_add.add_argument("speaker", help="Speaker name")
     p_add.add_argument("segments", nargs="+", help="Pattern: file start end [file start end ...]")
     p_add.set_defaults(func=cmd_add)
+
+    # extract-missing subcommand
+    p_extract_missing = subparsers.add_parser("extract-missing", help="Extract voiceprints for unknown speakers from diarization")
+    p_extract_missing.add_argument("audio", help="Audio/video file")
+    p_extract_missing.add_argument("diarize", nargs="?", help="Diarization JSON file (optional - if not provided, will run diarization via server)")
+    p_extract_missing.add_argument("--voiceprints", default="voiceprints.json", help="Voiceprints JSON file")
+    p_extract_missing.add_argument("--output", help="Output voiceprints file (default: same as input)")
+    p_extract_missing.add_argument("--min-duration", type=float, default=30.0, help="Minimum speaker duration in seconds")
+    p_extract_missing.add_argument("--min-confidence", type=float, default=0.7, help="Minimum average confidence (0-1)")
+    p_extract_missing.add_argument("--server", "-s", default=None, help="Server URL (default: http://127.0.0.1:8000)")
+    p_extract_missing.add_argument("--api-key", "-k", default=None, help="API key for authentication")
+    p_extract_missing.set_defaults(func=cmd_extract_missing)
 
     args = parser.parse_args()
     args.func(args)
