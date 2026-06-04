@@ -353,6 +353,23 @@ def format_timestamp(seconds: float, fmt: str = "hms") -> str:
         return str(seconds)
 
 
+def format_duration_readable(seconds: float) -> str:
+    """Format seconds to human-readable duration (e.g., '1h 23m 45s' or '23m 45s')."""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    
+    parts = []
+    if hours > 0:
+        parts.append(f"{hours}h")
+    if minutes > 0:
+        parts.append(f"{minutes}m")
+    if secs > 0 or not parts:
+        parts.append(f"{secs}s")
+    
+    return " ".join(parts)
+
+
 # ============================================================================
 # HTTP Client
 # ============================================================================
@@ -807,16 +824,16 @@ async def transcribe_file(
     client: TranscriptionClient,
     progress_bar: Optional[tqdm] = None,
     args = None
-) -> Optional[str]:
+) -> Optional[dict]:
     """
     Transcribe a single audio/video file.
-    Returns path to output transcript file, or None on failure.
+    Returns dict with output_path, total_duration, and speaker_stats, or None on failure.
     """
     p = Path(input_path).resolve()
     
     if p.suffix.lower() not in config.supported_formats:
         log.warn(f"Unsupported format: {p.suffix}", file=p.name)
-        return None
+        return None  # Return None for errors
     
     pid = os.getpid()
     temp_dir = tempfile.mkdtemp(prefix="transcribe_")
@@ -901,7 +918,9 @@ async def transcribe_file(
                     log.warn(f"Failed to update voiceprints.json: {e}")
         
         # Post-process unknown speakers if requested
-        if args and getattr(args, 'post_process_unknowns', False) and diarize_segments and speaker_profiles:
+        # Allow running even when `speaker_profiles` is empty so we can attempt
+        # to extract voiceprints for unknowns that the server didn't embed.
+        if args and getattr(args, 'post_process_unknowns', False) and diarize_segments:
             voiceprints_path = Path("voiceprints.json")
             existing_vp = {}
             if voiceprints_path.exists():
@@ -912,7 +931,7 @@ async def transcribe_file(
                     pass
             
             # Identify unknown speakers (those without embeddings in current profiles)
-            known_speakers = set(speaker_profiles.keys())
+            known_speakers = set(speaker_profiles.keys()) if speaker_profiles else set()
             unknown_speakers = set(s["speaker"] for s in diarize_segments) - known_speakers
             
             if unknown_speakers:
@@ -939,7 +958,7 @@ async def transcribe_file(
                         continue
                     
                     avg_conf = speaker_confidence_sum.get(spk, 0.0) / max(1, speaker_counts.get(spk, 1))
-                    if avg_conf < 0.7:
+                    if avg_conf < 0.65:
                         continue
                     
                     # Extract clean audio for this speaker
@@ -1036,8 +1055,10 @@ async def transcribe_file(
 
         if progress_bar is not None:
             progress_bar.total = int(round(total_duration))
-            progress_bar.set_description(p.name[:30])
-            progress_bar.unit = "s"  # Time unit instead of segments
+            progress_bar.set_description(f"{p.name[:20]}")
+            progress_bar.unit = ""  # Remove default unit
+            # Display: processed/total | elapsed<remaining in human-readable format
+            progress_bar.bar_format = "{desc}: {percentage:.0f}% |{bar}| {postfix} ({elapsed}<{remaining})"
 
         # Clear output file and write speaker legend header if profiles available
         with open(output_path, "w", encoding="utf-8") as f:
@@ -1095,6 +1116,8 @@ async def transcribe_file(
                     new_displayed = int(round(processed_duration))
                     step = new_displayed - displayed_duration
                     if step > 0:
+                        postfix_str = f"{format_duration_readable(new_displayed)} / {format_duration_readable(progress_bar.total)}"
+                        progress_bar.set_postfix_str(postfix_str)
                         progress_bar.update(step)
                         displayed_duration = new_displayed
                 continue
@@ -1140,17 +1163,56 @@ async def transcribe_file(
                 new_displayed = int(round(processed_duration))
                 step = new_displayed - displayed_duration
                 if step > 0:
+                    postfix_str = f"{format_duration_readable(new_displayed)} / {format_duration_readable(progress_bar.total)}"
+                    progress_bar.set_postfix_str(postfix_str)
                     progress_bar.update(step)
                     displayed_duration = new_displayed
 
         # Ensure we reach exactly 100% on the progress bar upon completion
         if progress_bar is not None and displayed_duration < progress_bar.total:
+            postfix_str = f"{format_duration_readable(progress_bar.total)} / {format_duration_readable(progress_bar.total)}"
+            progress_bar.set_postfix_str(postfix_str)
             progress_bar.update(progress_bar.total - displayed_duration)
+        
+        # Collect speaker statistics
+        speaker_stats = {}
+        if diarize_segments:
+            for seg in diarize_segments:
+                spk = seg.get("speaker", "UNKNOWN")
+                if spk not in speaker_stats:
+                    speaker_stats[spk] = {
+                        "total_duration": 0.0,
+                        "segment_count": 0,
+                        "times_active": 0,
+                        "last_end": -1.0
+                    }
+                
+                duration = seg.get("end", 0) - seg.get("start", 0)
+                speaker_stats[spk]["total_duration"] += duration
+                speaker_stats[spk]["segment_count"] += 1
+                
+                # Count "times active" as number of contiguous speech blocks
+                current_start = seg.get("start", 0)
+                if current_start > speaker_stats[spk]["last_end"] + 0.5:  # 500ms gap threshold
+                    speaker_stats[spk]["times_active"] += 1
+                speaker_stats[spk]["last_end"] = seg.get("end", 0)
+            
+            # Calculate percentages
+            total_audio_duration = total_duration
+            for spk in speaker_stats:
+                duration = speaker_stats[spk]["total_duration"]
+                speaker_stats[spk]["percentage"] = (duration / total_audio_duration * 100) if total_audio_duration > 0 else 0
+                del speaker_stats[spk]["last_end"]  # Remove temporary field
         
         # Write output
         writer.write()
         log.success(f"Saved: {output_path}")
-        return output_path
+        
+        return {
+            "output_path": output_path,
+            "total_duration": total_duration,
+            "speaker_stats": speaker_stats
+        }
         
     except Exception as e:
         log.error(f"Failed to process {p.name}: {e}")
@@ -1184,32 +1246,77 @@ async def transcribe_files(input_paths: list[str], config: Config, args):
         
         # Process files
         results = []
+        file_times = []  # Track processing time per file
         
         for input_path in input_paths:
-            with tqdm(unit="seg", leave=True, dynamic_ncols=True) as pbar:
+            file_start_time = time.perf_counter()
+            with tqdm(unit="", leave=True, dynamic_ncols=True) as pbar:
                 result = await transcribe_file(input_path, config, client, pbar, args)
                 results.append((input_path, result))
+                file_times.append(time.perf_counter() - file_start_time)
         
         # Summary
-        print("\n" + "=" * 50)
-        print("SUMMARY")
-        print("=" * 50)
+        print("\n" + "=" * 70)
+        print("TRANSCRIPTION SUMMARY")
+        print("=" * 70)
         
         success = sum(1 for _, r in results if r)
         failed = len(results) - success
         
-        for input_path, output_path in results:
-            status = "✓" if output_path else "✗"
-            print(f"  {status} {Path(input_path).name}")
-            if output_path:
-                print(f"    → {output_path}")
+        total_audio_duration = 0.0
+        total_file_size = 0.0
         
-        print(f"\nCompleted: {success}/{len(results)} files")
+        for (input_path, result), proc_time in zip(results, file_times):
+            p = Path(input_path)
+            status = "✓" if result else "✗"
+            print(f"\n  {status} {p.name}")
+            
+            if result:
+                output_path = result.get("output_path") if isinstance(result, dict) else result
+                file_duration = result.get("total_duration", 0) if isinstance(result, dict) else 0
+                speaker_stats = result.get("speaker_stats", {}) if isinstance(result, dict) else {}
+                
+                print(f"    → {output_path}")
+                if file_duration > 0:
+                    total_audio_duration += file_duration
+                    print(f"    Duration: {format_duration_readable(file_duration)}")
+                    if proc_time > 0:
+                        speedup = file_duration / proc_time
+                        print(f"    Processing time: {format_duration_readable(proc_time)} (speedup: {speedup:.1f}x)")
+                
+                # Display speaker statistics
+                if speaker_stats:
+                    print(f"    Speakers ({len(speaker_stats)}):")
+                    for spk in sorted(speaker_stats.keys()):
+                        stats = speaker_stats[spk]
+                        duration = stats.get("total_duration", 0)
+                        percentage = stats.get("percentage", 0)
+                        times_active = stats.get("times_active", 0)
+                        seg_count = stats.get("segment_count", 0)
+                        print(f"      {spk}: {format_duration_readable(duration)} ({percentage:.1f}%) | "
+                              f"{times_active} active period(s) | {seg_count} segment(s)")
+                
+                # Calculate file size in MB
+                if p.exists():
+                    file_size_mb = p.stat().st_size / (1024 * 1024)
+                    total_file_size += file_size_mb
+        
+        print("\n" + "=" * 70)
+        print(f"Completed: {success}/{len(results)} files")
         if failed:
             print(f"Failed: {failed} files")
 
         overall_time = time.perf_counter() - overall_start_time
-        print(f"Total transcription time: {overall_time:.2f} seconds")
+        print(f"Total processing time: {format_duration_readable(overall_time)}")
+        
+        if total_audio_duration > 0:
+            overall_speedup = total_audio_duration / overall_time
+            print(f"Overall speedup: {overall_speedup:.1f}x")
+        
+        if total_file_size > 0:
+            print(f"Total media size: {total_file_size:.1f} MB")
+        
+        print("=" * 70)
 
     finally:
         await client.close()
