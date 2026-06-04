@@ -974,35 +974,36 @@ async def transcribe_file(
                         continue
                     
                     try:
-                        # Send extracted audio to server for embedding
-                        print(f"[INFO] Extracting clean voiceprint for unknown speaker {spk}...")
-                        clean_diarize_segments, clean_speaker_profiles = await client.diarize_path(speaker_temp_path)
-                        
-                        if clean_speaker_profiles:
-                            # The extracted audio should have one dominant speaker
-                            # Get the speaker with the most speech
-                            if clean_diarize_segments:
-                                spk_durations_clean = {}
-                                for seg in clean_diarize_segments:
-                                    s = seg["speaker"]
-                                    d = seg["end"] - seg["start"]
-                                    spk_durations_clean[s] = spk_durations_clean.get(s, 0.0) + d
-                                
-                                dominant_spk = max(spk_durations_clean.items(), key=lambda x: x[1])[0]
-                                
-                                if dominant_spk in clean_speaker_profiles and "embedding" in clean_speaker_profiles[dominant_spk]:
-                                    # Generate persistent speaker name
-                                    existing_names = [n for n in existing_vp.keys() if n.startswith(f"{filename_prefix}_post_SPEAKER")]
-                                    next_n = len(existing_names) + 1
-                                    persistent_name = f"{filename_prefix}_post_SPEAKER_{next_n}"
-                                    
-                                    # Create voiceprint with embedding and metadata
-                                    voiceprint_entry = clean_speaker_profiles[dominant_spk].copy()
-                                    voiceprint_entry["total_speech_sec"] = total_dur
-                                    
-                                    existing_vp[persistent_name] = voiceprint_entry
-                                    print(f"[INFO] Added post-processed voiceprint: {persistent_name} (dur={total_dur:.1f}s, conf={avg_conf:.2%})")
-                        
+                        # Compute embedding locally for the extracted speaker audio
+                        print(f"[INFO] Computing local embedding for unknown speaker {spk}...")
+                        from settings import Settings
+                        from voiceprint_utils import load_audio_segment, get_embedding_session
+                        from speaker.embedding import extract_embedding, compute_pitch, compute_energy
+
+                        # Load audio and get embedding session
+                        waveform, sr = load_audio_segment(speaker_temp_path, 0, None)
+                        embedding_session = get_embedding_session(Settings())
+
+                        emb = extract_embedding(waveform, sr, embedding_session)
+                        if emb is not None:
+                            pitch, pitch_std = compute_pitch(waveform, sr)
+                            energy = compute_energy(waveform)
+
+                            existing_names = [n for n in existing_vp.keys() if n.startswith(f"{filename_prefix}_post_SPEAKER")]
+                            next_n = len(existing_names) + 1
+                            persistent_name = f"{filename_prefix}_post_SPEAKER_{next_n}"
+
+                            voiceprint_entry = {
+                                "pitch_hz": round(pitch, 1) if pitch > 0 else 0.0,
+                                "pitch_std": round(pitch_std, 1),
+                                "energy_rms": round(energy, 4),
+                                "total_speech_sec": total_dur,
+                                "embedding": emb,
+                            }
+
+                            existing_vp[persistent_name] = voiceprint_entry
+                            print(f"[INFO] Added post-processed voiceprint: {persistent_name} (dur={total_dur:.1f}s, conf={avg_conf:.2%})")
+
                     except Exception as e:
                         log.warn(f"Failed to extract voiceprint for {spk}: {e}")
                     finally:

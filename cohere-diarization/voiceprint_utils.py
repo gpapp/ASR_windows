@@ -607,7 +607,7 @@ def extract_speaker_segments(
             print(f"[SKIP] Segment {i} too short: {duration:.1f}s < {min_duration}s")
             continue
 
-        output_file = output_dir / f"{speaker_name}_{i:03d}_{format_time(start).replace(':', '')}.wav"
+        output_file = f"{output_dir}/{speaker_name}_{i:03d}_{format_time(start).replace(':', '')}.wav"
 
         result = subprocess.run([
             "ffmpeg", "-y", "-i", str(wav_path),
@@ -628,7 +628,7 @@ def extract_speaker_segments(
             "file": str(output_file),
             "text": seg.get("text", "")
         })
-        print(f"[OK] Extracted: {output_file.name} ({duration:.1f}s)")
+        print(f"[OK] Extracted: {output_file} ({duration:.1f}s)")
 
     return extracted
 
@@ -711,6 +711,9 @@ def extract_missing_voiceprints(
     updated = False
     filename_prefix = re.sub(r'[^a-zA-Z0-9_-]', '_', audio_file.stem)
     
+    # Keep track of newly identified speakers
+    newly_identified = {}
+    
     for spk in unknown_speakers:
         # Check quality gates
         total_dur = speaker_durations.get(spk, 0.0)
@@ -729,7 +732,7 @@ def extract_missing_voiceprints(
         # Create temporary WAV file for extracted speaker audio
         with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_wav:
             speaker_temp_path = tmp_wav.name
-        
+
         try:
             # Load original audio
             wav_path = ensure_wav(audio_file)
@@ -782,9 +785,6 @@ def extract_missing_voiceprints(
                 os.unlink(speaker_temp_path)
             except:
                 pass
-    
-    # Keep track of newly identified speakers
-    newly_identified = {}
     
     # Save updated voiceprints if any were added
     if updated:

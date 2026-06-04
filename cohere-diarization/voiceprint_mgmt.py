@@ -385,7 +385,6 @@ def cmd_refine(args):
 
 def cmd_create(args):
     """Create a new voiceprint from audio segment."""
-    from server import state, ensure_embedding_model
     import onnxruntime as ort
 
     start_sec = parse_time(args.start)
@@ -461,128 +460,8 @@ def cmd_create(args):
     if wav_path != audio_path and wav_path.exists():
         wav_path.unlink()
 
-
 def cmd_add(args):
-    """Add/r
-efine voiceprint with additional samples."""
-    from server import state, ensure_embedding_model
-    import onnxruntime as ort
-    import soundfile as sf
-
-    voiceprints_path = Path(args.voiceprints)
-    if not voiceprints_path.exists():
-        print(f"[ERROR] Voiceprints file not found: {args.voiceprints}")
-        sys.exit(1)
-
-    voiceprints = load_voiceprints(voiceprints_path)
-
-    if args.speaker not in voiceprints:
-        print(f"[ERROR] Speaker '{args.speaker}' not found")
-        print(f"  Available: {list(voiceprints.keys())}")
-        sys.exit(1)
-
-    existing = voiceprints[args.speaker]
-    print(f"[INFO] Existing voiceprint for '{args.speaker}':")
-    print(f"  - Duration: {existing.get('total_speech_sec', 0):.1f}s")
-    print(f"  - Pitch: {existing.get('pitch_hz', 0):.1f} Hz")
-
-    settings = Settings()
-    embedding_session = init_embedding_session(settings)
-
-    all_embeddings = []
-    all_pitches = []
-    all_energies = []
-    total_duration = 0.0
-
-    i = 0
-    segments = args.segments
-    while i < len(segments):
-        file_path = Path(segments[i])
-        start_sec = parse_time(segments[i + 1])
-        end_sec = parse_time(segments[i + 2])
-        i += 3
-
-        if not file_path.exists():
-            print(f"[WARN] Skipping missing file: {file_path}")
-            continue
-
-        duration = end_sec - start_sec
-        if duration < 1.5:
-            print(f"[WARN] Skipping short segment ({duration:.1f}s)")
-            continue
-
-        print(f"[INFO] Processing: {file_path.name} {format_time(start_sec)}-{format_time(end_sec)}")
-
-        try:
-            wav_path = ensure_wav(file_path)
-            waveform, sr = load_audio_segment(str(wav_path), start_sec, end_sec)
-
-            emb = extract_embedding(waveform, sr, embedding_session)
-            pitch, pitch_std = compute_pitch(waveform, sr)
-            energy = compute_energy(waveform)
-
-            all_embeddings.append(np.array(emb))
-            if pitch > 0:
-                all_pitches.append(pitch)
-            all_energies.append(energy)
-            total_duration += duration
-
-            print(f"  - OK: pitch={pitch:.1f}Hz")
-
-            if wav_path != file_path and wav_path.exists():
-                wav_path.unlink()
-
-        except Exception as e:
-            print(f"[WARN] Failed: {e}")
-            continue
-
-    if not all_embeddings:
-        print("[ERROR] No valid segments processed")
-        sys.exit(1)
-
-    print(f"[INFO] Processed: {total_duration:.1f}s from {len(all_embeddings)} segments")
-
-    combined_emb = np.mean(np.stack(all_embeddings), axis=0)
-    combined_emb = combined_emb / (np.linalg.norm(combined_emb) + 1e-12)
-    combined_emb = combined_emb.tolist()
-
-    avg_pitch = np.mean(all_pitches) if all_pitches else 0.0
-    pitch_std_new = np.std(all_pitches) if len(all_pitches) > 1 else 0.0
-    avg_energy = np.mean(all_energies)
-    new_duration = existing.get("total_speech_sec", 0) + total_duration
-
-    new_pitch = avg_pitch if avg_pitch > 0 else existing.get("pitch_hz", 0)
-    new_pitch_std = pitch_std_new if pitch_std_new > 0 else existing.get("pitch_std", 0)
-    new_energy = (existing.get("energy_rms", 0) + avg_energy) / 2
-
-    voiceprint = {
-        "pitch_hz": round(new_pitch, 1),
-        "pitch_std": round(new_pitch_std, 1),
-        "energy_rms": round(new_energy, 4),
-        "total_speech_sec": round(new_duration, 1),
-        "gender_hint": existing.get("gender_hint", "unknown"),
-        "embedding": combined_emb,
-    }
-    # Preserve existing spectral and MFCC features
-    for key in ["spectral_centroid", "spectral_rolloff"]:
-        if key in existing:
-            voiceprint[key] = existing[key]
-    for key in existing:
-        if key.startswith("mfcc"):
-            voiceprint[key] = existing[key]
-    
-    voiceprints[args.speaker] = voiceprint
-
-    save_voiceprints(voiceprints, voiceprints_path)
-
-    print(f"[SUCCESS] Updated voiceprint for '{args.speaker}'")
-    print(f"  - Total: {new_duration:.1f}s (was {existing.get('total_speech_sec', 0):.1f}s)")
-
-
-def cmd_add(args):
-    """Add/r
-efine voiceprint with additional samples."""
-    from server import state, ensure_embedding_model
+    """Add/refine voiceprint with additional samples."""
     import onnxruntime as ort
     import soundfile as sf
 

@@ -19,6 +19,7 @@ import tempfile
 from pathlib import Path
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
+from typing import Tuple, cast
 
 import numpy as np
 import librosa
@@ -30,7 +31,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from settings import get_settings
 from model_state import state, executor as global_executor
 from model_loader import load_models
-from transcriber import transcribe_audio_async, clean_transcript, TARGET_SAMPLES
+from transcriber import transcribe_audio_async, clean_transcript, TARGET_SAMPLES, _compute_mel_spectrogram_fast
 from diarization import Diarizer
 from streaming import stream_transcribe
 from api.schemas import (
@@ -54,8 +55,7 @@ async def lifespan(app: FastAPI):
     global global_executor
     
     settings = get_settings()
-       
-    # Initialize thread pool
+          
     global_executor = ThreadPoolExecutor(max_workers=settings.workers)
     
     # Assign to model_state module global
@@ -101,9 +101,41 @@ async def health():
     """Health check endpoint."""
     return HealthResponse(
         status="online" if state.is_ready else "degraded",
-        model_status=state.status,
-        device=state.device
+        model_status=state.status
     )
+
+
+async def _transcribe_chunks(
+    audio: np.ndarray,
+    language: str,
+    settings,
+    full_mel_spectrogram: np.ndarray
+) -> tuple[str, float, int]:
+    """Transcribe audio sequentially in chunks to avoid any task-pooling issues."""
+    full_text = ""
+    total_inference = 0.0
+    total_tokens = 0
+
+    chunk_samples = TARGET_SAMPLES
+    chunk_frames = chunk_samples // 160
+
+    for start in range(0, len(audio), chunk_samples):
+        start_frame = start // 160
+        end_frame = min(start_frame + chunk_frames, full_mel_spectrogram.shape[1])
+        chunk_mel_spectrogram = full_mel_spectrogram[:, start_frame:end_frame, :]
+
+        result = await transcribe_audio_async(
+            None,
+            language,
+            settings.request_timeout,
+            mel_spectrogram=chunk_mel_spectrogram
+        )
+
+        full_text += result.get("text", "") + " "
+        total_inference += result.get("inference_time_sec", 0.0)
+        total_tokens += result.get("tokens_generated", 0)
+
+    return full_text, total_inference, total_tokens
 
 
 async def delayed_shutdown():
@@ -205,103 +237,76 @@ async def transcribe_upload(
                 tmp.flush()
                 
                 # Load audio
-                audio, _ = await asyncio.to_thread(
-                    librosa.load, tmp.name, sr=16000, mono=True
+                load_start = time.perf_counter()
+                audio, _ = cast(
+                    Tuple[np.ndarray, float],
+                    await asyncio.to_thread(
+                        lambda: librosa.load(tmp.name, sr=16000, mono=True)
+                    )
+                )  # type: ignore[assignment]
+                audio_load_sec = time.perf_counter() - load_start
+
+                log.debug(
+                    "audio_loaded",
+                    filename=file.filename,
+                    duration_sec=len(audio) / 16000,
+                    load_time_sec=audio_load_sec
                 )
-                
-                # Apply pre-emphasis (matches CohereAsrFeatureExtractor)
+
                 audio_float = audio.astype(np.float32)
                 audio_float[1:] -= 0.97 * audio_float[:-1]
-                
-                # Compute mel-spectrogram using librosa (matches Cohere config: win_length=400, n_fft=512)
-                mel_spec = librosa.feature.melspectrogram(
-                    y=audio_float,
-                    sr=16000,
-                    n_fft=512,
-                    hop_length=160,
-                    win_length=400,
-                    n_mels=128,
-                    window='hann'
+
+                mel_start = time.perf_counter()
+                full_mel = _compute_mel_spectrogram_fast(audio_float)
+                mel_sec = time.perf_counter() - mel_start
+
+                log.debug(
+                    "mel_spectrogram_computed",
+                    filename=file.filename,
+                    mel_time_sec=mel_sec,
+                    mel_frames=full_mel.shape[1]
                 )
-                
-                # Convert to log scale (dB)
-                mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
-                
-                # Normalize per-feature (per-frequency bin)
-                mel_spec_db = (mel_spec_db - mel_spec_db.mean(axis=1, keepdims=True)) / (mel_spec_db.std(axis=1, keepdims=True) + 1e-8)
-                
-                # Transpose to [sequence_length, n_mels] and add batch dimension
-                # Shape: [1, seq_len, 128]
-                full_mel_spectrogram = mel_spec_db.T[np.newaxis, :, :].astype(np.float32)
-            
-            # Process audio in 30s chunks (model expects fixed-length input)
+
+                full_mel_spectrogram = full_mel.T[np.newaxis, :, :].astype(np.float32)
+
+            # Process audio in 30s chunks using the precomputed mel spectrogram
             full_text = ""
-            total_duration = 0
             total_inference = 0
             total_tokens = 0
-            
-            chunk_samples = TARGET_SAMPLES  # 30s at 16kHz
-            chunk_frames = 3000  # 30 seconds * 100 frames per second (10ms hop length)
-            
-            for start in range(0, len(audio), chunk_samples):
-                end = start + chunk_samples
-                chunk = audio[start:end]
-                
-                # Calculate mel spectrogram slice for this chunk
-                start_frame = start // 160  # Convert sample index to frame index
-                end_frame = min(start_frame + chunk_frames, full_mel_spectrogram.shape[1])
-                chunk_mel_spectrogram = full_mel_spectrogram[:, start_frame:end_frame, :]
-                
-                # Pad short final chunk to exactly 30s if needed
-                if len(chunk) < chunk_samples:
-                    chunk = np.pad(chunk, (0, chunk_samples - len(chunk)), mode='constant')
-                    # Also pad mel spectrogram if needed
-                    if chunk_mel_spectrogram.shape[1] < chunk_frames:
-                        pad_width = chunk_frames - chunk_mel_spectrogram.shape[1]
-                        chunk_mel_spectrogram = np.pad(
-                            chunk_mel_spectrogram, 
-                            ((0, 0), (0, pad_width), (0, 0)), 
-                            mode='constant'
-                        )
-                
-                result = await transcribe_audio_async(
-                    chunk, 
-                    language, 
-                    settings.request_timeout,
-                    mel_spectrogram=chunk_mel_spectrogram
-                )
-                
-                full_text += result["text"] + " "
-                total_duration += result["audio_duration_sec"]
-                total_inference += result["inference_time_sec"]
-                total_tokens += result["tokens_generated"]
-            
-                result = {
-                    "text": clean_transcript(full_text.strip()),
-                    "audio_duration_sec": len(audio) / 16000,
-                    "inference_time_sec": total_inference,
-                    "tokens_generated": total_tokens
-                }
-                results.append(TranscribeResult(
-                   text=result["text"],
-                   audio_duration_sec=str(result["audio_duration_sec"]),
-                   inference_time_sec=str(result["inference_time_sec"]),
-                   tokens_generated=str(result["tokens_generated"])
-                ))
+
+            full_text, total_inference, total_tokens = await _transcribe_chunks(
+                audio,
+                language,
+                settings,
+                full_mel_spectrogram
+            )
+
+            result = {
+                "text": clean_transcript(full_text.strip()),
+                "audio_duration_sec": len(audio) / 16000,
+                "inference_time_sec": total_inference,
+                "tokens_generated": total_tokens
+            }
+            results.append(TranscribeResult(
+               text=result["text"],
+               audio_duration_sec=result["audio_duration_sec"],
+               inference_time_sec=result["inference_time_sec"],
+               tokens_generated=result["tokens_generated"]
+            ))
                 
         except Exception as e:
             log.error("transcription_failed", filename=file.filename, error=str(e))
             results.append(TranscribeResult(
                 text="",
-                audio_duration_sec="0",
-                inference_time_sec="0",
-                tokens_generated="0",
+                audio_duration_sec=0.0,
+                inference_time_sec=0.0,
+                tokens_generated=0,
                 error=str(e)
             ))
     
     return TranscribeResponse(
         results=results,
-        total_time_sec=str(time.perf_counter() - start_time)
+        total_time_sec=time.perf_counter() - start_time
     )
 
 
@@ -327,76 +332,49 @@ async def transcribe_paths(
             resolved = validate_path_security(path, settings)
             
             # Load audio
-            audio, _ = await asyncio.to_thread(
-                librosa.load, str(resolved), sr=16000, mono=True
+            load_start = time.perf_counter()
+            audio, _ = cast(
+                Tuple[np.ndarray, float],
+                await asyncio.to_thread(
+                    lambda: librosa.load(str(resolved), sr=16000, mono=True)
+                )
+            )  # type: ignore[assignment]
+            audio_load_sec = time.perf_counter() - load_start
+
+            log.debug(
+                "audio_loaded",
+                path=str(resolved),
+                duration_sec=len(audio) / 16000,
+                load_time_sec=audio_load_sec
             )
-            
-            # Apply pre-emphasis (matches CohereAsrFeatureExtractor)
+
             audio_float = audio.astype(np.float32)
             audio_float[1:] -= 0.97 * audio_float[:-1]
-            
-            # Compute mel-spectrogram using librosa (matches Cohere config: win_length=400, n_fft=512)
-            mel_spec = librosa.feature.melspectrogram(
-                y=audio_float,
-                sr=16000,
-                n_fft=512,
-                hop_length=160,
-                win_length=400,
-                n_mels=128,
-                window='hann'
+
+            mel_start = time.perf_counter()
+            full_mel = _compute_mel_spectrogram_fast(audio_float)
+            mel_sec = time.perf_counter() - mel_start
+
+            log.debug(
+                "mel_spectrogram_computed",
+                path=str(resolved),
+                mel_time_sec=mel_sec,
+                mel_frames=full_mel.shape[1]
             )
+
+            full_mel_spectrogram = full_mel.T[np.newaxis, :, :].astype(np.float32)
             
-            # Convert to log scale (dB)
-            mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
-            
-            # Normalize per-feature (per-frequency bin)
-            mel_spec_db = (mel_spec_db - mel_spec_db.mean(axis=1, keepdims=True)) / (mel_spec_db.std(axis=1, keepdims=True) + 1e-8)
-            
-            # Transpose to [sequence_length, n_mels] and add batch dimension
-            # Shape: [1, seq_len, 128]
-            full_mel_spectrogram = mel_spec_db.T[np.newaxis, :, :].astype(np.float32)
-            
-            # Process audio in 30s chunks
+            # Process audio in 30s chunks using the precomputed mel spectrogram
             full_text = ""
-            total_duration = 0
             total_inference = 0
             total_tokens = 0
-            
-            chunk_samples = TARGET_SAMPLES  # 30s at 16kHz
-            chunk_frames = 3000  # 30 seconds * 100 frames per second (10ms hop length)
-            
-            for start in range(0, len(audio), chunk_samples):
-                end = start + chunk_samples
-                chunk = audio[start:end]
-                
-                # Calculate mel spectrogram slice for this chunk
-                start_frame = start // 160  # Convert sample index to frame index
-                end_frame = min(start_frame + chunk_frames, full_mel_spectrogram.shape[1])
-                chunk_mel_spectrogram = full_mel_spectrogram[:, start_frame:end_frame, :]
-                
-                # Pad short final chunk to exactly 30s if needed
-                if len(chunk) < chunk_samples:
-                    chunk = np.pad(chunk, (0, chunk_samples - len(chunk)), mode='constant')
-                    # Also pad mel spectrogram if needed
-                    if chunk_mel_spectrogram.shape[1] < chunk_frames:
-                        pad_width = chunk_frames - chunk_mel_spectrogram.shape[1]
-                        chunk_mel_spectrogram = np.pad(
-                            chunk_mel_spectrogram, 
-                            ((0, 0), (0, pad_width), (0, 0)), 
-                            mode='constant'
-                        )
-                
-                result = await transcribe_audio_async(
-                    chunk, 
-                    req.language, 
-                    settings.request_timeout,
-                    mel_spectrogram=chunk_mel_spectrogram
-                )
-                
-                full_text += result["text"] + " "
-                total_duration += result["audio_duration_sec"]
-                total_inference += result["inference_time_sec"]
-                total_tokens += result["tokens_generated"]
+
+            full_text, total_inference, total_tokens = await _transcribe_chunks(
+                audio,
+                req.language,
+                settings,
+                full_mel_spectrogram
+            )
             
             result = {
                 "text": clean_transcript(full_text.strip()),
@@ -407,18 +385,18 @@ async def transcribe_paths(
             
             results.append(TranscribeResult(
                 text=result["text"],
-                audio_duration_sec=str(result["audio_duration_sec"]),
-                inference_time_sec=str(result["inference_time_sec"]),
-                tokens_generated=str(result["tokens_generated"])
+                audio_duration_sec=result["audio_duration_sec"],
+                inference_time_sec=result["inference_time_sec"],
+                tokens_generated=result["tokens_generated"]
             ))
             
         except PathSecurityError as e:
             log.warning("path_security_error", path=path, error=str(e))
             results.append(TranscribeResult(
                 text="",
-                audio_duration_sec="0",
-                inference_time_sec="0",
-                tokens_generated="0",
+                audio_duration_sec=0.0,
+                inference_time_sec=0.0,
+                tokens_generated=0,
                 error=f"Access denied: {e.message}"
             ))
             
@@ -426,15 +404,15 @@ async def transcribe_paths(
             log.error("transcription_failed", path=path, error=str(e))
             results.append(TranscribeResult(
                 text="",
-                audio_duration_sec="0",
-                inference_time_sec="0",
-                tokens_generated="0",
+                audio_duration_sec=0.0,
+                inference_time_sec=0.0,
+                tokens_generated=0,
                 error=str(e)
             ))
         
     return TranscribeResponse(
         results=results,
-        total_time_sec=str(time.perf_counter() - start_time)
+        total_time_sec=time.perf_counter() - start_time
     )
 
 

@@ -33,15 +33,11 @@ class Settings(BaseSettings):
 
     # Decoder model ALWAYS on CPU for maximum compatibility, as it's only used for short sequences and token-by-token 
     # generation where GPU acceleration is less critical. We can still use quantized/FP16 models for the decoder to save memory, but we'll run them on CPU to avoid DirectML issues.
-    decoder_model_type: str = "_q4"  # options: _fp16, _quantized, _q4, _q4f16, — q4 fastest on this CPU (fp16 adds dtype conversion overhead)
+    decoder_model_type: str = ""  # options: _fp16, _quantized, _q4, _q4f16, — q4 fastest on this CPU (fp16 adds dtype conversion overhead)
     decoder_dtype: type = np.float16 if decoder_model_type in ["_fp16", "_q4f16"] else np.float32  # KV cache dtype (encoder_hidden_states remains float32)
-    # Stats for the same 1146s long audio file on iGPU (DirectML) vs CPU vs OpenVINO with different model types:
-    #           on DML      on CPU      OpenVINO    Notes
-    # fp32        959s      1784s       1161s    
-    # fp16       1082s      1161s        981s
-    # q4f16      1843s       DNF        1701s
-    # quantized    DNF       DNF                    Extremely slow on all, not recommended
-    # q4           DNF      2212s       1737s       Extremely slow on all, not recommended
+    cpu_threads: int = max(1, os.cpu_count() - 1)
+
+    # f16 is extremely slow on CPU and GPU due to covnversion overhead
 
     # VAD model settings
     # VAD models are always run on CPU for maximum compatibility, as they are only used for short audio chunks and we want to avoid any DirectML issues. We can still use quantized/FP16 models for VAD to save memory, but we'll run them on CPU.

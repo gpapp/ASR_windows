@@ -106,7 +106,6 @@ class ModelState:
         self.pre_computed_prompt_ids: list[int] = []
         self.pre_computed_eos_id: int = -1
         self.pre_computed_prompt_array: Optional[np.ndarray] = None
-        self.device: str = "cpu"
         self.status: str = "initializing"
         self.kv_pool: Optional[KVCachePool] = None
         self.embedding_cache: dict[str, np.ndarray] = {}

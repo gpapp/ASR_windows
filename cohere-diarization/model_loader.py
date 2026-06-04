@@ -21,7 +21,7 @@ log = structlog.get_logger()
 # iGPU Hardware Target Configuration
 # ============================================================================
 
-def get_igpu_session_options(provider_type: str = "DirectML"):
+def get_igpu_session_options(provider_type: str = "DirectML", settings: Settings = Settings()):
     """
     Generates execution provider list and session optimizations for iGPUs.
     
@@ -61,19 +61,28 @@ def get_igpu_session_options(provider_type: str = "DirectML"):
         }
 
         provider_options = [{"device_type": "GPU","load_config": json.dumps(ov_config)},{}]  
-        log.info("igpu_config_created", provider="OpenVINO", precision="FP16")
+        log.info("igpu_config_created", provider="OpenVINO")
         return providers, provider_options, opts
         
     elif provider_type.lower() == "directml":
         # Global Session configuration optimized for DirectML stability       
-        opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL  
         opts.enable_mem_pattern = False 
         # Basic optimizations only to prevent invalid command errors and driver crashes
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
         providers = ["DmlExecutionProvider", "CPUExecutionProvider"]
-        log.info("igpu_config_created", provider="DirectML", precision="native")
+        log.info("igpu_config_created", provider="DirectML")
         return providers, None, opts
-    
+    elif provider_type.lower() == "cpu":
+        ## CPU fallback with optimized threading for multi-core CPUs
+        providers = ["CPUExecutionProvider"]
+        opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        opts.enable_mem_pattern = False
+        opts.intra_op_num_threads = settings.cpu_threads
+        opts.inter_op_num_threads = 1
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        return providers, None, opts
+
     # Fallback to CPU only
     log.warning("igpu_provider_not_recognized", provider=provider_type)
     return ["CPUExecutionProvider"], None, opts
@@ -183,27 +192,28 @@ def load_models(settings: Settings):
     
     # 4. Configure iGPU execution providers (DirectML recommended for Windows)
     PROVIDER_SELECTION = settings.provider_type
-    providers, provider_options, opts = get_igpu_session_options(PROVIDER_SELECTION)
+    providers, provider_options, opts = get_igpu_session_options(PROVIDER_SELECTION, settings)
+    cpu_providers, cpu_provider_options, cpu_opts =  get_igpu_session_options("CPU", settings)
     
     # 5. Load encoder and decoder models
     log.info("loading_encoder_model", provider=PROVIDER_SELECTION)
     try:
         cohere_encoder = ort.InferenceSession(
             str(model_dir / f"onnx/encoder_model{settings.encoder_model_type}.onnx"),
-            sess_options=opts,
             providers=providers,
-            provider_options=provider_options if provider_options else None
+            provider_options=provider_options if provider_options else None,
+            sess_options=opts,
         )
         log.info("encoder_model_loaded_successfully")
     except Exception as e:
         log.error("encoder_initialization_failed", error=str(e), fallback="CPU")
         cohere_encoder = ort.InferenceSession(
             str(model_dir / f"onnx/encoder_model{settings.encoder_model_type}.onnx"),
-            providers=["CPUExecutionProvider"]
+            providers=cpu_providers,
+            provider_options=cpu_provider_options if cpu_provider_options else None,
+            sess_options=cpu_opts
         )
     
-    cpu_opts = ort.SessionOptions()
-    cpu_opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
 
     log.info("loading_decoder_model")
     try:
@@ -213,8 +223,9 @@ def load_models(settings: Settings):
 
         cohere_decoder = ort.InferenceSession(
             str(model_dir / f"onnx/decoder_model_merged{settings.decoder_model_type}.onnx"),
-            sess_options=cpu_opts,
-            providers=["CPUExecutionProvider"]  # Force CPU for decoder
+            providers=cpu_providers,
+            provider_options=cpu_provider_options if cpu_provider_options else None,
+            sess_options=cpu_opts
         )
         log.info("decoder_model_loaded_successfully", note="Using CPU provider due to DirectML compatibility")
     except Exception as e:
@@ -222,8 +233,6 @@ def load_models(settings: Settings):
         raise
     
     # 6. Update model state
-    device = "dml" if "DmlExecutionProvider" in providers else "gpu" if "GPUExecutionProvider" in providers or "OpenVINOExecutionProvider" in providers else "cpu"
-    
     state.encoder = cohere_encoder
     state.decoder = cohere_decoder
     state.tokens = tokens
@@ -231,8 +240,7 @@ def load_models(settings: Settings):
     state.pre_computed_prompt_ids = pre_computed_prompt_ids
     state.pre_computed_eos_id = pre_computed_eos_id
     state.pre_computed_prompt_array = pre_computed_prompt_array
-    state.device = device
-    state.kv_pool = KVCachePool(settings, device=device)
+    state.kv_pool = KVCachePool(settings)
     
     # 7. Load auxiliary models for diarization
     log.info("loading_vad_model")
@@ -244,8 +252,9 @@ def load_models(settings: Settings):
         # Direct loading of the optimized VAD session
         state.vad_session = ort.InferenceSession(
             vad_onnx_path,
-            sess_options=cpu_opts,
-            providers=["CPUExecutionProvider"]
+            providers=cpu_providers,
+            provider_options=cpu_provider_options if cpu_provider_options else None,
+            sess_options=cpu_opts
         )
         log.info("vad_model_loaded", provider="cpu")
     except Exception as e:
@@ -271,4 +280,4 @@ def load_models(settings: Settings):
             log.error("embedding_model_cpu_fallback_failed", error=str(e2))
     
     state.status = "ready"
-    log.info("all_models_loaded", device=device, provider=PROVIDER_SELECTION)
+    log.info("all_models_loaded", provider=PROVIDER_SELECTION)

@@ -59,5 +59,4 @@ class HealthResponse(BaseModel):
     """Health check response."""
     status: str
     model_status: str
-    device: str
     version: str = "1.0.0"

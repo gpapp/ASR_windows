@@ -7,6 +7,7 @@ import time
 import signal
 import re
 from contextlib import contextmanager
+from typing import Optional
 
 import numpy as np
 import librosa
@@ -20,8 +21,8 @@ from api.exceptions import TranscriptionError, AudioValidationError, TimeoutErro
 
 log = structlog.get_logger()
 
-# Target samples for chunking (30 seconds at 16kHz)
-TARGET_SAMPLES = 480000
+# Target samples for chunking (60 seconds at 16kHz)
+TARGET_SAMPLES = 960000
 
 # Pre-compute mel filterbank once (reuse across all calls)
 _MEL_FILTERBANK = None
@@ -169,10 +170,10 @@ def clean_transcript(text: str) -> str:
 # ============================================================================
 
 def transcribe_audio_sync(
-    audio: np.ndarray = None, 
+    audio: Optional[np.ndarray] = None,
     language: str = "en",
     timeout_sec: int = 120,
-    mel_spectrogram: np.ndarray = None
+    mel_spectrogram: Optional[np.ndarray] = None
 ) -> dict:
     """
     Synchronous ASR transcription using Cohere Transcribe ONNX model.
@@ -189,6 +190,7 @@ def transcribe_audio_sync(
     """
     settings = get_settings()
     start_time = time.perf_counter()
+    stage_timings = {}
     
     if not state.is_ready:
         raise TranscriptionError("Model not ready")
@@ -213,6 +215,7 @@ def transcribe_audio_sync(
             # Each frame = 160 samples = 0.01 seconds
             seq_len = input_features.shape[1]
             audio_duration = seq_len * 0.01
+            stage_timings["mel_extraction_sec"] = 0.0
         else:
             # Validate audio
             if audio is None:
@@ -229,7 +232,9 @@ def transcribe_audio_sync(
             audio_float[1:] -= 0.97 * audio_float[:-1]
             
             # Fast mel-spectrogram computation (5-10x faster than librosa)
+            mel_start = time.perf_counter()
             mel_spec_db = _compute_mel_spectrogram_fast(audio_float)
+            stage_timings["mel_extraction_sec"] = time.perf_counter() - mel_start
             
             # Transpose to [sequence_length, n_mels] and add batch dimension
             # Shape: [1, seq_len, 128]
@@ -249,7 +254,9 @@ def transcribe_audio_sync(
         }
         
         try:
+            enc_start = time.perf_counter()
             enc_outputs = encoder.run(None, enc_inputs)
+            stage_timings["encoder_sec"] = time.perf_counter() - enc_start
             raw_encoder_hidden_state = enc_outputs[0]  # Shape: [1, T', 1024]
             log.debug("encoder_inference_complete", output_shape=str(raw_encoder_hidden_state.shape))
         except Exception as e:
@@ -297,6 +304,7 @@ def transcribe_audio_sync(
                 (batch_size, num_heads, 0, head_dim), dtype=settings.decoder_dtype
             )
         
+        decoder_start = time.perf_counter()
         for step in range(max_new_tokens):
             # Get the last token ID(s) to feed
             if step == 0:
@@ -364,6 +372,9 @@ def transcribe_audio_sync(
             if (step + 1) % 10 == 0:
                 log.debug("generation_progress", step=step, tokens_generated=len(generated_ids) - len(prompt_ids))
         
+        decoder_time = time.perf_counter() - decoder_start
+        stage_timings["decoder_sec"] = decoder_time
+        
         # ====================================================================
         # Step 5: Decode tokens to text
         # ====================================================================
@@ -387,6 +398,7 @@ def transcribe_audio_sync(
         text = clean_transcript(text)
         
         tokens_generated = len(generated_ids) - len(prompt_ids)
+        stage_timings["decoder_avg_token_sec"] = stage_timings["decoder_sec"] / max(1, tokens_generated)
         inference_time = time.perf_counter() - start_time
         
         log.info(
@@ -394,7 +406,8 @@ def transcribe_audio_sync(
             audio_duration=f"{audio_duration:.2f}s",
             tokens=tokens_generated,
             inference_time=f"{inference_time:.2f}s",
-            text_preview=text[:100]
+            text_preview=text[:100],
+            stage_timings=stage_timings
         )
         
         return {
@@ -402,14 +415,15 @@ def transcribe_audio_sync(
             "tokens_generated": tokens_generated,
             "audio_duration_sec": audio_duration,
             "inference_time_sec": inference_time,
+            "stage_timings": stage_timings,
         }
 
 
 async def transcribe_audio_async(
-    audio: np.ndarray = None, 
+    audio: Optional[np.ndarray] = None,
     language: str = "en",
     timeout_sec: int = 120,
-    mel_spectrogram: np.ndarray = None
+    mel_spectrogram: Optional[np.ndarray] = None
 ) -> dict:
     """Async wrapper for transcription."""
     loop = asyncio.get_event_loop()
