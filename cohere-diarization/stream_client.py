@@ -14,6 +14,7 @@ import queue
 import sys
 import signal
 import threading
+from collections import deque
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -25,8 +26,17 @@ load_dotenv()
 
 SERVER_URL = os.getenv("STREAM_SERVER_URL", "ws://127.0.0.1:8000/ws/stream")
 TARGET_RATE = 16000
-CHUNK_SEC = 3.0
+CHUNK_SEC = 5.0
 CHUNK_SAMPLES = int(CHUNK_SEC * TARGET_RATE)
+
+VAD_FRAME_SEC = 0.25
+VAD_FRAME_SAMPLES = int(VAD_FRAME_SEC * TARGET_RATE)
+VAD_FRAME_BYTES = VAD_FRAME_SAMPLES * 2 * 2  # int16 stereo
+SILENCE_SEC = 1
+LOOKBACK_SEC = 0.5
+SILENCE_FRAMES = int(SILENCE_SEC / VAD_FRAME_SEC)
+LOOKBACK_FRAMES = int(LOOKBACK_SEC / VAD_FRAME_SEC)
+SILENCE_THRESHOLD = 0.002
 
 MY_NAME = os.getenv("MY_NAME", "[ME]")
 
@@ -41,6 +51,21 @@ def _resample(data: np.ndarray, orig_rate: int, target_rate: int) -> np.ndarray:
         np.arange(len(data)),
         data.astype(np.float32),
     ).astype(data.dtype)
+
+
+def _rms_from_bytes(chunk: bytes) -> float:
+    samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32767.0
+    if samples.size == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(np.square(samples))))
+
+
+def _is_voice_active(chunk: bytes) -> bool:
+    return _rms_from_bytes(chunk) >= SILENCE_THRESHOLD
+
+
+def _split_audio_frames(chunk: bytes, frame_bytes: int = VAD_FRAME_BYTES) -> list[bytes]:
+    return [chunk[i:i + frame_bytes] for i in range(0, len(chunk), frame_bytes) if len(chunk[i:i + frame_bytes]) == frame_bytes]
 
 
 def find_mic_device() -> int:
@@ -301,8 +326,7 @@ async def run_stream(output_path: str):
             diag += 1
             if diag % 10 == 0:
                 def _rms(x):
-                    return float(np.sqrt(np.mean(x ** 2)))
-                print(f"[DIAG] mic_rms={_rms(src_mic):.4f}  loop_rms={_rms(src_loop):.4f}", flush=True)
+                    return float(np.sqrt(np.mean(x ** 2)))            
 
     async def audio_capture():
         loop = asyncio.get_running_loop()
@@ -339,6 +363,20 @@ async def run_stream(output_path: str):
 
             async def sender():
                 nonlocal running
+                lookback = deque(maxlen=LOOKBACK_FRAMES)
+                current_audio = bytearray()
+                active = False
+                silence_frames = 0
+
+                async def _flush_current():
+                    nonlocal active, silence_frames
+                    if current_audio:
+                        await ws.send(bytes(current_audio))
+                        current_audio.clear()
+                    active = False
+                    silence_frames = 0
+                    lookback.clear()
+
                 while running or not send_queue.empty():
                     if send_queue.empty() and not running:
                         break
@@ -350,10 +388,42 @@ async def run_stream(output_path: str):
                                 break
                         else:
                             chunk = await send_queue.get()
-                        await ws.send(chunk)
                     except Exception:
                         running = False
                         break
+
+                    subframes = _split_audio_frames(chunk)
+                    for frame in subframes:
+                        if active:
+                            current_audio.extend(frame)
+                            if _is_voice_active(frame):
+                                silence_frames = 0
+                            else:
+                                silence_frames += 1
+                                if silence_frames >= SILENCE_FRAMES:
+                                    try:
+                                        await _flush_current()
+                                    except Exception:
+                                        running = False
+                                        break
+                        else:
+                            if _is_voice_active(frame):
+                                active = True
+                                for lookback_frame in lookback:
+                                    current_audio.extend(lookback_frame)
+                                current_audio.extend(frame)
+                                silence_frames = 0
+                                lookback.clear()
+                            else:
+                                lookback.append(frame)
+                    if not running:
+                        break
+
+                if active and current_audio:
+                    try:
+                        await ws.send(bytes(current_audio))
+                    except Exception:
+                        running = False
 
             async def receiver():
                 nonlocal running
@@ -391,19 +461,35 @@ async def run_stream(output_path: str):
             )
 
             running = False
+            for task in pending:
+                task.cancel()
+
             print("[INFO] Waiting for capture threads to terminate...", flush=True)
             await capture_task
 
             print("[INFO] Flushing and sending remaining audio queue...", flush=True)
-            await sender_task
+            try:
+                await sender_task
+            except asyncio.CancelledError:
+                pass
 
             try:
                 await ws.send(json.dumps({"type": "eof"}))
             except Exception:
                 pass
 
+            try:
+                await ws.close()
+            except Exception:
+                pass
+
             print("[INFO] Waiting for server to finish processing and send final transcripts...", flush=True)
-            await receiver_task
+            try:
+                await asyncio.wait_for(receiver_task, timeout=5.0)
+            except asyncio.TimeoutError:
+                receiver_task.cancel()
+            except asyncio.CancelledError:
+                pass
 
     except Exception as e:
         print(f"[ERROR] {e}", file=sys.stderr)

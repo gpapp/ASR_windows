@@ -22,6 +22,7 @@ from speaker.audio import extract_fbank, generate_sliding_windows
 from speaker.vad import run_vad_onnx_direct, split_at_energy_dips
 from speaker.profiling import profile_speakers
 from diarization.segment_ops import absorb_islands, eliminate_ghost_speakers
+from typing import Optional
 
 log = structlog.get_logger()
 
@@ -98,6 +99,8 @@ def _process_speaker_window(
     window_start: float,
     recording_ts: str,
     session_new_speakers: dict,
+    speaker_kv_caches: dict[str, dict], # New parameter for persistent KV cache
+    speaker_prefix_ids: dict[str, list[int]], # New parameter for token prefixing
     sr: int = 16000,
 ) -> tuple[list[dict], dict]:
     """
@@ -320,17 +323,23 @@ def _process_speaker_window(
             continue
         seg_audio = audio_1d[s:e]
 
+        spk = seg["speaker"]
+        current_kv_cache = speaker_kv_caches.get(spk)
+        current_prefix_ids = speaker_prefix_ids.get(spk)
+
+        dur = (e - s) / sr
         asr_audio = seg_audio if len(seg_audio) >= ASR_MIN else np.pad(seg_audio, (0, ASR_MIN - len(seg_audio)))
         try:
-            result = transcribe_audio_sync(asr_audio)
+            result = transcribe_audio_sync(asr_audio, past_kv_cache_ort=current_kv_cache, prefix_ids=current_prefix_ids)
             text = result.get("text", "")
             token_count = result.get("tokens_generated", 0)
-            dur = (e - s) / sr
             conf_score = min(0.95, max(0.3, token_count / (dur * 10 + 1)))
+            speaker_kv_caches[spk] = result.get("past_kv_cache_ort") # Store updated KV cache
+            speaker_prefix_ids[spk] = result.get("last_token_ids") # Store token IDs for next utterance
         except Exception:
             text = ""
             conf_score = 0.0
-
+        
         if not text.strip():
             continue
 
@@ -440,9 +449,12 @@ async def stream_transcribe(websocket: WebSocket):
         recording_ts = ""
 
     SR = 16000
-    SILENCE_THRESH = 0.5
+    FRAME_SEC = 0.25
+    FRAME_SAMPLES = int(FRAME_SEC * SR)
+    FRAME_BYTES = FRAME_SAMPLES * 2 * 2
+    SILENCE_THRESH = 0.002
     MAX_UTT_SEC = 15.0
-    MIN_UTT_SEC = 0.5
+    MIN_UTT_SEC = 0.1
     ASR_MIN = int(SR * 3)
     SILENCE_SAMPLES = int(SILENCE_THRESH * SR)
     MAX_UTT_SAMPLES = int(MAX_UTT_SEC * SR)
@@ -459,6 +471,10 @@ async def stream_transcribe(websocket: WebSocket):
     session_time = 0.0
 
     voiceprints = _stream_load_voiceprints()
+    mic_kv_cache: Optional[dict] = None # KV cache for the mic channel
+    mic_prefix_ids: Optional[list[int]] = None # Token prefix for mic channel
+    speaker_kv_caches: dict[str, dict] = {} # KV caches for remote speakers
+    speaker_prefix_ids: dict[str, list[int]] = {} # Token prefixes per speaker
     session_new_speakers: dict = {}
 
     def _vad_has_speech(audio: np.ndarray) -> bool:
@@ -475,21 +491,26 @@ async def stream_transcribe(websocket: WebSocket):
         except Exception:
             return True
 
-    def _process_mic_utterance(audio: np.ndarray) -> list[dict]:
+    def _process_mic_utterance(audio: np.ndarray, past_kv_cache_mic: Optional[dict], prefix_ids_mic: Optional[list[int]]) -> tuple[list[dict], Optional[dict], Optional[list[int]]]:
         """Simple VAD-gated ASR for the mic channel (speaker is always MY_NAME)."""
+        updated_kv_cache_mic = past_kv_cache_mic
+        updated_prefix_ids_mic = prefix_ids_mic
         asr_in = audio if len(audio) >= ASR_MIN else np.pad(audio, (0, ASR_MIN - len(audio)))
         try:
-            result = transcribe_audio_sync(asr_in)
+            result = transcribe_audio_sync(asr_in, past_kv_cache_ort=past_kv_cache_mic, prefix_ids=prefix_ids_mic)
             text = clean_transcript(result.get("text", ""))
+            updated_kv_cache_mic = result.get("past_kv_cache_ort")
+            updated_prefix_ids_mic = result.get("last_token_ids")
         except Exception:
             text = ""
+
         if not text.strip():
-            return []
+            return [], updated_kv_cache_mic, updated_prefix_ids_mic
         return [{"type": "transcript", "channel": "mic", "speaker": my_name,
-                 "text": text, "confidence": 0.9}]
+                 "text": text, "confidence": 0.9}], updated_kv_cache_mic, updated_prefix_ids_mic
 
     async def flush_utterance(ch: ChannelState, channel: str):
-        nonlocal session_new_speakers, voiceprints
+        nonlocal session_new_speakers, voiceprints, mic_kv_cache, mic_prefix_ids, speaker_kv_caches, speaker_prefix_ids
         audio = ch.utt_buf.copy()
         ch.utt_buf = np.array([], dtype=np.float32)
         ch.in_speech = False
@@ -500,7 +521,9 @@ async def stream_transcribe(websocket: WebSocket):
             return
 
         if channel == "mic":
-            msgs = await asyncio.to_thread(_process_mic_utterance, audio)
+            msgs, updated_mic_kv_cache, updated_mic_prefix_ids = await asyncio.to_thread(_process_mic_utterance, audio, mic_kv_cache, mic_prefix_ids)
+            mic_kv_cache = updated_mic_kv_cache # Update mic KV cache
+            mic_prefix_ids = updated_mic_prefix_ids # Update mic prefix token IDs
             for msg in msgs:
                 msg.setdefault("start", round(start_time, 2))
                 msg.setdefault("end", round(start_time + len(audio) / SR, 2))
@@ -511,7 +534,7 @@ async def stream_transcribe(websocket: WebSocket):
         else:
             msgs, session_new_speakers = await asyncio.to_thread(
                 _process_speaker_window,
-                audio, voiceprints, start_time, recording_ts, session_new_speakers,
+                audio, voiceprints, start_time, recording_ts, session_new_speakers, speaker_kv_caches, speaker_prefix_ids,
             )
             for msg in msgs:
                 try:
@@ -542,6 +565,18 @@ async def stream_transcribe(websocket: WebSocket):
                     ch.utt_buf = ch.utt_buf[:max(trim, 0)]
                     await flush_utterance(ch, channel)
 
+    recv_buffer = b''
+
+    def _iter_frames(data: bytes):
+        nonlocal recv_buffer
+        recv_buffer += data
+        while len(recv_buffer) >= FRAME_BYTES:
+            frame_bytes = recv_buffer[:FRAME_BYTES]
+            recv_buffer = recv_buffer[FRAME_BYTES:]
+            frame = np.frombuffer(frame_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+            frame = frame.reshape(-1, 2)
+            yield frame
+
     try:
         while True:
             msg = await websocket.receive()
@@ -550,11 +585,10 @@ async def stream_transcribe(websocket: WebSocket):
 
             if "bytes" in msg:
                 data = msg["bytes"]
-                frame = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
-                frame = frame.reshape(-1, 2)
-                session_time += len(frame) / SR
-                await process_chunk(mic_ch, frame[:, 0], "mic")
-                await process_chunk(spk_ch, frame[:, 1], "speakers")
+                for frame in _iter_frames(data):
+                    session_time += len(frame) / SR
+                    await process_chunk(mic_ch, frame[:, 0], "mic")
+                    await process_chunk(spk_ch, frame[:, 1], "speakers")
             elif "text" in msg:
                 try:
                     payload = json.loads(msg["text"])

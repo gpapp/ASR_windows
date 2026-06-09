@@ -14,6 +14,7 @@ import librosa
 import asyncio
 import structlog
 from scipy import signal as scipy_signal
+import onnxruntime as ort
 
 from settings import get_settings
 from model_state import state, executor
@@ -141,6 +142,11 @@ def _trim_partial_suffix(after: str, unit: str) -> str:
 
 def clean_transcript(text: str) -> str:
     """Replace hallucinated looping repetitions with [inaudible]."""
+    # First pass: collapse adjacent 2× word-level stutters (e.g. "Hello Hello",
+    # "usual usual").  This catches short repeats that _LOOP_RE misses.
+    text = re.sub(r'\b(\w{3,})\s+\1\b', r'\1', text)
+    # Also handle 2-char repeats like "Ah Ah"
+    text = re.sub(r'\b(\w{2})\s+\1\b', r'\1', text)
     prev = None
     while prev != text:
         prev = text
@@ -173,7 +179,9 @@ def transcribe_audio_sync(
     audio: Optional[np.ndarray] = None,
     language: str = "en",
     timeout_sec: int = 120,
-    mel_spectrogram: Optional[np.ndarray] = None
+    mel_spectrogram: Optional[np.ndarray] = None,
+    past_kv_cache_ort: Optional[dict] = None,
+    prefix_ids: Optional[list[int]] = None
 ) -> dict:
     """
     Synchronous ASR transcription using Cohere Transcribe ONNX model.
@@ -184,7 +192,9 @@ def transcribe_audio_sync(
         timeout_sec: Inference timeout in seconds
         mel_spectrogram: Precomputed mel-spectrogram features with shape [1, seq_len, 128]
                          If provided, audio parameter is ignored
-    
+        past_kv_cache_ort: Previous KV cache for incremental decoding
+        prefix_ids: Last few token IDs from the previous segment to use as a prefix
+
     Returns:
         Dict with transcribed text, tokens generated, timing, and audio duration.
     """
@@ -229,6 +239,12 @@ def transcribe_audio_sync(
             
             # Apply pre-emphasis (matches CohereAsrFeatureExtractor)
             audio_float = audio.astype(np.float32)
+            
+            # Step 1.1: Volume Normalization (Improved to reduce hallucinations)
+            rms = np.sqrt(np.mean(audio_float**2))
+            if rms > 0.005:  # Noise floor check
+                audio_float = audio_float * (0.06 / rms)
+
             audio_float[1:] -= 0.97 * audio_float[:-1]
             
             # Fast mel-spectrogram computation (5-10x faster than librosa)
@@ -269,14 +285,20 @@ def transcribe_audio_sync(
         # ====================================================================
         # Step 3: Prepare decoder inputs with prompt
         # ====================================================================
-        # Pre-computed prompt tokens (from state)
-        prompt_ids = state.pre_computed_prompt_ids
+        # Use the provided language to select the correct prompt tokens
+        if language == "en":
+            prompt_ids = state.pre_computed_prompt_ids
+        else:
+            lang_token = f"<|{language}|>"
+            prompt_tokens = [
+                "<|startofcontext|>", "<|startoftranscript|>", "<|emo:undefined|>",
+                lang_token, lang_token, "<|pnc|>", "<|noitn|>", "<|notimestamp|>", "<|nodiarize|>",
+            ]
+            prompt_ids = [token_to_id[t] for t in prompt_tokens if t in token_to_id]
         eos_id = state.pre_computed_eos_id
         
         # Initialize with batch size 1
         batch_size = 1
-        
-        generated_ids = list(prompt_ids)
         
         # ====================================================================
         # Step 4: Autoregressive generation with KV cache
@@ -289,42 +311,78 @@ def transcribe_audio_sync(
         num_heads = 8
         head_dim = 128
         
-        past_kv_cache = {}
-        for layer_idx in range(num_layers):
-            past_kv_cache[f"past_key_values.{layer_idx}.decoder.key"] = np.zeros(
-                (batch_size, num_heads, 0, head_dim), dtype=settings.decoder_dtype
-            )
-            past_kv_cache[f"past_key_values.{layer_idx}.decoder.value"] = np.zeros(
-                (batch_size, num_heads, 0, head_dim), dtype=settings.decoder_dtype
-            )
-            past_kv_cache[f"past_key_values.{layer_idx}.encoder.key"] = np.zeros(
-                (batch_size, num_heads, 0, head_dim), dtype=settings.decoder_dtype
-            )
-            past_kv_cache[f"past_key_values.{layer_idx}.encoder.value"] = np.zeros(
-                (batch_size, num_heads, 0, head_dim), dtype=settings.decoder_dtype
-            )
-        
+        # Determine current sequence length in the cache
+        past_seq_len = 0
+        if past_kv_cache_ort is not None:
+            # Extract length from the first decoder key in the cache
+            # OrtValue.shape() returns a list: [batch, heads, seq_len, head_dim]
+            first_key_name = f"past_key_values.0.decoder.key"
+            if first_key_name in past_kv_cache_ort:
+                past_seq_len = past_kv_cache_ort[first_key_name].shape()[2]
+
+        if past_kv_cache_ort is None:
+            # Initialize new KV cache with OrtValue objects
+            new_kv_cache = {}
+            for layer_idx in range(num_layers):
+                new_kv_cache[f"past_key_values.{layer_idx}.decoder.key"] = ort.OrtValue.ortvalue_from_numpy(
+                    np.zeros((batch_size, num_heads, 0, head_dim), dtype=settings.decoder_dtype), "cpu", 0
+                )
+                new_kv_cache[f"past_key_values.{layer_idx}.decoder.value"] = ort.OrtValue.ortvalue_from_numpy(
+                    np.zeros((batch_size, num_heads, 0, head_dim), dtype=settings.decoder_dtype), "cpu", 0
+                )
+                new_kv_cache[f"past_key_values.{layer_idx}.encoder.key"] = ort.OrtValue.ortvalue_from_numpy(
+                    np.zeros((batch_size, num_heads, 0, head_dim), dtype=settings.decoder_dtype), "cpu", 0
+                )
+                new_kv_cache[f"past_key_values.{layer_idx}.encoder.value"] = ort.OrtValue.ortvalue_from_numpy(
+                    np.zeros((batch_size, num_heads, 0, head_dim), dtype=settings.decoder_dtype), "cpu", 0
+                )
+            past_kv_cache_ort = new_kv_cache
+            past_seq_len = 0
+
+        else:
+            # IMPORTANT: We must reset the encoder KV cache entries every call 
+            # because the encoder_hidden_states are fresh for this specific audio chunk.
+            for layer_idx in range(num_layers):
+                past_kv_cache_ort[f"past_key_values.{layer_idx}.encoder.key"] = ort.OrtValue.ortvalue_from_numpy(
+                    np.zeros((batch_size, num_heads, 0, head_dim), dtype=settings.decoder_dtype), "cpu", 0
+                )
+                past_kv_cache_ort[f"past_key_values.{layer_idx}.encoder.value"] = ort.OrtValue.ortvalue_from_numpy(
+                    np.zeros((batch_size, num_heads, 0, head_dim), dtype=settings.decoder_dtype), "cpu", 0
+                )
+
+        # generated_ids tracks all tokens for output stripping (prompt + prefix
+        # context + newly generated).
+        generated_ids = list(prompt_ids)
+        if prefix_ids:
+            generated_ids.extend(prefix_ids[-20:])
+        num_context = len(generated_ids)
+
         decoder_start = time.perf_counter()
+        tokens_this_call = 0  # input tokens processed in this call so far (excl. cached)
         for step in range(max_new_tokens):
             # Get the last token ID(s) to feed
             if step == 0:
-                # First step: use full prompt
-                current_ids = np.array([prompt_ids], dtype=np.int64)
+                if past_kv_cache_ort is not None and prefix_ids:
+                    # Bridge: feed just the last prefix token — the KV cache
+                    # already holds the rest of the previous utterance's context.
+                    current_ids = np.array([[prefix_ids[-1]]], dtype=np.int64)
+                else:
+                    current_ids = np.array([prompt_ids], dtype=np.int64)
             else:
-                # Subsequent steps: use just the last generated token
                 current_ids = np.array([[generated_ids[-1]]], dtype=np.int64)
             
             # Build attention masks (all 1s - attend to everything)
             seq_length = current_ids.shape[1]
-            total_seq_len = len(generated_ids)  # All tokens generated so far
+            total_seq_len = past_seq_len + tokens_this_call + seq_length
             attention_mask = np.ones((batch_size, total_seq_len), dtype=np.int64)
             
             # Position IDs
             if step == 0:
-                position_ids = np.arange(seq_length, dtype=np.int64).reshape(batch_size, -1)
+                position_ids = (np.arange(seq_length, dtype=np.int64) + past_seq_len).reshape(batch_size, -1)
             else:
-                # Only position for the last token
                 position_ids = np.array([[total_seq_len - 1]], dtype=np.int64)
+            
+            tokens_this_call += seq_length
             
             # num_logits_to_keep: how many output logits to keep (1 for greedy decoding)
             num_logits_to_keep = np.array(1, dtype=np.int64)
@@ -338,20 +396,20 @@ def transcribe_audio_sync(
                 "encoder_hidden_states": encoder_hidden_state,
             }
             
-            # Add KV cache inputs
-            decoder_inputs.update(past_kv_cache)
+            # Add KV cache inputs (OrtValue objects)
+            decoder_inputs.update(past_kv_cache_ort)
             
             try:
                 dec_outputs = decoder.run(None, decoder_inputs)
                 logits = dec_outputs[0]  # Shape: [batch, num_logits_to_keep, vocab_size]
                 
                 # Extract and update KV cache from outputs
-                # Outputs: [logits, present.0.decoder.key, present.0.decoder.value, ...]
                 for layer_idx in range(num_layers):
-                    past_kv_cache[f"past_key_values.{layer_idx}.decoder.key"] = dec_outputs[1 + layer_idx * 4]
-                    past_kv_cache[f"past_key_values.{layer_idx}.decoder.value"] = dec_outputs[2 + layer_idx * 4]
-                    past_kv_cache[f"past_key_values.{layer_idx}.encoder.key"] = dec_outputs[3 + layer_idx * 4]
-                    past_kv_cache[f"past_key_values.{layer_idx}.encoder.value"] = dec_outputs[4 + layer_idx * 4]
+                    # Update past_kv_cache_ort with new OrtValue objects
+                    past_kv_cache_ort[f"past_key_values.{layer_idx}.decoder.key"] = dec_outputs[1 + layer_idx * 4]
+                    past_kv_cache_ort[f"past_key_values.{layer_idx}.decoder.value"] = dec_outputs[2 + layer_idx * 4]
+                    past_kv_cache_ort[f"past_key_values.{layer_idx}.encoder.key"] = dec_outputs[3 + layer_idx * 4]
+                    past_kv_cache_ort[f"past_key_values.{layer_idx}.encoder.value"] = dec_outputs[4 + layer_idx * 4]
                     
             except Exception as e:
                 log.error("decoder_inference_failed", step=step, error=str(e))
@@ -370,7 +428,7 @@ def transcribe_audio_sync(
             generated_ids.append(next_token_id)
             
             if (step + 1) % 10 == 0:
-                log.debug("generation_progress", step=step, tokens_generated=len(generated_ids) - len(prompt_ids))
+                log.debug("generation_progress", step=step, tokens_generated=len(generated_ids) - num_context)
         
         decoder_time = time.perf_counter() - decoder_start
         stage_timings["decoder_sec"] = decoder_time
@@ -378,8 +436,8 @@ def transcribe_audio_sync(
         # ====================================================================
         # Step 5: Decode tokens to text
         # ====================================================================
-        # Skip prompt tokens when decoding
-        generated_tokens = generated_ids[len(prompt_ids):]
+        # Skip context tokens when decoding (prompt or prefix context)
+        generated_tokens = generated_ids[num_context:]
         
         # Convert token IDs to text
         text_parts = []
@@ -397,7 +455,7 @@ def transcribe_audio_sync(
         # Clean up repetition artifacts (hallucinations)
         text = clean_transcript(text)
         
-        tokens_generated = len(generated_ids) - len(prompt_ids)
+        tokens_generated = len(generated_ids) - num_context
         stage_timings["decoder_avg_token_sec"] = stage_timings["decoder_sec"] / max(1, tokens_generated)
         inference_time = time.perf_counter() - start_time
         
@@ -416,14 +474,18 @@ def transcribe_audio_sync(
             "audio_duration_sec": audio_duration,
             "inference_time_sec": inference_time,
             "stage_timings": stage_timings,
+            "past_kv_cache_ort": past_kv_cache_ort, # Return the updated OrtValue KV cache
+            "last_token_ids": generated_ids[num_context:] # Return IDs for future prefixing
         }
 
 
 async def transcribe_audio_async(
     audio: Optional[np.ndarray] = None,
     language: str = "en",
-    timeout_sec: int = 120,
-    mel_spectrogram: Optional[np.ndarray] = None
+    timeout_sec: int = 120, # This is the request timeout, not inference timeout
+    mel_spectrogram: Optional[np.ndarray] = None,
+    past_kv_cache_ort: Optional[dict] = None,
+    prefix_ids: Optional[list[int]] = None
 ) -> dict:
     """Async wrapper for transcription."""
     loop = asyncio.get_event_loop()
@@ -433,5 +495,7 @@ async def transcribe_audio_async(
         audio, 
         language,
         timeout_sec,
-        mel_spectrogram
+        mel_spectrogram,
+        past_kv_cache_ort,
+        prefix_ids
     )
