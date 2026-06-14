@@ -1,8 +1,39 @@
+# Core dependencies
+fastapi
+uvicorn
+pydantic
+pydantic-settings
+numpy
+librosa
+python-dotenv
+onnxruntime-directml==1.24.1
+tokenizers
+huggingface-hub
+transformers>=4.52.1
+accelerate
+
+# Diarization
+scikit-learn
 torch
 torchaudio
-transformers>=4.52.1
-huggingface_hub
-soundfile
-scipy
-silero-vad
-# Add any specific diarization or audio processing libraries here (e.g., pyannote-audio)
+
+# Async HTTP client
+python-multipart
+aiohttp
+
+# Logging
+structlog
+
+# Progress bars
+tqdm
+
+# Optional: Rate limiting
+slowapi
+
+# Testing
+pytest
+
+# Streaming
+sounddevice
+websockets
+pyaudiowpatch

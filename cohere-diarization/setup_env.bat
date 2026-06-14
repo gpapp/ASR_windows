@@ -27,6 +27,23 @@ if %errorlevel% neq 0 (
 :: ONNX is faster 
 :: uv pip install --upgrade torch torchaudio --index-url https://download.pytorch.org/whl/xpu
 
+:: Check for NVIDIA CUDA and upgrade PyTorch if available
+nvidia-smi >nul 2>&1
+if %errorlevel% equ 0 (
+    echo.
+    echo CUDA detected - installing PyTorch with CUDA support...
+    uv pip install --upgrade onnxruntime-gpu
+    uv pip install --upgrade torch torchaudio --index-url https://download.pytorch.org/whl/cu130
+    if %errorlevel% neq 0 (
+        echo [WARNING] CUDA PyTorch install failed, falling back to CPU version.
+    ) else (
+        echo CUDA PyTorch installed successfully.
+    )
+) else (
+    echo.
+    echo No CUDA detected - using CPU-only PyTorch from requirements.txt.
+)
+
 echo.
 echo [3/3] Setup complete!
 echo.

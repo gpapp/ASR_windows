@@ -1,22 +1,54 @@
 @echo off
-REM This script initializes the Granite Diarization environment
+echo ============================================
+echo  Granite Diarization - Environment Setup
+echo ============================================
+echo.
 
-IF NOT EXIST .venv (
-    python -m venv .venv
+where uv >nul 2>&1
+if %errorlevel% neq 0 (
+    echo [ERROR] 'uv' is not installed or not in PATH.
+    echo Install it from: https://github.com/astral-sh/uv
+    pause
+    exit /b 1
 )
 
-echo Activating virtual environment...
-call .\.venv\Scripts\activate
+echo [1/3] Creating virtual environment...
+uv venv .venv --clear
 
-echo Installing dependencies from requirements.txt...
-uv pip install -r requirements.txt --upgrade
+echo [2/3] Installing base dependencies...
+call .venv\Scripts\activate
+uv pip install --upgrade -r requirements.txt
 
-echo Model cache setup (if needed)...
-:: Add logic here to ensure model download/caching happens correctly for ibm-granite/granite-speech-4.1-2b
-:: For now, assume standard HF download handles it.
+if %errorlevel% neq 0 (
+    echo [ERROR] Package installation failed.
+    pause
+    exit /b 1
+)
 
-echo Installing Torch CUDA packages
-uv pip install torch torchaudio --upgrade --index-url https://download.pytorch.org/whl/cu126 
+:: Check for NVIDIA CUDA and upgrade PyTorch if available
+nvidia-smi >nul 2>&1
+if %errorlevel% equ 0 (
+    echo.
+    echo CUDA detected - installing PyTorch with CUDA support...
+    uv pip install --upgrade onnxruntime-gpu
+    uv pip install --upgrade torch torchaudio --index-url https://download.pytorch.org/whl/cu130
+    if %errorlevel% neq 0 (
+        echo [WARNING] CUDA PyTorch install failed, falling back to CPU version.
+    ) else (
+        echo CUDA PyTorch installed successfully.
+    )
+) else (
+    echo.
+    echo No CUDA detected - using CPU-only PyTorch from requirements.txt.
+)
 
-
-echo Setup complete! Remember to run the script again after updating dependencies.
+echo.
+echo [3/3] Setup complete!
+echo.
+echo NOTE: The Granite Speech model (~4 GB) will be downloaded automatically
+echo       on first use from: ibm-granite/granite-speech-4.1-2b-plus
+echo       Additional models: Silero VAD, ECAPA-TDNN embedding
+echo       Model files will be saved to: models\
+echo.
+echo Drop audio/video files onto DropToTranscribe.bat to transcribe.
+pause
