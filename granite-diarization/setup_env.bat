@@ -30,7 +30,8 @@ nvidia-smi >nul 2>&1
 if %errorlevel% equ 0 (
     echo.
     echo CUDA detected - installing PyTorch with CUDA support...
-    uv pip install --upgrade onnxruntime-gpu
+    :: Do NOT install onnxruntime-gpu - it conflicts with onnxruntime-directml
+    :: ONNX models (VAD, embedding) use DirectML/CPU, not CUDA
     uv pip install --upgrade torch torchaudio --index-url https://download.pytorch.org/whl/cu130
     if %errorlevel% neq 0 (
         echo [WARNING] CUDA PyTorch install failed, falling back to CPU version.
