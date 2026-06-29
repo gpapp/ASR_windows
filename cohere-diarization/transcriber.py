@@ -310,7 +310,7 @@ def transcribe_audio_sync(
             lang_token = f"<|{language}|>"
             prompt_tokens = [
                 "<|startofcontext|>", "<|startoftranscript|>", "<|emo:undefined|>",
-                lang_token, lang_token, "<|pnc|>", "<|noitn|>", "<|notimestamp|>", "<|nodiarize|>",
+                lang_token, lang_token, "<|pnc|>", "<|noitn|>", "<|timestamp|>", "<|nodiarize|>",
             ]
             prompt_ids = [token_to_id[t] for t in prompt_tokens if t in token_to_id]
         eos_id = state.pre_computed_eos_id
@@ -452,26 +452,53 @@ def transcribe_audio_sync(
         stage_timings["decoder_sec"] = decoder_time
         
         # ====================================================================
-        # Step 5: Decode tokens to text
+        # Step 5: Decode tokens to timed segments
         # ====================================================================
         # Skip context tokens when decoding (prompt or prefix context)
         generated_tokens = generated_ids[num_context:]
         
-        # Convert token IDs to text
-        text_parts = []
+        # Split token constants
+        SPLIT_TOKEN_BASE = token_to_id.get("<|spltoken0|>", -1)
+        NUM_SPLIT_BINS = 34
+        
+        # Decode tokens into text parts and track split-token boundaries
+        segments = []
+        seg_text_parts = []
+        current_seg_start = 0.0
+        
         for token_id in generated_tokens:
             token_str = tokens_dict.get(token_id, "")
             if token_str.startswith("<|"):
-                # Skip special tokens
+                if SPLIT_TOKEN_BASE != -1 and SPLIT_TOKEN_BASE <= token_id < SPLIT_TOKEN_BASE + NUM_SPLIT_BINS:
+                    # Flush current text as a segment ending at this split point
+                    seg_text = "".join(seg_text_parts).strip()
+                    if seg_text:
+                        seg_end = audio_duration * (token_id - SPLIT_TOKEN_BASE) / NUM_SPLIT_BINS
+                        segments.append({
+                            "start": round(current_seg_start, 3),
+                            "end": round(seg_end, 3),
+                            "text": seg_text
+                        })
+                        current_seg_start = seg_end
+                    seg_text_parts = []
                 continue
-            # Replace sentence piece marker with space
             token_str = token_str.replace("▁", " ")
-            text_parts.append(token_str)
+            seg_text_parts.append(token_str)
         
-        text = "".join(text_parts).strip()
+        # Flush remaining text after the last split token
+        seg_text = "".join(seg_text_parts).strip()
+        if seg_text:
+            segments.append({
+                "start": round(current_seg_start, 3),
+                "end": round(audio_duration, 3),
+                "text": seg_text
+            })
         
-        # Clean up repetition artifacts (hallucinations)
-        text = clean_transcript(text)
+        # Clean each segment text individually, then build flat text
+        for seg in segments:
+            seg["text"] = clean_transcript(seg["text"])
+        text_parts = [s["text"] for s in segments]
+        text = " ".join(text_parts).strip()
         
         tokens_generated = len(generated_ids) - num_context
         stage_timings["decoder_avg_token_sec"] = stage_timings["decoder_sec"] / max(1, tokens_generated)
@@ -494,6 +521,7 @@ def transcribe_audio_sync(
         
         return {
             "text": text,
+            "segments": segments,
             "tokens_generated": tokens_generated,
             "audio_duration_sec": audio_duration,
             "inference_time_sec": inference_time,

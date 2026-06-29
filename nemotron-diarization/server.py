@@ -1,12 +1,11 @@
 """
-Production-ready ASR transcription server using ONNX Runtime.
+Production-ready ASR transcription server using Nemotron streaming ONNX model.
 
 Features:
 - Secure file upload and validated path access
 - Async request handling with thread pool for inference
 - Request validation and size limits
 - Timeout protection
-- KV cache pooling for memory efficiency
 - Structured logging
 - Optional API key authentication
 - Rate limiting
@@ -46,30 +45,22 @@ from api.exceptions import register_exception_handlers, PathSecurityError
 log = structlog.get_logger()
 
 
-# ============================================================================
-# Application Lifespan
-# ============================================================================
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan manager."""
     global global_executor
-    
+
     settings = get_settings()
-          
+
     global_executor = ThreadPoolExecutor(max_workers=settings.workers)
-    
-    # Assign to model_state module global
+
     import model_state
     model_state.executor = global_executor
-    
-    # Load models
+
     log.info("starting_server", host=settings.host, port=settings.port)
     load_models(settings)
-    
+
     yield
-    
-    # Cleanup
+
     log.info("shutting_down")
     if global_executor:
         global_executor.shutdown(wait=True)
@@ -77,29 +68,19 @@ async def lifespan(app: FastAPI):
     state.status = "shutdown"
 
 
-# ============================================================================
-# FastAPI Application
-# ============================================================================
-
 app = FastAPI(
-    title="Transcription Server",
-    description="Production ASR transcription service using Cohere model",
+    title="Nemotron Transcription Server",
+    description="Production ASR transcription service using Nemotron streaming model",
     version="1.0.0",
     lifespan=lifespan
 )
 
-# Apply middleware and exception handlers
 apply_middleware(app)
 register_exception_handlers(app)
 
 
-# ============================================================================
-# Endpoints
-# ============================================================================
-
 @app.get("/health", response_model=HealthResponse)
 async def health():
-    """Health check endpoint."""
     return HealthResponse(
         status="online" if state.is_ready else "degraded",
         model_status=state.status
@@ -113,52 +94,40 @@ async def _transcribe_chunks(
     full_mel_spectrogram: np.ndarray,
     chunk_sec: int = 120
 ) -> tuple[list[TimedSegment], float, int]:
-    """Transcribe audio in chunks, returning timed segments for speaker alignment.
-
-    Each chunk produces model-level timed segments (via <|spltokenN|> boundaries).
-    These are offset by chunk position and aggregated into the full list.
-
-    Larger chunks amortize encoder overhead. Default 120s — works well with q4
-    quantized encoder that has GPU memory headroom.
+    """
+    Transcribe audio in 120s chunks using Nemotron streaming API.
+    Returns timed segments with ~560ms granularity from streaming chunk positions.
     """
     import gc
 
     segments: list[TimedSegment] = []
     total_inference = 0.0
     total_tokens = 0
-
     chunk_samples = chunk_sec * 16000
-    chunk_frames = chunk_sec * 100  # 10ms per frame
 
     for start in range(0, len(audio), chunk_samples):
         chunk_start_sec = start / 16000
-        start_frame = start // 160
-        end_frame = min(start_frame + chunk_frames, full_mel_spectrogram.shape[1])
-        chunk_mel_spectrogram = full_mel_spectrogram[:, start_frame:end_frame, :]
+        audio_chunk = audio[start:start + chunk_samples]
 
         result = await transcribe_audio_async(
-            None,
-            language,
-            settings.request_timeout,
-            mel_spectrogram=chunk_mel_spectrogram
+            audio_chunk, language, settings.request_timeout,
+            use_chunked=True
         )
 
-        # Use model-level timed segments, offset by chunk position
-        for seg in result.get("segments", []):
-            offset_start = chunk_start_sec + seg["start"]
-            offset_end = chunk_start_sec + seg["end"]
-            seg_text = seg["text"]
-            if seg_text:
+        for ct in result.get("chunk_texts", []):
+            offset_start = chunk_start_sec + ct["start"]
+            offset_end = chunk_start_sec + ct["end"]
+            if ct["text"]:
                 segments.append(TimedSegment(
                     start=round(offset_start, 3),
                     end=round(offset_end, 3),
-                    text=seg_text
+                    text=ct["text"]
                 ))
 
         total_inference += result.get("inference_time_sec", 0.0)
         total_tokens += result.get("tokens_generated", 0)
 
-        chunk_mel_spectrogram = None
+        audio_chunk = None
         result = None
         gc.collect()
 
@@ -172,7 +141,6 @@ async def delayed_shutdown():
 
 @app.post("/shutdown")
 async def shutdown(_: str = Depends(verify_api_key)):
-    """Shutdown the server."""
     log.info("shutdown_requested")
     asyncio.create_task(delayed_shutdown())
     return {"status": "shutting down"}
@@ -184,15 +152,11 @@ async def diarize_path_endpoint(
     settings = Depends(get_settings),
     _: str = Depends(verify_api_key)
 ):
-    """
-    Streams Pyannote diarization progress as NDJSON, then yields the final segments.
-    """
     if not state.vad_session:
         return JSONResponse(
             status_code=400,
             content={"error": "Diarization not enabled or pipeline not loaded"}
         )
-    
     if not state.embedding_session:
         return JSONResponse(
             status_code=400,
@@ -209,7 +173,6 @@ async def diarize_path_endpoint(
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-    # Start diarization in thread
     diarizer = Diarizer(state, settings)
     task = asyncio.create_task(
         asyncio.to_thread(diarizer.run, req, queue, loop, str(resolved))
@@ -222,12 +185,9 @@ async def diarize_path_endpoint(
                 if msg is None:
                     break
                 yield msg + "\n"
-
-                # Stop if we hit a terminal message
                 if '"type": "result"' in msg or '"error"' in msg:
                     break
         finally:
-            # Free diarization memory after streaming completes
             state.embedding_cache.clear()
             gc.collect()
 
@@ -240,26 +200,19 @@ async def transcribe_upload(
     language: str = "en",
     _: str = Depends(verify_api_key)
 ):
-    """
-    Transcribe uploaded audio files.
-    
-    Accepts multiple audio files and returns transcriptions.
-    Supports WAV, MP3, MP4, M4A, FLAC, OGG formats.
-    """
     settings = get_settings()
     start_time = time.perf_counter()
-    
+
     if len(files) > settings.max_batch_size:
         return JSONResponse(
-            status_code=400, 
+            status_code=400,
             content={"error": f"Too many files. Max: {settings.max_batch_size}"}
         )
-      
+
     results = []
-    
+
     for file in files:
         try:
-            # Save to temp file
             with tempfile.NamedTemporaryFile(
                 suffix=Path(file.filename or "audio.wav").suffix,
                 delete=True
@@ -267,15 +220,14 @@ async def transcribe_upload(
                 content = await file.read()
                 tmp.write(content)
                 tmp.flush()
-                
-                # Load audio
+
                 load_start = time.perf_counter()
                 audio, _ = cast(
                     Tuple[np.ndarray, float],
                     await asyncio.to_thread(
                         lambda: librosa.load(tmp.name, sr=16000, mono=True)
                     )
-                )  # type: ignore[assignment]
+                )
                 audio_load_sec = time.perf_counter() - load_start
 
                 log.debug(
@@ -301,16 +253,8 @@ async def transcribe_upload(
 
                 full_mel_spectrogram = full_mel.T[np.newaxis, :, :].astype(np.float32)
 
-            # Process audio in chunks using the precomputed mel spectrogram
-            timed_segments = []
-            total_inference = 0
-            total_tokens = 0
-
             timed_segments, total_inference, total_tokens = await _transcribe_chunks(
-                audio,
-                language,
-                settings,
-                full_mel_spectrogram
+                audio, language, settings, full_mel_spectrogram
             )
 
             full_text = " ".join(s.text for s in timed_segments)
@@ -328,7 +272,7 @@ async def transcribe_upload(
                tokens_generated=result["tokens_generated"],
                segments=timed_segments
             ))
-                
+
         except Exception as e:
             log.error("transcription_failed", filename=file.filename, error=str(e))
             results.append(TranscribeResult(
@@ -338,8 +282,7 @@ async def transcribe_upload(
                 tokens_generated=0,
                 error=str(e)
             ))
-        
-        # Clear per-file memory to prevent accumulation across multiple files
+
         if "audio" in dir():
             audio = None
         if "full_mel_spectrogram" in dir():
@@ -347,7 +290,7 @@ async def transcribe_upload(
         if "full_mel" in dir():
             full_mel = None
         gc.collect()
-    
+
     return TranscribeResponse(
         results=results,
         total_time_sec=time.perf_counter() - start_time
@@ -360,29 +303,20 @@ async def transcribe_paths(
     settings = Depends(get_settings),
     _: str = Depends(verify_api_key)
 ):
-    """
-    Transcribe audio files by path.
-    
-    Paths must be accessible by the server and within allowed directories
-    if TRANSCRIBE_ALLOWED_AUDIO_DIR is set.
-    """
     start_time = time.perf_counter()
-    
     results = []
-    
+
     for path in req.wav_paths:
         try:
-            # Validate path
             resolved = validate_path_security(path, settings)
-            
-            # Load audio
+
             load_start = time.perf_counter()
             audio, _ = cast(
                 Tuple[np.ndarray, float],
                 await asyncio.to_thread(
                     lambda: librosa.load(str(resolved), sr=16000, mono=True)
                 )
-            )  # type: ignore[assignment]
+            )
             audio_load_sec = time.perf_counter() - load_start
 
             log.debug(
@@ -407,17 +341,9 @@ async def transcribe_paths(
             )
 
             full_mel_spectrogram = full_mel.T[np.newaxis, :, :].astype(np.float32)
-            
-            # Process audio in chunks using the precomputed mel spectrogram
-            timed_segments = []
-            total_inference = 0
-            total_tokens = 0
 
             timed_segments, total_inference, total_tokens = await _transcribe_chunks(
-                audio,
-                req.language,
-                settings,
-                full_mel_spectrogram
+                audio, req.language, settings, full_mel_spectrogram
             )
 
             full_text = " ".join(s.text for s in timed_segments)
@@ -436,13 +362,12 @@ async def transcribe_paths(
                 tokens_generated=result["tokens_generated"],
                 segments=timed_segments
             ))
-            
-            # Clear per-file memory to prevent accumulation across multiple files
+
             audio = None
             full_mel_spectrogram = None
             full_mel = None
             gc.collect()
-            
+
         except PathSecurityError as e:
             log.warning("path_security_error", path=path, error=str(e))
             results.append(TranscribeResult(
@@ -452,7 +377,6 @@ async def transcribe_paths(
                 tokens_generated=0,
                 error=f"Access denied: {e.message}"
             ))
-            
         except Exception as e:
             log.error("transcription_failed", path=path, error=str(e))
             results.append(TranscribeResult(
@@ -462,29 +386,23 @@ async def transcribe_paths(
                 tokens_generated=0,
                 error=str(e)
             ))
-        
+
     return TranscribeResponse(
         results=results,
         total_time_sec=time.perf_counter() - start_time
     )
 
 
-# ============================================================================
-# WebSocket endpoint for batch transcription with per-chunk progress
-# ============================================================================
-
 @app.websocket("/ws/transcribe")
 async def ws_transcribe(websocket: WebSocket):
     """Transcribe a file with per-chunk progress and stream speaker-attributed segments.
 
     Client sends:
-        {"wav_path": "...", "diarize_segments": [{"start": 0.0, "end": 5.2, "speaker": "SPEAKER1"}, ...],
-         "language": "en", "api_key": "..."}
+        {"wav_path": "...", "diarize_segments": [...], "language": "en", "api_key": "..."}
     Server streams:
-        {"type": "progress", "chunk": 1, "total_chunks": 5, ...}
-        {"type": "segment", "speaker": "SPEAKER1", "start": 0.0, "end": 5.2, "text": "..."}
+        {"type": "progress", "chunk": N, "total_chunks": M, ...}
+        {"type": "segment", "speaker": "...", "start": ..., "end": ..., "text": "..."}
         {"type": "done"}
-        {"type": "error", "message": "..."}
     """
     await websocket.accept()
     settings = get_settings()
@@ -507,28 +425,16 @@ async def ws_transcribe(websocket: WebSocket):
 
         audio, _ = librosa.load(str(resolved), sr=16000, mono=True)
 
-        audio_float = audio.astype(np.float32)
-        audio_float[1:] -= 0.97 * audio_float[:-1]
-        full_mel = _compute_mel_spectrogram_fast(audio_float)
-        full_mel_spectrogram = full_mel.T[np.newaxis, :, :].astype(np.float32)
-
         total_segments = len(diarize_segments)
 
-        # Transcribe each diarization segment independently.
-        # The Cohere model does NOT support timestamps, so per-segment
-        # transcription is the only way to get correct speaker-attributed text.
         for idx, ds in enumerate(diarize_segments):
-            # Extract mel slice with 0.5s padding for context
-            pad_sec = 0.5
-            start_sample = max(0, int((ds["start"] - pad_sec) * 16000))
-            end_sample = min(len(audio), int((ds["end"] + pad_sec) * 16000))
-            start_frame = start_sample // 160
-            end_frame = min(end_sample // 160, full_mel_spectrogram.shape[1])
-            seg_mel = full_mel_spectrogram[:, start_frame:end_frame, :]
+            start_sample = int(ds["start"] * 16000)
+            end_sample = int(ds["end"] * 16000)
+            seg_audio = audio[start_sample:end_sample]
 
             result = await transcribe_audio_async(
-                None, language, settings.request_timeout,
-                mel_spectrogram=seg_mel
+                seg_audio, language, settings.request_timeout,
+                use_chunked=False
             )
 
             text = result.get("text", "").strip()
@@ -550,7 +456,7 @@ async def ws_transcribe(websocket: WebSocket):
                 "inference_time_sec": round(result.get("inference_time_sec", 0.0), 3)
             })
 
-            seg_mel = None
+            seg_audio = None
             result = None
             gc.collect()
 
@@ -572,15 +478,11 @@ async def ws_transcribe(websocket: WebSocket):
 app.add_api_websocket_route("/ws/stream", stream_transcribe)
 
 
-# ============================================================================
-# Main
-# ============================================================================
-
 if __name__ == "__main__":
     import uvicorn
-    
+
     settings = get_settings()
-    
+
     uvicorn.run(
         app,
         host=settings.host,

@@ -184,7 +184,7 @@ def load_models(settings: Settings):
     # Pre-compute prompt tokens for transcription
     prompt_tokens = [
         "<|startofcontext|>", "<|startoftranscript|>", "<|emo:undefined|>",
-        "<|en|>", "<|en|>", "<|pnc|>", "<|noitn|>", "<|notimestamp|>", "<|nodiarize|>",
+        "<|en|>", "<|en|>", "<|pnc|>", "<|noitn|>", "<|timestamp|>", "<|nodiarize|>",
     ]
     pre_computed_prompt_ids = [token_to_id[t] for t in prompt_tokens if t in token_to_id]
     pre_computed_eos_id = token_to_id.get("<|endoftext|>", -1)

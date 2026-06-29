@@ -1,0 +1,44 @@
+# Core dependencies
+fastapi
+uvicorn
+pydantic
+pydantic-settings
+numpy
+librosa
+python-dotenv
+# cpu only: onnxruntime
+onnxruntime-directml
+#onnxruntime-openvino==1.24.1
+#openvino==2025.4.1
+tokenizers
+huggingface-hub
+
+# ONNX Runtime GenAI for Nemotron streaming ASR
+onnxruntime-genai
+onnxruntime-genai[directml]
+
+# Diarization
+scikit-learn
+torch
+torchaudio
+
+# Async HTTP client
+python-multipart
+aiohttp
+
+# Logging
+structlog
+
+# Progress bars
+tqdm
+
+# Optional: Rate limiting
+slowapi
+
+# Testing
+pytest
+
+# Streaming
+sounddevice
+websockets
+pyaudiowpatch

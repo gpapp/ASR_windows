@@ -88,7 +88,7 @@ class Config:
     """Transcription client configuration."""
     
     # Server settings
-    server_url: str = "http://127.0.0.1:8000"
+    server_url: str = "http://127.0.0.1:8001"
     api_key: Optional[str] = None
     request_timeout: int = 600
     
@@ -1359,10 +1359,10 @@ def main():
 Examples:
   %(prog)s recording.mp3
   %(prog)s *.wav --format srt
-  %(prog)s meeting.mp4 --server http://localhost:8000
+  %(prog)s meeting.mp4 --server http://localhost:8001
   
   Environment variables:
-    TRANSCRIBE_SERVER_URL  - Server URL (default: http://127.0.0.1:8000)
+    TRANSCRIBE_SERVER_URL  - Server URL (default: http://127.0.0.1:8001)
     TRANSCRIBE_API_KEY     - API key for authentication
     TRANSCRIBE_TIMEOUT     - Request timeout in seconds
     TRANSCRIBE_BATCH_SIZE  - Batch size for requests
@@ -1384,7 +1384,7 @@ Examples:
     parser.add_argument(
         "--server", "-s",
         default=None,
-        help="Server URL (default: http://127.0.0.1:8000)"
+        help="Server URL (default: http://127.0.0.1:8001)"
     )
     parser.add_argument(
         "--format", "-f",

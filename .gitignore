@@ -1,7 +1,8 @@
-*/.venv
-*/.env
-*/models
-*/__pycache__
+**/.venv
+**/.env
+**/__pycache__
+**/.pytest_cache/
+
 
 cohere-diarization/samples
 granite-diarization/samples

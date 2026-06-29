@@ -1,5 +1,5 @@
 """
-Real-time dual-channel streaming transcription via WebSocket.
+Real-time dual-channel streaming transcription via WebSocket using Nemotron ASR.
 """
 
 import json
@@ -17,7 +17,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 from settings import get_settings
 from model_state import state
 from config import get
-from transcriber import transcribe_audio_sync, clean_transcript
+from transcriber import transcribe_segment, clean_transcript
 from speaker.audio import extract_fbank, generate_sliding_windows
 from speaker.vad import run_vad_onnx_direct, split_at_energy_dips
 from speaker.profiling import profile_speakers
@@ -28,10 +28,6 @@ log = structlog.get_logger()
 
 VOICEPRINTS_PATH = Path(__file__).parent / "voiceprints.json"
 
-
-# ============================================================================
-# Voiceprint Management
-# ============================================================================
 
 def _stream_load_voiceprints() -> dict:
     if VOICEPRINTS_PATH.exists():
@@ -55,7 +51,6 @@ def _estimate_embedding_from_audio(
     audio_1d: np.ndarray,
     sr: int = 16000,
 ) -> np.ndarray | None:
-    """Extract a single L2-normalised speaker embedding from an audio chunk."""
     if not state.embedding_session or len(audio_1d) < sr * 1.5:
         return None
     wav_t = torch.from_numpy(audio_1d).float().unsqueeze(0)
@@ -76,7 +71,6 @@ def _estimate_embedding_from_audio(
                 fb = torch.nn.functional.pad(fb, (0, 0, 0, max_len - fb.shape[1]))
             padded.append(fb)
         batch = torch.stack(padded, dim=0)
-        # Ensure explicit float32 dtype for iGPU execution
         batch = (batch - batch.mean(dim=2, keepdim=True)).squeeze(1).numpy().astype(np.float32)
         embs = state.embedding_session.run(None, {
             state.embedding_session.get_inputs()[0].name: batch
@@ -89,25 +83,14 @@ def _estimate_embedding_from_audio(
         return None
 
 
-# ============================================================================
-# Speaker Window Processing
-# ============================================================================
-
 def _process_speaker_window(
     audio_1d: np.ndarray,
     voiceprints: dict,
     window_start: float,
     recording_ts: str,
     session_new_speakers: dict,
-    speaker_kv_caches: dict[str, dict], # New parameter for persistent KV cache
-    speaker_prefix_ids: dict[str, list[int]], # New parameter for token prefixing
     sr: int = 16000,
 ) -> tuple[list[dict], dict]:
-    """
-    Run VAD + energy-dip splitting + sliding-window diarization + ASR on a
-    mono float32 chunk of arbitrary length (typically one VAD-bounded utterance).
-    Returns (transcript_messages, updated_session_new_speakers).
-    """
     results = []
     ASR_MIN = int(sr * 3.0)
 
@@ -116,7 +99,6 @@ def _process_speaker_window(
 
     wav_t = torch.from_numpy(audio_1d).float().unsqueeze(0)
 
-    # 1. VAD
     if not state.vad_session:
         return results, session_new_speakers
 
@@ -133,10 +115,8 @@ def _process_speaker_window(
     if not speech_ts:
         return results, session_new_speakers
 
-    # 1b. Energy-dip splitting
     speech_ts = split_at_energy_dips(speech_ts, audio_1d, sample_rate=sr)
 
-    # 2. Sliding-window embedding extraction
     MIN_EMBED_DUR = 1.5
     all_fbanks = []
     all_seg_meta = []
@@ -160,9 +140,8 @@ def _process_speaker_window(
                 embeddable_idxs.append(idx)
 
     if not all_fbanks or not state.embedding_session:
-        # Fallback: transcribe whole utterance as unknown speaker
         asr_audio = audio_1d if len(audio_1d) >= ASR_MIN else np.pad(audio_1d, (0, ASR_MIN - len(audio_1d)))
-        result = transcribe_audio_sync(asr_audio)
+        result = transcribe_segment(asr_audio)
         text = result.get("text", "")
         if text.strip():
             results.append({
@@ -176,7 +155,6 @@ def _process_speaker_window(
             })
         return results, session_new_speakers
 
-    # Batch embedding
     max_len = max(fb.shape[1] for fb in all_fbanks)
     padded = []
     for fb in all_fbanks:
@@ -196,7 +174,6 @@ def _process_speaker_window(
     norms = np.linalg.norm(raw_embs, axis=1, keepdims=True)
     raw_embs = raw_embs / np.maximum(norms, 1e-12)
 
-    # 3. Clustering
     settings = get_settings()
     if len(raw_embs) > 1:
         clusterer = AgglomerativeClustering(
@@ -209,7 +186,6 @@ def _process_speaker_window(
     else:
         labels = np.array([0])
 
-    # 4. Map raw clusters to speaker names (try voiceprint match)
     cluster_centroids = {}
     for cid in set(labels):
         mask = labels == cid
@@ -217,11 +193,9 @@ def _process_speaker_window(
         norm_emb = mean_emb / (np.linalg.norm(mean_emb) + 1e-12)
         cluster_centroids[int(cid)] = norm_emb
 
-    # Assign raw labels to segments
     for idx, label in zip(embeddable_idxs, labels):
         all_seg_meta[idx]["raw_label"] = int(label)
 
-    # Assign short windows to nearest embeddable window
     emb_mids = np.array([
         (all_seg_meta[i]["start"] + all_seg_meta[i]["end"]) / 2
         for i in embeddable_idxs
@@ -232,7 +206,6 @@ def _process_speaker_window(
             nearest = int(np.argmin(np.abs(emb_mids - mid)))
             seg["raw_label"] = all_seg_meta[embeddable_idxs[nearest]]["raw_label"]
 
-    # Match clusters to voiceprints, then to session speakers
     accept_thresh = get("matching", "accept_threshold", 0.35)
     clear_gap = get("matching", "clear_winner_gap", 0.02)
     embed_only_t = get("matching", "embed_only_threshold", 0.16)
@@ -243,7 +216,6 @@ def _process_speaker_window(
     next_spk_num = len(session_new_speakers) + 1
 
     for raw_id, centroid in sorted(cluster_centroids.items()):
-        # --- voiceprint match ---
         best_vp, best_vp_dist, second_vp_dist = None, 1.0, 1.0
         for vp_name, vp_data in voiceprints.items():
             if "embedding" not in vp_data:
@@ -264,7 +236,6 @@ def _process_speaker_window(
             speaker_map[raw_id] = best_vp
             continue
 
-        # --- session speaker match (stable SPEAKER_N across utterances) ---
         best_sess, best_sess_dist = None, 1.0
         for sname, sdata in session_new_speakers.items():
             se = np.array(sdata["embedding"])
@@ -275,7 +246,6 @@ def _process_speaker_window(
 
         if best_sess and best_sess_dist < clust_thresh:
             speaker_map[raw_id] = best_sess
-            # Update running-average centroid
             n = session_new_speakers[best_sess].get("n_utterances", 1)
             old = np.array(session_new_speakers[best_sess]["embedding"])
             updated = (old * n + centroid) / (n + 1)
@@ -295,7 +265,6 @@ def _process_speaker_window(
                 "n_utterances": 1,
             }
 
-    # 5. Merge contiguous same-speaker windows into segments
     merged = []
     all_seg_meta.sort(key=lambda x: x["start"])
     cur = None
@@ -311,11 +280,9 @@ def _process_speaker_window(
     if cur:
         merged.append(cur)
 
-    # 5b. Island absorption + ghost-speaker elimination
     merged = absorb_islands(merged)
     merged = eliminate_ghost_speakers(merged, profiles=None)
 
-    # 6. Transcribe each merged segment
     for seg in merged:
         s = max(0, int(seg["start"] * sr))
         e = min(len(audio_1d), int(seg["end"] * sr))
@@ -324,22 +291,17 @@ def _process_speaker_window(
         seg_audio = audio_1d[s:e]
 
         spk = seg["speaker"]
-        current_kv_cache = speaker_kv_caches.get(spk)
-        current_prefix_ids = speaker_prefix_ids.get(spk)
 
-        dur = (e - s) / sr
-        asr_audio = seg_audio if len(seg_audio) >= ASR_MIN else np.pad(seg_audio, (0, ASR_MIN - len(seg_audio)))
         try:
-            result = transcribe_audio_sync(asr_audio, past_kv_cache_ort=current_kv_cache, prefix_ids=current_prefix_ids)
+            result = transcribe_segment(seg_audio)
             text = result.get("text", "")
-            token_count = result.get("tokens_generated", 0)
+            token_count = len(text.split())
+            dur = (e - s) / sr
             conf_score = min(0.95, max(0.3, token_count / (dur * 10 + 1)))
-            speaker_kv_caches[spk] = result.get("past_kv_cache_ort") # Store updated KV cache
-            speaker_prefix_ids[spk] = result.get("last_token_ids") # Store token IDs for next utterance
         except Exception:
             text = ""
             conf_score = 0.0
-        
+
         if not text.strip():
             continue
 
@@ -354,7 +316,6 @@ def _process_speaker_window(
             "confidence": round(conf_score, 3),
         })
 
-        # Accumulate audio for persistence
         if spk in session_new_speakers:
             session_new_speakers[spk]["audio_fragments"].append(seg_audio)
             session_new_speakers[spk]["total_sec"] += dur
@@ -372,10 +333,6 @@ def _persist_new_speakers(
     min_speech_sec: float = 30.0,
     min_confidence: float = 0.8,
 ):
-    """
-    Persist new speakers to voiceprints.json if they have enough data and confidence.
-    Uses naming pattern: recording_timestamp_SPEAKER_x
-    """
     persisted = []
     for spk_key, data in list(session_new_speakers.items()):
         if data["total_sec"] < min_speech_sec:
@@ -383,36 +340,25 @@ def _persist_new_speakers(
         avg_conf = data["confidence_sum"] / max(1, data["count"])
         if avg_conf < min_confidence:
             continue
-
-        # Concatenate all audio fragments
         if not data["audio_fragments"]:
             continue
         all_audio = np.concatenate(data["audio_fragments"])
         dur = len(all_audio) / sr
         if dur < 5.0:
             continue
-
-        # Estimate embedding
         emb = _estimate_embedding_from_audio(all_audio, sr)
         if emb is None:
             continue
-
-        # Generate speaker profile
         wav_t = torch.from_numpy(all_audio).float().unsqueeze(0)
         mock_segments = [{"start": 0.0, "end": dur, "speaker": spk_key}]
         prof = profile_speakers(wav_t, mock_segments, sr)
         speaker_prof = prof.get(spk_key, {})
         speaker_prof["embedding"] = emb.tolist() if isinstance(emb, np.ndarray) else emb
-
-        # Assign persistent name
         existing_names = [n for n in voiceprints.keys() if n.startswith(f"{recording_ts}_SPEAKER")]
         next_n = len(existing_names) + 1
         persistent_name = f"{recording_ts}_SPEAKER_{next_n}"
-
         voiceprints[persistent_name] = speaker_prof
         persisted.append(persistent_name)
-
-        # Clean up session tracking
         del session_new_speakers[spk_key]
 
     if persisted:
@@ -421,22 +367,7 @@ def _persist_new_speakers(
             log.info("new_speaker_persisted", name=name)
 
 
-# ============================================================================
-# WebSocket Endpoint
-# ============================================================================
-
 async def stream_transcribe(websocket: WebSocket):
-    """
-    WebSocket endpoint for real-time dual-channel streaming transcription.
-
-    Client sends:
-    1. JSON config: {"my_name": "...", "recording_ts": "YYYYMMDD_HHMMSS"}
-    2. Binary PCM frames: 2-channel int16, 16kHz, interleaved [L=mic, R=speakers]
-
-    VAD detects sentence boundaries; each utterance is processed with the full
-    sliding-window diarization pipeline (energy-dip split → embed → cluster →
-    voiceprint match → ASR).  SPEAKER_N labels are stable across the session.
-    """
     await websocket.accept()
     log.debug("stream_connected")
 
@@ -471,10 +402,8 @@ async def stream_transcribe(websocket: WebSocket):
     session_time = 0.0
 
     voiceprints = _stream_load_voiceprints()
-    mic_kv_cache: Optional[dict] = None # KV cache for the mic channel
-    mic_prefix_ids: Optional[list[int]] = None # Token prefix for mic channel
-    speaker_kv_caches: dict[str, dict] = {} # KV caches for remote speakers
-    speaker_prefix_ids: dict[str, list[int]] = {} # Token prefixes per speaker
+    speaker_kv_caches: dict[str, dict] = {}
+    speaker_prefix_ids: dict[str, list[int]] = {}
     session_new_speakers: dict = {}
 
     def _vad_has_speech(audio: np.ndarray) -> bool:
@@ -491,26 +420,21 @@ async def stream_transcribe(websocket: WebSocket):
         except Exception:
             return True
 
-    def _process_mic_utterance(audio: np.ndarray, past_kv_cache_mic: Optional[dict], prefix_ids_mic: Optional[list[int]]) -> tuple[list[dict], Optional[dict], Optional[list[int]]]:
-        """Simple VAD-gated ASR for the mic channel (speaker is always MY_NAME)."""
-        updated_kv_cache_mic = past_kv_cache_mic
-        updated_prefix_ids_mic = prefix_ids_mic
-        asr_in = audio if len(audio) >= ASR_MIN else np.pad(audio, (0, ASR_MIN - len(audio)))
+    def _process_mic_utterance(audio: np.ndarray) -> tuple[list[dict], None, None]:
+        ASR_MIN_LOCAL = int(SR * 3)
+        asr_in = audio if len(audio) >= ASR_MIN_LOCAL else np.pad(audio, (0, ASR_MIN_LOCAL - len(audio)))
         try:
-            result = transcribe_audio_sync(asr_in, past_kv_cache_ort=past_kv_cache_mic, prefix_ids=prefix_ids_mic)
+            result = transcribe_segment(asr_in)
             text = clean_transcript(result.get("text", ""))
-            updated_kv_cache_mic = result.get("past_kv_cache_ort")
-            updated_prefix_ids_mic = result.get("last_token_ids")
         except Exception:
             text = ""
-
         if not text.strip():
-            return [], updated_kv_cache_mic, updated_prefix_ids_mic
+            return [], None, None
         return [{"type": "transcript", "channel": "mic", "speaker": my_name,
-                 "text": text, "confidence": 0.9}], updated_kv_cache_mic, updated_prefix_ids_mic
+                 "text": text, "confidence": 0.9}], None, None
 
     async def flush_utterance(ch: ChannelState, channel: str):
-        nonlocal session_new_speakers, voiceprints, mic_kv_cache, mic_prefix_ids, speaker_kv_caches, speaker_prefix_ids
+        nonlocal session_new_speakers, voiceprints
         audio = ch.utt_buf.copy()
         ch.utt_buf = np.array([], dtype=np.float32)
         ch.in_speech = False
@@ -521,9 +445,7 @@ async def stream_transcribe(websocket: WebSocket):
             return
 
         if channel == "mic":
-            msgs, updated_mic_kv_cache, updated_mic_prefix_ids = await asyncio.to_thread(_process_mic_utterance, audio, mic_kv_cache, mic_prefix_ids)
-            mic_kv_cache = updated_mic_kv_cache # Update mic KV cache
-            mic_prefix_ids = updated_mic_prefix_ids # Update mic prefix token IDs
+            msgs, _, _ = await asyncio.to_thread(_process_mic_utterance, audio)
             for msg in msgs:
                 msg.setdefault("start", round(start_time, 2))
                 msg.setdefault("end", round(start_time + len(audio) / SR, 2))
@@ -534,7 +456,7 @@ async def stream_transcribe(websocket: WebSocket):
         else:
             msgs, session_new_speakers = await asyncio.to_thread(
                 _process_speaker_window,
-                audio, voiceprints, start_time, recording_ts, session_new_speakers, speaker_kv_caches, speaker_prefix_ids,
+                audio, voiceprints, start_time, recording_ts, session_new_speakers,
             )
             for msg in msgs:
                 try:
@@ -598,7 +520,6 @@ async def stream_transcribe(websocket: WebSocket):
                 except Exception:
                     pass
 
-        # Normal loop termination
         if len(mic_ch.utt_buf) > 0:
             await flush_utterance(mic_ch, "mic")
         if len(spk_ch.utt_buf) > 0:
