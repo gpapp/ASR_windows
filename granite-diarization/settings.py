@@ -68,6 +68,11 @@ class Settings(BaseSettings):
     enable_cors: bool = True
     cors_origins: str = "*"
 
+    # ONNX settings
+    onnx_model_id: str = "smcleod/ibm-granite-speech-4.1-2b-plus-onnx"
+    onnx_precision: str = "int8"
+    onnx_model_dir: Path = Path(__file__).parent.parent / "models/granite-speech-onnx"
+
     # Feature flags
     enable_rate_limit: bool = True
     hf_token: Optional[str] = None

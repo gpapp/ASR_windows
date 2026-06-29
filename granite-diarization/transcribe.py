@@ -1059,6 +1059,7 @@ async def transcribe_files(input_paths: list[str], config: Config, args):
     client = TranscriptionClient(config)
 
     try:
+        import time
         overall_start_time = time.perf_counter()
 
         log.info("Checking server health...")

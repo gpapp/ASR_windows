@@ -1,5 +1,5 @@
 """
-Model loading for Granite ASR (transformers) and auxiliary ONNX models.
+Model loading for Granite ASR (ONNX int8) and auxiliary ONNX models.
 """
 
 import os
@@ -10,13 +10,26 @@ import json
 import numpy as np
 import onnxruntime as ort
 import structlog
-import torch
-from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq
+from transformers import AutoProcessor
 
 from settings import Settings
 from model_state import state
 
 log = structlog.get_logger()
+
+ONNX_GRAPHS = [
+    "encoder.onnx",
+    "embed_tokens.onnx",
+    "prompt_encode.onnx",
+    "decode_step.onnx",
+]
+SHARED_FILES = [
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "processor_config.json",
+    "chat_template.jinja",
+    "granite_export_metadata.json",
+]
 
 
 def get_igpu_session_options(provider_type: str = "DirectML", settings: Settings = Settings()):
@@ -110,36 +123,100 @@ def ensure_embedding_model(settings: Settings) -> Path:
         raise
 
 
-def load_models(settings: Settings):
-    """Load Granite ASR model + Silero VAD + ECAPA-TDNN embedding model."""
+def ensure_onnx_model(settings: Settings) -> Path:
+    """Download int8 ONNX graphs and shared files if not present."""
+    local_dir = settings.onnx_model_dir
+    precision = settings.onnx_precision
 
-    log.info("--- Initialising Granite + Silero VAD + ECAPA-TDNN ---")
+    int8_dir = local_dir / precision
+    if int8_dir.exists():
+        present = all((int8_dir / g).exists() for g in ONNX_GRAPHS)
+        if present:
+            log.info("onnx_model_present", path=str(int8_dir))
+            return local_dir
 
-    # 1. Auto-detect device
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    state.device = device
-    log.info("device_selected", device=device)
+    log.info("downloading_onnx_model", repo=settings.onnx_model_id, precision=precision)
+    local_dir.mkdir(parents=True, exist_ok=True)
 
-    # 2. Load Granite ASR
-    log.info("loading_granite_model", repo=settings.model_repo)
     try:
-        processor = AutoProcessor.from_pretrained(settings.model_repo, token=settings.hf_token)
-        dtype = torch.bfloat16 if device == "cuda" else torch.float32
-        model = AutoModelForSpeechSeq2Seq.from_pretrained(
-            settings.model_repo,
-            device_map=device,
-            torch_dtype=dtype,
-            token=settings.hf_token,
-        )
-        model.eval()
-        state.processor = processor
-        state.model = model
-        log.info("granite_model_loaded", device=device, dtype=str(dtype))
+        from huggingface_hub import hf_hub_download
+
+        for graph in ONNX_GRAPHS:
+            hf_hub_download(
+                repo_id=settings.onnx_model_id,
+                filename=f"{precision}/{graph}",
+                local_dir=str(local_dir),
+                token=settings.hf_token,
+            )
+            data_file = graph + "_data"
+            hf_hub_download(
+                repo_id=settings.onnx_model_id,
+                filename=f"{precision}/{data_file}",
+                local_dir=str(local_dir),
+                token=settings.hf_token,
+            )
+
+        for shared in SHARED_FILES:
+            hf_hub_download(
+                repo_id=settings.onnx_model_id,
+                filename=shared,
+                local_dir=str(local_dir),
+                token=settings.hf_token,
+            )
+
+        log.info("onnx_model_downloaded")
     except Exception as e:
-        log.error("granite_model_load_failed", error=str(e))
+        log.error("onnx_model_download_failed", error=str(e))
+        raise
+    return local_dir
+
+
+def load_models(settings: Settings):
+    """Load Granite ASR ONNX int8 (CPU) + Silero VAD (CPU) + ECAPA-TDNN (DML)."""
+    emb_provider_type = "DirectML" 
+
+    log.info("--- Initialising Granite ONNX int8 (CPU) + VAD (CPU) + ECAPA (DML) ---")
+
+    # 1. Download Granite ONNX int8 graphs
+    model_dir = ensure_onnx_model(settings)
+    precision_dir = model_dir / settings.onnx_precision
+
+    log.info("loading_onnx_graphs", precision=settings.onnx_precision)
+    emb_providers, emb_provider_options, emb_opts = get_igpu_session_options(emb_provider_type, settings)
+    cpu_providers, _, cpu_opts = get_igpu_session_options("CPU", settings)
+
+    for session_name, attr_name in [
+        ("encoder.onnx", "encoder_session"),
+        ("embed_tokens.onnx", "embed_tokens_session"),
+        ("prompt_encode.onnx", "prompt_encode_session"),
+        ("decode_step.onnx", "decode_step_session"),
+    ]:
+        sess = ort.InferenceSession(
+            str(precision_dir / session_name),
+            providers=cpu_providers,
+            sess_options=cpu_opts,
+        )
+        setattr(state, attr_name, sess)
+
+    log.info("onnx_graphs_loaded",
+        encoder="CPU (int8)",
+        embed_tokens="CPU (int8)",
+        prompt_encode="CPU (int8)",
+        decode_step="CPU (int8)",
+    )    
+
+    # 3. Load processor (tokenizer + feature extractor) from ONNX repo
+    log.info("loading_processor")
+    try:
+        processor = AutoProcessor.from_pretrained(str(settings.onnx_model_dir))
+        state.processor = processor
+        state.tokenizer = processor.tokenizer
+        log.info("processor_loaded")
+    except Exception as e:
+        log.error("processor_loading_failed", error=str(e))
         raise
 
-    # 3. Load VAD ONNX (CPU)
+    # 4. Load VAD ONNX (CPU)
     _, cpu_opts = get_igpu_session_options("CPU", settings)[::2]
     log.info("loading_vad_model")
     try:
@@ -154,19 +231,17 @@ def load_models(settings: Settings):
         log.error("vad_load_failed", error=str(e))
         raise
 
-    # 4. Load embedding model (DirectML/CPU)
+    # 5. Load embedding model (DirectML/CPU)
     log.info("loading_embedding_model")
-    PROVIDER_SELECTION = settings.provider_type if hasattr(settings, 'provider_type') else "CPU"
-    providers, provider_options, opts = get_igpu_session_options(PROVIDER_SELECTION, settings)
     try:
         emb_path = str(ensure_embedding_model(settings))
         state.embedding_session = ort.InferenceSession(
             emb_path,
-            sess_options=opts,
-            providers=providers,
-            provider_options=provider_options if provider_options else None
+            sess_options=emb_opts,
+            providers=emb_providers,
+            provider_options=emb_provider_options if emb_provider_options else None
         )
-        log.info("embedding_model_loaded", provider=PROVIDER_SELECTION)
+        log.info("embedding_model_loaded", provider=emb_provider_type)
     except Exception as e:
         log.error("embedding_model_load_failed", error=str(e), fallback="CPU")
         try:

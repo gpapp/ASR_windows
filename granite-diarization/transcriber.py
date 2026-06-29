@@ -1,5 +1,6 @@
 """
 Granite ASR transcription: SAA (speaker-attributed) and plain ASR modes.
+ONNX int8 path when available, fallback to PyTorch.
 """
 
 import sys
@@ -11,7 +12,6 @@ from contextlib import contextmanager
 from typing import Optional
 
 import numpy as np
-import torch
 import structlog
 
 from settings import get_settings
@@ -147,7 +147,16 @@ def inference_timeout(seconds: int):
         signal.signal(signal.SIGALRM, old_handler)
 
 
-@torch.inference_mode()
+def _transcribe_onnx(
+    audio: np.ndarray,
+    prompt_text: str,
+    max_new_tokens: int,
+) -> dict:
+    from granite_onnx import transcribe_audio
+    text = transcribe_audio(audio, prompt_text, max_new_tokens)
+    return {"text": text}
+
+
 def transcribe_saa_sync(
     audio: np.ndarray,
     prefix_text: Optional[str] = None,
@@ -171,35 +180,51 @@ def transcribe_saa_sync(
     audio_duration = len(audio) / 16000
 
     with inference_timeout(timeout_sec):
-        processor = state.processor
-        model = state.model
-        device = state.device
+        tokenizer = state.tokenizer
+        if tokenizer is None:
+            raise TranscriptionError("No tokenizer available")
 
-        chat = [
-            {"role": "system", "content": settings.system_prompt},
-            {"role": "user", "content": settings.saa_prompt},
-        ]
-        extra = {"prefix_text": prefix_text} if prefix_text else {}
-        tokenizer = processor.tokenizer
-        prompt_text = tokenizer.apply_chat_template(
-            chat, tokenize=False, add_generation_prompt=True, **extra
-        )
+        if state.onnx_ready:
+            chat = [
+                {"role": "system", "content": settings.system_prompt},
+                {"role": "user", "content": settings.saa_prompt},
+            ]
+            extra = {"prefix_text": prefix_text} if prefix_text else {}
+            prompt_text = tokenizer.apply_chat_template(
+                chat, tokenize=False, add_generation_prompt=True, **extra
+            )
+            raw = _transcribe_onnx(audio, prompt_text, settings.max_new_tokens)
+            text = raw.get("text", "")
+        else:
+            import torch
+            processor = state.processor
+            model = state.model
+            device = state.device
 
-        inputs = processor(prompt_text, audio, device=device, return_tensors="pt").to(device)
+            chat = [
+                {"role": "system", "content": settings.system_prompt},
+                {"role": "user", "content": settings.saa_prompt},
+            ]
+            extra = {"prefix_text": prefix_text} if prefix_text else {}
+            prompt_text = tokenizer.apply_chat_template(
+                chat, tokenize=False, add_generation_prompt=True, **extra
+            )
 
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=settings.max_new_tokens,
-            do_sample=False,
-            num_beams=1,
-            repetition_penalty=1.3,
-        )
+            inputs = processor(prompt_text, audio, device=device, return_tensors="pt").to(device)
 
-        new_tokens = outputs[0, inputs["input_ids"].shape[-1]:]
+            with torch.inference_mode():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=settings.max_new_tokens,
+                    do_sample=False,
+                    num_beams=1,
+                    repetition_penalty=1.3,
+                )
 
-        text = tokenizer.decode(new_tokens, add_special_tokens=False, skip_special_tokens=True)
+            new_tokens = outputs[0, inputs["input_ids"].shape[-1]:]
+            text = tokenizer.decode(new_tokens, add_special_tokens=False, skip_special_tokens=True)
+
         text = clean_transcript(text)
-
         segments = parse_speaker_turns(text)
 
     inference_time = time.perf_counter() - start_time
@@ -220,7 +245,6 @@ def transcribe_saa_sync(
     }
 
 
-@torch.inference_mode()
 def transcribe_audio_sync(
     audio: np.ndarray,
     timeout_sec: int = 120,
@@ -251,32 +275,48 @@ def transcribe_audio_sync(
         )
 
     with inference_timeout(timeout_sec):
-        processor = state.processor
-        model = state.model
-        device = state.device
+        tokenizer = state.tokenizer
+        if tokenizer is None:
+            raise TranscriptionError("No tokenizer available")
 
-        chat = [
-            {"role": "system", "content": settings.system_prompt},
-            {"role": "user", "content": PLAIN_ASR_PROMPT},
-        ]
-        tokenizer = processor.tokenizer
-        prompt_text = tokenizer.apply_chat_template(
-            chat, tokenize=False, add_generation_prompt=True
-        )
+        if state.onnx_ready:
+            chat = [
+                {"role": "system", "content": settings.system_prompt},
+                {"role": "user", "content": PLAIN_ASR_PROMPT},
+            ]
+            prompt_text = tokenizer.apply_chat_template(
+                chat, tokenize=False, add_generation_prompt=True
+            )
+            raw = _transcribe_onnx(audio, prompt_text, settings.max_new_tokens)
+            text = raw.get("text", "")
+        else:
+            import torch
+            processor = state.processor
+            model = state.model
+            device = state.device
 
-        inputs = processor(prompt_text, audio, device=device, return_tensors="pt").to(device)
+            chat = [
+                {"role": "system", "content": settings.system_prompt},
+                {"role": "user", "content": PLAIN_ASR_PROMPT},
+            ]
+            prompt_text = tokenizer.apply_chat_template(
+                chat, tokenize=False, add_generation_prompt=True
+            )
 
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=settings.max_new_tokens,
-            do_sample=False,
-            num_beams=1,
-            repetition_penalty=1.3,
-        )
+            inputs = processor(prompt_text, audio, device=device, return_tensors="pt").to(device)
 
-        new_tokens = outputs[0, inputs["input_ids"].shape[-1]:]
-        text = tokenizer.decode(new_tokens, add_special_tokens=False, skip_special_tokens=True)
-        text = clean_transcript(text)
+            with torch.inference_mode():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=settings.max_new_tokens,
+                    do_sample=False,
+                    num_beams=1,
+                    repetition_penalty=1.3,
+                )
+
+            new_tokens = outputs[0, inputs["input_ids"].shape[-1]:]
+            text = tokenizer.decode(new_tokens, add_special_tokens=False, skip_special_tokens=True)
+            text = clean_transcript(text)
 
     inference_time = time.perf_counter() - start_time
 
