@@ -157,6 +157,21 @@ class ModelState:
         gc.collect()
 
 
+def run_embedding(input_feed: dict) -> list[np.ndarray]:
+    """Run embedding session with automatic retry+reload on GPU OOM."""
+    try:
+        return state.embedding_session.run(None, input_feed)
+    except Exception as e:
+        log.warning("embedding_inference_failed_reloading", error=str(e))
+        from model_loader import reload_embedding_session
+        reload_embedding_session(get_settings())
+        try:
+            return state.embedding_session.run(None, input_feed)
+        except Exception as e2:
+            log.error("embedding_inference_failed_after_reload", error=str(e2))
+            raise
+
+
 # Global state
 state = ModelState()
 executor: Optional[ThreadPoolExecutor] = None

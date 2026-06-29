@@ -159,7 +159,7 @@ def refine_speaker_boundaries(
     # ------------------------------------------------------------------ #
     # Pass 2: single batched ONNX inference over all sub-windows with cache.
     # ------------------------------------------------------------------ #
-    from model_state import state
+    from model_state import state, run_embedding
     import hashlib
 
     # Hash each sub-window filterbank to uniquely identify it
@@ -185,7 +185,7 @@ def refine_speaker_boundaries(
             padded.append(fb.squeeze(0))
 
         batch = torch.stack(padded).numpy().astype(np.float32)
-        raw_embs_miss = embedding_session.run(None, {input_name: batch})[0]
+        raw_embs_miss = run_embedding({input_name: batch})[0]
 
         for local_idx, idx in enumerate(miss_indices):
             emb = raw_embs_miss[local_idx]
