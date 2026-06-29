@@ -19,6 +19,7 @@ import onnxruntime as ort
 
 from settings import get_settings
 from model_state import state, executor
+from model_loader import reload_encoder_session, reload_embedding_session
 from api.exceptions import TranscriptionError, AudioValidationError, TimeoutError
 
 log = structlog.get_logger()
@@ -277,8 +278,19 @@ def transcribe_audio_sync(
             raw_encoder_hidden_state = enc_outputs[0]  # Shape: [1, T', 1024]
             log.debug("encoder_inference_complete", output_shape=str(raw_encoder_hidden_state.shape))
         except Exception as e:
-            log.error("encoder_inference_failed", error=str(e))
-            raise TranscriptionError(f"Encoder inference failed: {str(e)}")
+            log.warning("encoder_inference_failed_reloading", error=str(e))
+            reload_embedding_session(settings)
+            reload_encoder_session(settings)
+            encoder = state.encoder
+            try:
+                enc_start = time.perf_counter()
+                enc_outputs = encoder.run(None, enc_inputs)
+                stage_timings["encoder_sec"] = time.perf_counter() - enc_start
+                raw_encoder_hidden_state = enc_outputs[0]
+                log.info("encoder_inference_succeeded_after_reload")
+            except Exception as e2:
+                log.error("encoder_inference_failed_after_reload", error=str(e2))
+                raise TranscriptionError(f"Encoder inference failed: {str(e2)}")
         
         # Both _q4 and _fp16 models expect encoder_hidden_states as float32
         encoder_hidden_state = raw_encoder_hidden_state.astype(np.float32)
