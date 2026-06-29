@@ -279,8 +279,8 @@ def transcribe_audio_sync(
             log.debug("encoder_inference_complete", output_shape=str(raw_encoder_hidden_state.shape))
         except Exception as e:
             log.warning("encoder_inference_failed_reloading", error=str(e))
-            reload_embedding_session(settings)
-            reload_encoder_session(settings)
+            reload_embedding_session(settings, force_cpu=True)
+            reload_encoder_session(settings, force_cpu=True)
             encoder = state.encoder
             try:
                 enc_start = time.perf_counter()

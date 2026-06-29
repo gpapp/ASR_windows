@@ -158,13 +158,13 @@ class ModelState:
 
 
 def run_embedding(input_feed: dict) -> list[np.ndarray]:
-    """Run embedding session with automatic retry+reload on GPU OOM."""
+    """Run embedding session with automatic CPU fallback on GPU OOM."""
     try:
         return state.embedding_session.run(None, input_feed)
     except Exception as e:
-        log.warning("embedding_inference_failed_reloading", error=str(e))
+        log.warning("embedding_inference_failed_reloading_cpu", error=str(e))
         from model_loader import reload_embedding_session
-        reload_embedding_session(get_settings())
+        reload_embedding_session(get_settings(), force_cpu=True)
         try:
             return state.embedding_session.run(None, input_feed)
         except Exception as e2:
