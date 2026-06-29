@@ -3,6 +3,7 @@ ASR transcription inference and transcript cleaning.
 """
 
 import sys
+import gc
 import time
 import signal
 import re
@@ -282,6 +283,11 @@ def transcribe_audio_sync(
         # Both _q4 and _fp16 models expect encoder_hidden_states as float32
         encoder_hidden_state = raw_encoder_hidden_state.astype(np.float32)
         
+        # Free encoder output to release GPU memory held by DirectML
+        enc_outputs = None
+        raw_encoder_hidden_state = None
+        gc.collect()
+        
         # ====================================================================
         # Step 3: Prepare decoder inputs with prompt
         # ====================================================================
@@ -467,6 +473,12 @@ def transcribe_audio_sync(
             text_preview=text[:100],
             stage_timings=stage_timings
         )
+        
+        # Clear large encoder memory before returning
+        input_features = None
+        encoder_hidden_state = None
+        decoder_inputs = None
+        logits = None
         
         return {
             "text": text,

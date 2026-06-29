@@ -168,12 +168,12 @@ def refine_speaker_boundaries(
     cached_embeddings = {}
     miss_indices = []
 
-    with state.lock:
-        for idx, h in enumerate(fb_hashes):
-            if h in state.embedding_cache:
-                cached_embeddings[idx] = state.embedding_cache[h]
-            else:
-                miss_indices.append(idx)
+    for idx, h in enumerate(fb_hashes):
+        cached = state.embedding_cache.get(h)
+        if cached is not None:
+            cached_embeddings[idx] = cached
+        else:
+            miss_indices.append(idx)
 
     if miss_indices:
         miss_fbanks = [all_fbanks[idx] for idx in miss_indices]
@@ -187,12 +187,11 @@ def refine_speaker_boundaries(
         batch = torch.stack(padded).numpy().astype(np.float32)
         raw_embs_miss = embedding_session.run(None, {input_name: batch})[0]
 
-        with state.lock:
-            for local_idx, idx in enumerate(miss_indices):
-                emb = raw_embs_miss[local_idx]
-                h = fb_hashes[idx]
-                state.embedding_cache[h] = emb
-                cached_embeddings[idx] = emb
+        for local_idx, idx in enumerate(miss_indices):
+            emb = raw_embs_miss[local_idx]
+            h = fb_hashes[idx]
+            state.embedding_cache.put(h, emb)
+            cached_embeddings[idx] = emb
 
     raw_embs = np.array([cached_embeddings[idx] for idx in range(len(all_fbanks))])
     norms    = np.linalg.norm(raw_embs, axis=1, keepdims=True)

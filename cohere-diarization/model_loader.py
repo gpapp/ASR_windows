@@ -281,3 +281,87 @@ def load_models(settings: Settings):
     
     state.status = "ready"
     log.info("all_models_loaded", provider=PROVIDER_SELECTION)
+
+
+def reload_encoder_session(settings: Settings):
+    """
+    Recreate the encoder ONNX session to release DirectML GPU memory.
+    
+    DirectML's memory arena grows with each encoder call but never shrinks.
+    Recreating the session forces DirectML to release all GPU allocations
+    associated with the old session. The new session starts with a clean arena.
+    
+    Call this between large transcription jobs or when memory pressure is detected.
+    This is safe to call because only one encoder is active at a time.
+    """
+    from model_state import state
+    import gc
+
+    log.info("reloading_encoder_session")
+
+    providers, provider_options, opts = get_igpu_session_options(settings.provider_type, settings)
+    cpu_providers, cpu_provider_options, cpu_opts = get_igpu_session_options("CPU", settings)
+    model_dir = ensure_model(settings)
+    model_path = str(model_dir / f"onnx/encoder_model{settings.encoder_model_type}.onnx")
+
+    # Release old session
+    old = state.encoder
+    state.encoder = None
+    del old
+    gc.collect()
+
+    try:
+        state.encoder = ort.InferenceSession(
+            model_path,
+            providers=providers,
+            provider_options=provider_options if provider_options else None,
+            sess_options=opts,
+        )
+        log.info("encoder_session_reloaded", provider=settings.provider_type)
+    except Exception as e:
+        log.error("encoder_reload_failed", error=str(e), fallback="CPU")
+        state.encoder = ort.InferenceSession(
+            model_path,
+            providers=cpu_providers,
+            provider_options=cpu_provider_options if cpu_provider_options else None,
+            sess_options=cpu_opts,
+        )
+    gc.collect()
+
+
+def reload_embedding_session(settings: Settings):
+    """
+    Recreate the embedding ONNX session to release DirectML GPU memory.
+    
+    Same rationale as reload_encoder_session: DirectML memory arena grows but
+    never shrinks. Recreating the session is the only reliable way to free
+    GPU memory back to the driver.
+    """
+    from model_state import state
+    import gc
+
+    log.info("reloading_embedding_session")
+
+    providers, provider_options, opts = get_igpu_session_options(settings.provider_type, settings)
+    emb_path = str(ensure_embedding_model(settings))
+
+    old = state.embedding_session
+    state.embedding_session = None
+    del old
+    gc.collect()
+
+    try:
+        state.embedding_session = ort.InferenceSession(
+            emb_path,
+            sess_options=opts,
+            providers=providers,
+            provider_options=provider_options if provider_options else None,
+        )
+        log.info("embedding_session_reloaded", provider=settings.provider_type)
+    except Exception as e:
+        log.error("embedding_reload_failed", error=str(e), fallback="CPU")
+        try:
+            state.embedding_session = ort.InferenceSession(emb_path, providers=["CPUExecutionProvider"])
+        except Exception as e2:
+            log.error("embedding_reload_cpu_fallback_failed", error=str(e2))
+    gc.collect()

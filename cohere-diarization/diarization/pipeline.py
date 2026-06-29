@@ -225,12 +225,12 @@ class Diarizer:
         cached_embeddings = {}
         miss_indices = []
         
-        with self.state.lock:
-            for idx, h in enumerate(fb_hashes):
-                if h in self.state.embedding_cache:
-                    cached_embeddings[idx] = self.state.embedding_cache[h]
-                else:
-                    miss_indices.append(idx)
+        for idx, h in enumerate(fb_hashes):
+            cached = self.state.embedding_cache.get(h)
+            if cached is not None:
+                cached_embeddings[idx] = cached
+            else:
+                miss_indices.append(idx)
         
         # If we have cache misses, compute them via ONNX in batch
         if miss_indices:
@@ -262,12 +262,11 @@ class Diarizer:
             computed_embeddings = np.concatenate(computed_embeddings, axis=0)
             
             # Store newly computed embeddings in the global cache
-            with self.state.lock:
-                for local_idx, idx in enumerate(miss_indices):
-                    emb = computed_embeddings[local_idx]
-                    h = fb_hashes[idx]
-                    self.state.embedding_cache[h] = emb
-                    cached_embeddings[idx] = emb
+            for local_idx, idx in enumerate(miss_indices):
+                emb = computed_embeddings[local_idx]
+                h = fb_hashes[idx]
+                self.state.embedding_cache.put(h, emb)
+                cached_embeddings[idx] = emb
         
         # Reconstruct the full sequence of raw embeddings from cache/computed
         raw_embeddings = np.array([cached_embeddings[idx] for idx in range(len(all_fbanks))])

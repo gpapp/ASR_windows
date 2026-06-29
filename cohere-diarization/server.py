@@ -13,6 +13,7 @@ Features:
 """
 
 import os
+import gc
 import time
 import asyncio
 import tempfile
@@ -112,6 +113,8 @@ async def _transcribe_chunks(
     full_mel_spectrogram: np.ndarray
 ) -> tuple[str, float, int]:
     """Transcribe audio sequentially in chunks to avoid any task-pooling issues."""
+    import gc
+
     full_text = ""
     total_inference = 0.0
     total_tokens = 0
@@ -134,6 +137,12 @@ async def _transcribe_chunks(
         full_text += result.get("text", "") + " "
         total_inference += result.get("inference_time_sec", 0.0)
         total_tokens += result.get("tokens_generated", 0)
+
+        # Release memory between chunks: DirectML memory arena accumulates
+        # with each encoder call; explicitly free intermediate references.
+        chunk_mel_spectrogram = None
+        result = None
+        gc.collect()
 
     return full_text, total_inference, total_tokens
 
@@ -189,15 +198,20 @@ async def diarize_path_endpoint(
     )
 
     async def event_generator():
-        while True:
-            msg = await queue.get()
-            if msg is None:
-                break
-            yield msg + "\n"
+        try:
+            while True:
+                msg = await queue.get()
+                if msg is None:
+                    break
+                yield msg + "\n"
 
-            # Stop if we hit a terminal message
-            if '"type": "result"' in msg or '"error"' in msg:
-                break
+                # Stop if we hit a terminal message
+                if '"type": "result"' in msg or '"error"' in msg:
+                    break
+        finally:
+            # Free diarization memory after streaming completes
+            state.embedding_cache.clear()
+            gc.collect()
 
     return StreamingResponse(event_generator(), media_type="application/x-ndjson")
 
@@ -303,6 +317,15 @@ async def transcribe_upload(
                 tokens_generated=0,
                 error=str(e)
             ))
+        
+        # Clear per-file memory to prevent accumulation across multiple files
+        if "audio" in dir():
+            audio = None
+        if "full_mel_spectrogram" in dir():
+            full_mel_spectrogram = None
+        if "full_mel" in dir():
+            full_mel = None
+        gc.collect()
     
     return TranscribeResponse(
         results=results,
@@ -389,6 +412,12 @@ async def transcribe_paths(
                 inference_time_sec=result["inference_time_sec"],
                 tokens_generated=result["tokens_generated"]
             ))
+            
+            # Clear per-file memory to prevent accumulation across multiple files
+            audio = None
+            full_mel_spectrogram = None
+            full_mel = None
+            gc.collect()
             
         except PathSecurityError as e:
             log.warning("path_security_error", path=path, error=str(e))

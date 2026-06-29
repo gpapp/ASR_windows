@@ -2,7 +2,9 @@
 Model state and KV cache pool management.
 """
 
+import gc
 import threading
+from collections import OrderedDict
 from typing import Optional
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
@@ -14,6 +16,8 @@ import structlog
 from settings import Settings
 
 log = structlog.get_logger()
+
+EMBEDDING_CACHE_MAX_SIZE = 5000
 
 
 # ============================================================================
@@ -93,6 +97,37 @@ class KVCachePool:
 # Model State
 # ============================================================================
 
+class LRUCache:
+    """Thread-safe LRU cache with max size."""
+
+    def __init__(self, max_size: int = EMBEDDING_CACHE_MAX_SIZE):
+        self._cache: OrderedDict[str, np.ndarray] = OrderedDict()
+        self._max_size = max_size
+        self._lock = threading.Lock()
+
+    def get(self, key: str) -> Optional[np.ndarray]:
+        with self._lock:
+            if key not in self._cache:
+                return None
+            self._cache.move_to_end(key)
+            return self._cache[key]
+
+    def put(self, key: str, value: np.ndarray):
+        with self._lock:
+            self._cache[key] = value
+            self._cache.move_to_end(key)
+            while len(self._cache) > self._max_size:
+                removed_key, _ = self._cache.popitem(last=False)
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._cache)
+
+    def clear(self):
+        with self._lock:
+            self._cache.clear()
+
+
 class ModelState:
     """Thread-safe container for model state."""
 
@@ -108,12 +143,18 @@ class ModelState:
         self.pre_computed_prompt_array: Optional[np.ndarray] = None
         self.status: str = "initializing"
         self.kv_pool: Optional[KVCachePool] = None
-        self.embedding_cache: dict[str, np.ndarray] = {}
+        self.embedding_cache: LRUCache = LRUCache()
         self.lock = threading.Lock()
     
     @property
     def is_ready(self) -> bool:
         return self.status == "ready"
+
+    def clear_gpu_memory(self):
+        """Release GPU memory by clearing caches and forcing GC."""
+        log.info("clearing_gpu_memory")
+        self.embedding_cache.clear()
+        gc.collect()
 
 
 # Global state
