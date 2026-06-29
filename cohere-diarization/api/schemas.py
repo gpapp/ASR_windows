@@ -40,12 +40,20 @@ class TranscribePathsRequest(BaseModel):
         return v
 
 
+class TimedSegment(BaseModel):
+    """A transcription segment with timing info for speaker alignment."""
+    start: float
+    end: float
+    text: str
+
+
 class TranscribeResult(BaseModel):
     """Single transcription result."""
     text: str
     audio_duration_sec: float
     inference_time_sec: float
     tokens_generated: int
+    segments: Optional[list[TimedSegment]] = None
     error: Optional[str] = None
 
 

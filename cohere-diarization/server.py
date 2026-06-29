@@ -32,12 +32,12 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from settings import get_settings
 from model_state import state, executor as global_executor
 from model_loader import load_models
-from transcriber import transcribe_audio_async, clean_transcript, TARGET_SAMPLES, _compute_mel_spectrogram_fast
+from transcriber import transcribe_audio_async, clean_transcript, _compute_mel_spectrogram_fast
 from diarization import Diarizer
 from streaming import stream_transcribe
 from api.schemas import (
     DiarizePathsRequest, TranscribePathsRequest, TranscribeResult,
-    TranscribeResponse, HealthResponse
+    TranscribeResponse, HealthResponse, TimedSegment
 )
 from api.security import verify_api_key, validate_path_security
 from api.middleware import apply_middleware
@@ -110,19 +110,25 @@ async def _transcribe_chunks(
     audio: np.ndarray,
     language: str,
     settings,
-    full_mel_spectrogram: np.ndarray
-) -> tuple[str, float, int]:
-    """Transcribe audio sequentially in chunks to avoid any task-pooling issues."""
+    full_mel_spectrogram: np.ndarray,
+    chunk_sec: int = 120
+) -> tuple[list[TimedSegment], float, int]:
+    """Transcribe audio in chunks, returning timed segments for speaker alignment.
+
+    Larger chunks amortize encoder overhead. Default 120s — works well with q4
+    quantized encoder that has GPU memory headroom.
+    """
     import gc
 
-    full_text = ""
+    segments: list[TimedSegment] = []
     total_inference = 0.0
     total_tokens = 0
 
-    chunk_samples = TARGET_SAMPLES
-    chunk_frames = chunk_samples // 160
+    chunk_samples = chunk_sec * 16000
+    chunk_frames = chunk_sec * 100  # 10ms per frame
 
     for start in range(0, len(audio), chunk_samples):
+        chunk_start_sec = start / 16000
         start_frame = start // 160
         end_frame = min(start_frame + chunk_frames, full_mel_spectrogram.shape[1])
         chunk_mel_spectrogram = full_mel_spectrogram[:, start_frame:end_frame, :]
@@ -134,17 +140,23 @@ async def _transcribe_chunks(
             mel_spectrogram=chunk_mel_spectrogram
         )
 
-        full_text += result.get("text", "") + " "
+        chunk_end_sec = chunk_start_sec + (end_frame - start_frame) * 0.01
+        chunk_text = result.get("text", "")
+        if chunk_text:
+            segments.append(TimedSegment(
+                start=round(chunk_start_sec, 3),
+                end=round(chunk_end_sec, 3),
+                text=chunk_text
+            ))
+
         total_inference += result.get("inference_time_sec", 0.0)
         total_tokens += result.get("tokens_generated", 0)
 
-        # Release memory between chunks: DirectML memory arena accumulates
-        # with each encoder call; explicitly free intermediate references.
         chunk_mel_spectrogram = None
         result = None
         gc.collect()
 
-    return full_text, total_inference, total_tokens
+    return segments, total_inference, total_tokens
 
 
 async def delayed_shutdown():
@@ -283,17 +295,19 @@ async def transcribe_upload(
 
                 full_mel_spectrogram = full_mel.T[np.newaxis, :, :].astype(np.float32)
 
-            # Process audio in 30s chunks using the precomputed mel spectrogram
-            full_text = ""
+            # Process audio in chunks using the precomputed mel spectrogram
+            timed_segments = []
             total_inference = 0
             total_tokens = 0
 
-            full_text, total_inference, total_tokens = await _transcribe_chunks(
+            timed_segments, total_inference, total_tokens = await _transcribe_chunks(
                 audio,
                 language,
                 settings,
                 full_mel_spectrogram
             )
+
+            full_text = " ".join(s.text for s in timed_segments)
 
             result = {
                 "text": clean_transcript(full_text.strip()),
@@ -305,7 +319,8 @@ async def transcribe_upload(
                text=result["text"],
                audio_duration_sec=result["audio_duration_sec"],
                inference_time_sec=result["inference_time_sec"],
-               tokens_generated=result["tokens_generated"]
+               tokens_generated=result["tokens_generated"],
+               segments=timed_segments
             ))
                 
         except Exception as e:
@@ -387,30 +402,33 @@ async def transcribe_paths(
 
             full_mel_spectrogram = full_mel.T[np.newaxis, :, :].astype(np.float32)
             
-            # Process audio in 30s chunks using the precomputed mel spectrogram
-            full_text = ""
+            # Process audio in chunks using the precomputed mel spectrogram
+            timed_segments = []
             total_inference = 0
             total_tokens = 0
 
-            full_text, total_inference, total_tokens = await _transcribe_chunks(
+            timed_segments, total_inference, total_tokens = await _transcribe_chunks(
                 audio,
                 req.language,
                 settings,
                 full_mel_spectrogram
             )
-            
+
+            full_text = " ".join(s.text for s in timed_segments)
+
             result = {
                 "text": clean_transcript(full_text.strip()),
                 "audio_duration_sec": len(audio) / 16000,
                 "inference_time_sec": total_inference,
                 "tokens_generated": total_tokens
             }
-            
+
             results.append(TranscribeResult(
                 text=result["text"],
                 audio_duration_sec=result["audio_duration_sec"],
                 inference_time_sec=result["inference_time_sec"],
-                tokens_generated=result["tokens_generated"]
+                tokens_generated=result["tokens_generated"],
+                segments=timed_segments
             ))
             
             # Clear per-file memory to prevent accumulation across multiple files
