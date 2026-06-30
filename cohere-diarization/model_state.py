@@ -13,7 +13,7 @@ import numpy as np
 import onnxruntime as ort
 import structlog
 
-from settings import Settings
+from settings import Settings, get_settings
 
 log = structlog.get_logger()
 

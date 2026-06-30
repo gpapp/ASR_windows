@@ -24,7 +24,7 @@ Usage:
 
     # Extract voiceprints for unknown speakers from diarization (same logic as --post-process-unknowns):
     python voiceprint_mgmt.py extract-missing meeting.mp4 diarization.json --voiceprints voiceprints.json
-    python voiceprint_mgmt.py extract-missing meeting.mp4 diarization.json --min-duration 20 --min-confidence 0.6
+    python voiceprint_mgmt.py extract-missing meeting.mp4 diarization.json --min-duration 10 --min-confidence 0.5
 
     # Create new voiceprint from audio segment:
     python voiceprint_mgmt.py create meeting.mp4 00:05:30 00:06:15 "John"
@@ -670,18 +670,35 @@ def cmd_extract_missing(args):
     
     # If diarize file is not provided, run diarization via server
     if not args.diarize:
+        # Check if the user accidentally passed a .txt file (common mistake)
+        if audio_path.suffix.lower() == ".txt":
+            # Try to find a corresponding audio file
+            potential_audio = None
+            for ext in [".mp4", ".wav", ".m4a", ".mkv", ".mp3", ".flac", ".webm"]:
+                if audio_path.with_suffix(ext).exists():
+                    potential_audio = audio_path.with_suffix(ext)
+                    break
+            
+            if potential_audio:
+                print(f"[INFO] You provided a .txt file, but diarization needs audio.")
+                print(f"[INFO] Found corresponding audio file: {potential_audio.name}")
+                audio_path = potential_audio
+            else:
+                print(f"[ERROR] Diarization requires an audio/video file, but you provided: {audio_path.name}")
+                print(f"        Please provide the path to the original media file instead of the transcript.")
+                sys.exit(1)
+
         print(f"[INFO] No diarization file provided - running diarization via server...")
         
-        # Load config
-        config = Config()
+        # Load config from environment
+        config = Config.from_env()
+        
+        # Override with command line arguments
         if args.server:
             config.server_url = args.server
         if args.api_key:
             config.api_key = args.api_key
             
-        # Override config from environment if needed
-        config = Config.from_env()
-        
         # Run diarization
         async def run_diarization():
             client = TranscriptionClient(config)
@@ -846,8 +863,8 @@ def main():
     p_extract_missing.add_argument("diarize", nargs="?", help="Diarization JSON file (optional - if not provided, will run diarization via server)")
     p_extract_missing.add_argument("--voiceprints", default="voiceprints.json", help="Voiceprints JSON file")
     p_extract_missing.add_argument("--output", help="Output voiceprints file (default: same as input)")
-    p_extract_missing.add_argument("--min-duration", type=float, default=30.0, help="Minimum speaker duration in seconds")
-    p_extract_missing.add_argument("--min-confidence", type=float, default=0.7, help="Minimum average confidence (0-1)")
+    p_extract_missing.add_argument("--min-duration", type=float, default=30.0, help="Minimum speaker duration in seconds (default: 30)")
+    p_extract_missing.add_argument("--min-confidence", type=float, default=0.5, help="Minimum average confidence (0-1) (default: 0.5)")
     p_extract_missing.add_argument("--server", "-s", default=None, help="Server URL (default: http://127.0.0.1:8000)")
     p_extract_missing.add_argument("--api-key", "-k", default=None, help="API key for authentication")
     p_extract_missing.set_defaults(func=cmd_extract_missing)

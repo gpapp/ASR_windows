@@ -463,7 +463,15 @@ class TranscriptionClient:
                     f"{self.config.server_url}/diarize/path",
                     json=payload
                 ) as resp:
-                    resp.raise_for_status()
+                    if resp.status >= 400:
+                        body = await resp.text()
+                        try:
+                            err_data = json.loads(body)
+                            detail = err_data.get("error") or err_data.get("detail") or body
+                        except Exception:
+                            detail = body or f"HTTP {resp.status}"
+                        log.warn(f"Failed to get diarization: {resp.status} {resp.reason} - {detail[:300]}")
+                        return [], {}
 
                     pbar = None
                     current_step = None
@@ -506,19 +514,10 @@ class TranscriptionClient:
                             pbar.close()
 
                     # Fallback if stream ends without a result message
-                    return []
+                    return [], {}
 
         except asyncio.TimeoutError:
             log.warn("Failed to get diarization: Connection timed out after 30 minutes")
-            return [], {}
-        except aiohttp.ClientResponseError as e:
-            text = "Unknown error"
-            if 'resp' in locals():
-                try:
-                    text = await resp.text()
-                except Exception:
-                    pass
-            log.warn(f"Failed to get diarization: {e} - Response: {text[:200]}")
             return [], {}
         except Exception as e:
             log.warn(f"Failed to get diarization: {e}")

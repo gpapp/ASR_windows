@@ -46,7 +46,10 @@ def validate_path_security(path: str, settings: Settings) -> Path:
             )
     
     # Check file extension
-    allowed_extensions = {".wav", ".mp3", ".mp4", ".m4a", ".flac", ".ogg", ".webm"}
+    allowed_extensions = {
+        ".wav", ".mp3", ".mp4", ".m4a", ".flac", ".ogg", ".webm",
+        ".mov", ".mkv", ".avi", ".wmv", ".mpeg", ".mpg"
+    }
     if resolved.suffix.lower() not in allowed_extensions:
         raise PathSecurityError(
             f"File type not allowed: {resolved.suffix}",
