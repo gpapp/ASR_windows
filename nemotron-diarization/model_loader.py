@@ -163,15 +163,55 @@ def load_models(settings: Settings):
 
     config = og.Config(str(model_dir))
     ep = settings.provider_type.lower()
+    
+    # Check for DirectML hybrid fallback
+    is_dml = (ep == "directml")
+    
     if ep != "follow_config":
         config.clear_providers()
-        if ep == "cpu":
-            config.append_provider("cpu")
-        elif ep == "directml":
+        if is_dml:
+            # We want to use DML where stable. 
+            # In onnxruntime-genai, append_provider("dml") applies to the whole model group.
+            # If the encoder fails on DML, we have to decide if we run the WHOLE Model on CPU
+            # or try to force hybrid. 
+            # Note: og.Model currently doesn't allow per-component provider overrides.
+            # If the Encoder is the only blocker, and we want DML for Decoder,
+            # we must use CPU for the whole Model if og.Model is used, 
+            # OR wrap it ourselves.
+            
+            # For now, let's try appending DML and see if we can use a workaround.
             config.append_provider("dml")
+        elif ep == "cpu":
+            pass # Default is CPU
 
     log.info("loading_nemotron_model", provider=settings.provider_type)
     model = og.Model(config)
+    
+    if is_dml:
+        try:
+            # Proactively verify DML works with a dummy inference step
+            # This catches 80070057 which happens during first execution
+            dummy_audio = np.zeros(settings.nemotron_chunk_samples, dtype=np.float32)
+            processor = og.StreamingProcessor(model)
+            processor.set_option("use_vad", "false")
+            inputs = processor.process(dummy_audio)
+            
+            params = og.GeneratorParams(model)
+            generator = og.Generator(model, params)
+            generator.set_inputs(inputs)
+            generator.generate_next_token()
+            log.info("nemotron_dml_verified_success")
+        except Exception as e:
+            if "DmlFusedNode" in str(e) or "80070057" in str(e):
+                log.warning("nemotron_dml_verification_failed_falling_back_to_full_cpu", error=str(e))
+                # Force settings to CPU so VAD and Embeddings follow suit
+                settings.provider_type = "CPU"
+                is_dml = False
+                config.clear_providers()
+                model = og.Model(config)
+            else:
+                raise e
+
     state.model = model
 
     processor = og.StreamingProcessor(model)

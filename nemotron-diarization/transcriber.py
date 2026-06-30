@@ -86,6 +86,7 @@ def _trim_partial_suffix(after: str, unit: str) -> str:
     return a
 
 def clean_transcript(text: str) -> str:
+    text = re.sub(r'<[^>]+>', '', text)
     text = re.sub(r'\b(\w{3,})\s+\1\b', r'\1', text)
     text = re.sub(r'\b(\w{2})\s+\1\b', r'\1', text)
     prev = None

@@ -400,7 +400,7 @@ async def ws_transcribe(websocket: WebSocket):
     Client sends:
         {"wav_path": "...", "diarize_segments": [...], "language": "en", "api_key": "..."}
     Server streams:
-        {"type": "progress", "chunk": N, "total_chunks": M, ...}
+        {"type": "progress", "step": "asr|diarize|match", ...}
         {"type": "segment", "speaker": "...", "start": ..., "end": ..., "text": "..."}
         {"type": "done"}
     """
@@ -422,43 +422,71 @@ async def ws_transcribe(websocket: WebSocket):
                 return
 
         resolved = validate_path_security(wav_path, settings)
-
         audio, _ = librosa.load(str(resolved), sr=16000, mono=True)
 
+        # Step 1: Transcribe full audio with 120s chunks
         total_segments = len(diarize_segments)
+        await websocket.send_json({
+            "type": "progress", "step": "asr", "chunk": 0, "total_chunks": 0
+        })
+
+        audio_float = audio.astype(np.float32)
+        audio_float[1:] -= 0.97 * audio_float[:-1]
+        full_mel = _compute_mel_spectrogram_fast(audio_float)
+        full_mel_spectrogram = full_mel.T[np.newaxis, :, :].astype(np.float32)
+
+        timed_segments, _, _ = await _transcribe_chunks(
+            audio, language, settings, full_mel_spectrogram
+        )
+
+        # Step 2: Match diarization segments to timed segments by overlap
+        await websocket.send_json({
+            "type": "progress", "step": "match", "chunk": 0, "total_chunks": total_segments
+        })
 
         for idx, ds in enumerate(diarize_segments):
-            start_sample = int(ds["start"] * 16000)
-            end_sample = int(ds["end"] * 16000)
-            seg_audio = audio[start_sample:end_sample]
+            ds_start = ds["start"]
+            ds_end = ds["end"]
 
-            result = await transcribe_audio_async(
-                seg_audio, language, settings.request_timeout,
-                use_chunked=False
-            )
+            matched = []
+            for ts in timed_segments:
+                if ts.start >= ds_start and ts.end <= ds_end:
+                    matched.append(ts)
+                elif ts.start < ds_end and ts.end > ds_start:
+                    mid = (ts.start + ts.end) / 2
+                    if ds_start <= mid <= ds_end:
+                        matched.append(ts)
 
-            text = result.get("text", "").strip()
+            if matched:
+                text = clean_transcript(" ".join(ts.text for ts in matched))
+            else:
+                text = ""
+
             if text:
                 await websocket.send_json({
                     "type": "segment",
                     "speaker": ds["speaker"],
-                    "start": round(ds["start"], 3),
-                    "end": round(ds["end"], 3),
+                    "start": round(ds_start, 3),
+                    "end": round(ds_end, 3),
                     "text": text,
                     "ds_idx": idx
                 })
 
             await websocket.send_json({
                 "type": "progress",
+                "step": "match",
                 "chunk": idx + 1,
                 "total_chunks": total_segments,
-                "segment_duration_sec": round(ds["end"] - ds["start"], 2),
-                "inference_time_sec": round(result.get("inference_time_sec", 0.0), 3)
+                "segment_duration_sec": round(ds_end - ds_start, 2),
+                "matched_subchunks": len(matched)
             })
 
-            seg_audio = None
-            result = None
-            gc.collect()
+        audio = None
+        audio_float = None
+        full_mel = None
+        full_mel_spectrogram = None
+        timed_segments = None
+        gc.collect()
 
         await websocket.send_json({"type": "done"})
 

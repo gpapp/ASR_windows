@@ -59,6 +59,7 @@ def _trim_partial_suffix(after: str, unit: str) -> str:
 
 def clean_transcript(text: str) -> str:
     """Replace hallucinated looping repetitions with [inaudible]."""
+    text = re.sub(r"<[^>]+>", "", text)
     prev = None
     while prev != text:
         prev = text
@@ -1161,14 +1162,19 @@ async def transcribe_file(
             msg_type = data.get("type")
             if msg_type == "progress":
                 if progress_bar is not None:
+                    step_name = data.get("step", "transcribing")
                     chunk_num = data.get("chunk", 0)
                     total = data.get("total_chunks", 1)
-                    progress_bar.set_postfix_str(f"Chunk {chunk_num}/{total}")
-                    if total > 0:
-                        target = int(round(progress_bar.total * chunk_num / total))
-                        step = target - progress_bar.n
-                        if step > 0:
-                            progress_bar.update(step)
+                    suffix = f"{step_name} {chunk_num}/{total}"
+                    if step_name == "asr":
+                        progress_bar.set_postfix_str("Full audio ASR...")
+                    else:
+                        progress_bar.set_postfix_str(suffix)
+                        if total > 0:
+                            target = int(round(progress_bar.total * chunk_num / total))
+                            step = target - progress_bar.n
+                            if step > 0:
+                                progress_bar.update(step)
             elif msg_type == "segment":
                 text = data.get("text", "")
                 if not text.strip():

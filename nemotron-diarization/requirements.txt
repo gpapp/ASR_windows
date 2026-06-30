@@ -14,8 +14,9 @@ tokenizers
 huggingface-hub
 
 # ONNX Runtime GenAI for Nemotron streaming ASR
-onnxruntime-genai
-onnxruntime-genai[directml]
+# Use directml variant for iGPU acceleration via DirectML
+# NOTE: onnxruntime-genai (CPU) and onnxruntime-genai-directml are mutually exclusive
+onnxruntime-genai-directml
 
 # Diarization
 scikit-learn
