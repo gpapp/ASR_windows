@@ -1137,16 +1137,18 @@ async def transcribe_file(
             for seg in diarize_segments:
                 spk_segs[seg["speaker"]].append(seg)
             trained_count = 0
+            vp_dirty = False
             for spk, segs in spk_segs.items():
                 if spk in _known_vp:
-                    trained_sec = _known_vp[spk].get("total_speech_sec", 0.0)
-                    if trained_sec >= min_trained_sec:
-                        print(f"  - {spk}: skipped ({trained_sec:.0f}s trained)")
+                    existing_seg_sec = _known_vp[spk].get("segments_sec", -1.0)
+                    if existing_seg_sec >= min_trained_sec:
+                        print(f"  - {spk}: skipped ({existing_seg_sec:.0f}s segments already extracted)")
                         continue
                 sorted_segs = sorted(segs, key=lambda s: float(s.get("confidence", 0.5)), reverse=True)
                 top_segs = sorted_segs[:max_seg]
                 spk_dir = trained_dir / spk
                 spk_dir.mkdir(parents=True, exist_ok=True)
+                spk_written_dur = 0.0
                 for seg in top_segs:
                     start_f = seg["start"]
                     end_f = seg["end"]
@@ -1160,9 +1162,21 @@ async def transcribe_file(
                     end_s = int(end_f * sr)
                     sf.write(str(out_file), audio_data[start_s:end_s], sr)
                     trained_count += 1
+                    spk_written_dur += dur
+                if spk_written_dur > 0 and spk in _known_vp:
+                    prev_seg_sec = _known_vp[spk].get("segments_sec", 0.0)
+                    _known_vp[spk]["segments_sec"] = round(prev_seg_sec + spk_written_dur, 1)
+                    vp_dirty = True
                 print(f"  - {spk}: {len(top_segs)} top-trained to {spk_dir}")
             if trained_count:
                 print(f"[INFO] Extracted {trained_count} top-trained segments to {trained_dir}")
+            if vp_dirty and _vp_path.exists():
+                try:
+                    import json as _json
+                    with open(_vp_path, 'w', encoding='utf-8') as _f:
+                        _json.dump(_known_vp, _f, indent=2, ensure_ascii=False)
+                except Exception as e:
+                    log.warn(f"Failed to update segments_sec in voiceprints: {e}")
         
         if not diarize_segments:
             log.warn("Diarization returned no segments. Assuming single speaker for fallback.", file=p.name)
