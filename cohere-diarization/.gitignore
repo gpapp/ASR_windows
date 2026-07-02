@@ -6,3 +6,4 @@
 openvino_model_cache/
 segments_trained/
 voiceprints.json
+voiceprints*.json
