@@ -1558,7 +1558,7 @@ Examples:
     )
     parser.add_argument(
         "--min-trained-seconds",
-        type=float, default=120.0,
+        type=float, default=1200.0,
         help="Skip segment extraction for known speakers already above this total_speech_sec in voiceprints.json (default: 120)"
     )
 
