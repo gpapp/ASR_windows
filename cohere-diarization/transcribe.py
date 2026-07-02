@@ -1111,6 +1111,7 @@ async def transcribe_file(
             from collections import defaultdict
             trained_dir = Path(args.segments_trained)
             max_seg = args.max_trained_segments or 20
+            min_trained_sec = getattr(args, 'min_trained_seconds', 120) or 120
             audio_data, sr = sf.read(temp_wav)
             if len(audio_data.shape) > 1:
                 audio_data = audio_data.mean(axis=1)
@@ -1122,11 +1123,26 @@ async def transcribe_file(
                 _hash_int, _idx = divmod(_hash_int, 32)
                 _result.append(_chars[_idx])
             audio_hash = "".join(_result)
+            _vp_arg = args.voiceprints if (args and getattr(args, 'voiceprints', None)) else None
+            _vp_path = Path(_vp_arg) if _vp_arg else Path("voiceprints.json")
+            _known_vp = {}
+            if _vp_path.exists():
+                try:
+                    import json as _json
+                    with open(_vp_path, 'r', encoding='utf-8-sig') as _f:
+                        _known_vp = _json.load(_f)
+                except Exception:
+                    pass
             spk_segs = defaultdict(list)
             for seg in diarize_segments:
                 spk_segs[seg["speaker"]].append(seg)
             trained_count = 0
             for spk, segs in spk_segs.items():
+                if spk in _known_vp:
+                    trained_sec = _known_vp[spk].get("total_speech_sec", 0.0)
+                    if trained_sec >= min_trained_sec:
+                        print(f"  - {spk}: skipped ({trained_sec:.0f}s trained)")
+                        continue
                 sorted_segs = sorted(segs, key=lambda s: float(s.get("confidence", 0.5)), reverse=True)
                 top_segs = sorted_segs[:max_seg]
                 spk_dir = trained_dir / spk
@@ -1539,6 +1555,11 @@ Examples:
         "--max-trained-segments",
         type=int, default=20,
         help="Maximum best-matching segments per speaker for retraining (default: 20)"
+    )
+    parser.add_argument(
+        "--min-trained-seconds",
+        type=float, default=120.0,
+        help="Skip segment extraction for known speakers already above this total_speech_sec in voiceprints.json (default: 120)"
     )
 
     args = parser.parse_args()
