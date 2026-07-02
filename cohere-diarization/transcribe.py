@@ -943,6 +943,7 @@ async def transcribe_file(
                 speaker_counts[spk] = speaker_counts.get(spk, 0) + 1
 
             updated = False
+            name_remap = {}
             filename_prefix = re.sub(r'[^a-zA-Z0-9_-]', '_', p.stem)
 
             for name, profile in speaker_profiles.items():
@@ -952,7 +953,6 @@ async def transcribe_file(
                 if name in existing_vp:
                     continue
 
-                # Filter by total duration and average confidence
                 total_dur = speaker_durations.get(name, 0.0)
                 if total_dur < 10.0:
                     continue
@@ -966,9 +966,12 @@ async def transcribe_file(
                 next_n = len(existing_names) + 1
                 persistent_name = f"{filename_prefix}_SPEAKER_{next_n}"
 
-                profile["total_speech_sec"] = total_dur
-
-                existing_vp[persistent_name] = profile
+                existing_vp[persistent_name] = {
+                    "pitch_hz": profile.get("pitch_hz", 0.0),
+                    "total_speech_sec": total_dur,
+                    "embedding": profile.get("embedding", []),
+                }
+                name_remap[name] = persistent_name
                 updated = True
                 print(f"[INFO] Added new voiceprint: {persistent_name} (dur={total_dur:.1f}s, conf={avg_conf:.2%})")
             
@@ -979,6 +982,49 @@ async def transcribe_file(
                     print(f"[INFO] Updated voiceprints.json with {len(existing_vp)} speakers")
                 except Exception as e:
                     log.warn(f"Failed to update voiceprints.json: {e}")
+                
+                # Rename segments and profiles to match the persistent voiceprint names
+                for seg in diarize_segments:
+                    old = seg["speaker"]
+                    if old in name_remap:
+                        seg["speaker"] = name_remap[old]
+                for old, new in list(name_remap.items()):
+                    if old in speaker_profiles:
+                        speaker_profiles[new] = speaker_profiles.pop(old)
+        
+        # Extract top N best-matching segments per speaker for retraining
+        if args and getattr(args, 'segments_trained', None) is not None and diarize_segments:
+            import soundfile as sf
+            trained_dir = Path(args.segments_trained)
+            max_seg = args.max_trained_segments or 20
+            audio_data, sr = sf.read(temp_wav)
+            if len(audio_data.shape) > 1:
+                audio_data = audio_data.mean(axis=1)
+            from collections import defaultdict
+            spk_segs = defaultdict(list)
+            for seg in diarize_segments:
+                spk_segs[seg["speaker"]].append(seg)
+            trained_count = 0
+            for spk, segs in spk_segs.items():
+                sorted_segs = sorted(segs, key=lambda s: float(s.get("confidence", 0.5)), reverse=True)
+                top_segs = sorted_segs[:max_seg]
+                spk_dir = trained_dir / spk
+                spk_dir.mkdir(parents=True, exist_ok=True)
+                for rank, seg in enumerate(top_segs, 1):
+                    start_f = seg["start"]
+                    end_f = seg["end"]
+                    dur = end_f - start_f
+                    if dur < 1.5:
+                        continue
+                    conf = int(float(seg.get("confidence", 0.5)) * 100)
+                    out_file = spk_dir / f"{rank:02d}_{int(start_f)}_{conf:02d}_{dur:02.0f}.flac"
+                    start_s = int(start_f * sr)
+                    end_s = int(end_f * sr)
+                    sf.write(str(out_file), audio_data[start_s:end_s], sr)
+                    trained_count += 1
+                print(f"  - {spk}: {len(top_segs)} top-trained to {spk_dir}")
+            if trained_count:
+                print(f"[INFO] Extracted {trained_count} top-trained segments to {trained_dir}")
         
         # Post-process unknown speakers if requested
         # Allow running even when `speaker_profiles` is empty so we can attempt
@@ -1013,17 +1059,17 @@ async def transcribe_file(
                 
                 # Filter and extract clean voiceprints for unknown speakers
                 filename_prefix = re.sub(r'[^a-zA-Z0-9_-]', '_', p.stem)
+                post_name_remap = {}
                 
                 for spk in unknown_speakers:
-                    # Check quality gates
                     total_dur = speaker_durations.get(spk, 0.0)
                     if total_dur < 30.0:
                         continue
-                    
+
                     avg_conf = speaker_confidence_sum.get(spk, 0.0) / max(1, speaker_counts.get(spk, 1))
                     if avg_conf < 0.65:
                         continue
-                    
+
                     # Extract clean audio for this speaker
                     speaker_temp_wav = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
                     speaker_temp_path = speaker_temp_wav.name
@@ -1041,7 +1087,7 @@ async def transcribe_file(
                         print(f"[INFO] Computing local embedding for unknown speaker {spk}...")
                         from settings import Settings
                         from voiceprint_utils import load_audio_segment, get_embedding_session
-                        from speaker.embedding import extract_embedding, compute_pitch, compute_energy
+                        from speaker.embedding import extract_embedding, compute_pitch
 
                         # Load audio and get embedding session
                         waveform, sr = load_audio_segment(speaker_temp_path, 0, None)
@@ -1049,8 +1095,9 @@ async def transcribe_file(
 
                         emb = extract_embedding(waveform, sr, embedding_session)
                         if emb is not None:
-                            pitch, pitch_std = compute_pitch(waveform, sr)
-                            energy = compute_energy(waveform)
+                            pitch = compute_pitch(waveform, sr)
+                            if isinstance(pitch, tuple):
+                                pitch = pitch[0]
 
                             existing_names = [n for n in existing_vp.keys() if n.startswith(f"{filename_prefix}_post_SPEAKER")]
                             next_n = len(existing_names) + 1
@@ -1058,13 +1105,12 @@ async def transcribe_file(
 
                             voiceprint_entry = {
                                 "pitch_hz": round(pitch, 1) if pitch > 0 else 0.0,
-                                "pitch_std": round(pitch_std, 1),
-                                "energy_rms": round(energy, 4),
                                 "total_speech_sec": total_dur,
                                 "embedding": emb,
                             }
 
                             existing_vp[persistent_name] = voiceprint_entry
+                            post_name_remap[spk] = persistent_name
                             print(f"[INFO] Added post-processed voiceprint: {persistent_name} (dur={total_dur:.1f}s, conf={avg_conf:.2%})")
 
                     except Exception as e:
@@ -1075,8 +1121,14 @@ async def transcribe_file(
                         except:
                             pass
                 
+                if post_name_remap:
+                    for seg in diarize_segments:
+                        old = seg["speaker"]
+                        if old in post_name_remap:
+                            seg["speaker"] = post_name_remap[old]
+                
                 # Save updated voiceprints if any were added
-                if existing_vp:
+                if existing_vp: 
                     try:
                         with open(voiceprints_path, 'w', encoding='utf-8') as f:
                             json.dump(existing_vp, f, indent=2, ensure_ascii=False)
@@ -1465,6 +1517,16 @@ Examples:
         "--post-process-unknowns",
         action="store_true",
         help="Extract clean voiceprints for unknown speakers with substantial talk (>= 30s, >= 0.8 confidence)"
+    )
+    parser.add_argument(
+        "--segments-trained",
+        nargs='?', const='segments_trained', default=None,
+        help="Directory to save top N best-matching segments per speaker for retraining (default: segments_trained/)"
+    )
+    parser.add_argument(
+        "--max-trained-segments",
+        type=int, default=20,
+        help="Maximum best-matching segments per speaker for retraining (default: 20)"
     )
 
     args = parser.parse_args()

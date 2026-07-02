@@ -16,7 +16,7 @@
   "weights": {
     "embedding": 0.6,
     "pitch": 0.15,
-    "energy": 0.05,
+    "energy": 0.0,
     "spectral": 0.1,
     "mfcc": 0.1
   },

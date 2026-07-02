@@ -54,7 +54,6 @@ from voiceprint_utils import (
     load_audio_segment,
     extract_embedding,
     compute_pitch,
-    compute_energy,
     init_embedding_session,
     load_voiceprints,
     save_voiceprints,
@@ -247,6 +246,30 @@ def cmd_extract(args):
 
             print(f"  - {speaker_name}: {len(speaker_segments)} segments, {extracted_count} extracted to {speaker_dir}")
 
+        if args.segments_trained:
+            trained_dir = Path(args.segments_trained)
+            max_seg = args.max_trained_segments
+            trained_count = 0
+            for speaker_name, speaker_segments in speakers.items():
+                sorted_segs = sorted(speaker_segments, key=lambda s: s["confidence"], reverse=True)
+                top_segs = sorted_segs[:max_seg]
+                speaker_trained_dir = trained_dir / speaker_name
+                speaker_trained_dir.mkdir(parents=True, exist_ok=True)
+                for rank, seg in enumerate(top_segs, 1):
+                    start = seg["start"]
+                    end = seg["end"]
+                    duration = end - start
+                    if duration < (args.min_duration or 1.5):
+                        continue
+                    conf = int(seg["confidence"] * 100)
+                    out_file = speaker_trained_dir / f"{rank:02d}_{format_time_short(start)}_{conf:02d}_{duration:02.0f}.flac"
+                    start_sample = int(start * sample_rate)
+                    end_sample = int(end * sample_rate)
+                    sf.write(str(out_file), waveform[start_sample:end_sample], sample_rate)
+                    trained_count += 1
+                print(f"  - {speaker_name}: {len(top_segs)} top-trained to {speaker_trained_dir}")
+            print(f"[SUCCESS] Extracted {trained_count} top-trained segments to {trained_dir}")
+
         print(f"[SUCCESS] Extracted {extracted_count} segments to {output_dir}")
         print(f"[INFO] Review {review_file} to verify speaker identification")
         print(f"[INFO] Remove incorrect segments from speaker folders, then run:")
@@ -417,18 +440,9 @@ def cmd_create(args):
     embedding = extract_embedding(waveform, sample_rate, embedding_session)
 
     print(f"[INFO] Computing features...")
-    pitch_result = compute_pitch(waveform, sample_rate)
-    if isinstance(pitch_result, tuple):
-        pitch, pitch_std = pitch_result
-    else:
-        pitch, pitch_std = pitch_result, 0.0
-    energy = compute_energy(waveform)
-    
-    # Extract spectral and MFCC features
-    from speaker.profiling import _extract_spectral_features, _extract_mfcc_stats
-    waveform_np = waveform.squeeze(0).numpy()
-    spectral = _extract_spectral_features(waveform_np, sample_rate)
-    mfcc_stats = _extract_mfcc_stats(waveform_np, sample_rate)
+    pitch = compute_pitch(waveform, sample_rate)
+    if isinstance(pitch, tuple):
+        pitch = pitch[0]
 
     voiceprints = load_voiceprints(Path(args.output))
 
@@ -440,15 +454,9 @@ def cmd_create(args):
 
     voiceprint = {
         "pitch_hz": round(pitch, 1) if pitch > 0 else 0.0,
-        "pitch_std": round(pitch_std, 1),
-        "energy_rms": round(energy, 4),
         "total_speech_sec": round(duration, 1),
         "embedding": embedding,
     }
-    # Add spectral features
-    voiceprint.update(spectral)
-    # Add MFCC features
-    voiceprint.update(mfcc_stats)
     
     voiceprints[args.name] = voiceprint
 
@@ -487,7 +495,6 @@ def cmd_add(args):
 
     all_embeddings = []
     all_pitches = []
-    all_energies = []
     total_duration = 0.0
 
     i = 0
@@ -514,13 +521,13 @@ def cmd_add(args):
             waveform, sr = load_audio_segment(str(wav_path), start_sec, end_sec)
 
             emb = extract_embedding(waveform, sr, embedding_session)
-            pitch, pitch_std = compute_pitch(waveform, sr)
-            energy = compute_energy(waveform)
+            pitch = compute_pitch(waveform, sr)
+            if isinstance(pitch, tuple):
+                pitch = pitch[0]
 
             all_embeddings.append(np.array(emb))
             if pitch > 0:
                 all_pitches.append(pitch)
-            all_energies.append(energy)
             total_duration += duration
 
             print(f"  - OK: pitch={pitch:.1f}Hz")
@@ -543,29 +550,15 @@ def cmd_add(args):
     combined_emb = combined_emb.tolist()
 
     avg_pitch = np.mean(all_pitches) if all_pitches else 0.0
-    pitch_std_new = np.std(all_pitches) if len(all_pitches) > 1 else 0.0
-    avg_energy = np.mean(all_energies)
     new_duration = existing.get("total_speech_sec", 0) + total_duration
 
     new_pitch = avg_pitch if avg_pitch > 0 else existing.get("pitch_hz", 0)
-    new_pitch_std = pitch_std_new if pitch_std_new > 0 else existing.get("pitch_std", 0)
-    new_energy = (existing.get("energy_rms", 0) + avg_energy) / 2
 
     voiceprint = {
         "pitch_hz": round(new_pitch, 1),
-        "pitch_std": round(new_pitch_std, 1),
-        "energy_rms": round(new_energy, 4),
         "total_speech_sec": round(new_duration, 1),
-        "gender_hint": existing.get("gender_hint", "unknown"),
         "embedding": combined_emb,
     }
-    # Preserve existing spectral and MFCC features
-    for key in ["spectral_centroid", "spectral_rolloff"]:
-        if key in existing:
-            voiceprint[key] = existing[key]
-    for key in existing:
-        if key.startswith("mfcc"):
-            voiceprint[key] = existing[key]
     
     voiceprints[args.speaker] = voiceprint
 
@@ -812,6 +805,8 @@ def main():
     p_extract.add_argument("--single-speaker-threshold", type=float, default=0.8, help="Min ratio of windows matching dominant speaker (0.0-1.0)")
     p_extract.add_argument("--include-unknown", action="store_true", default=False, help="Also extract segments from unknown speakers (not matching any voiceprint) for training")
     p_extract.add_argument("--min-confidence", type=float, default=0.0, help="Minimum confidence threshold (0-1). Lower quality segments are skipped.")
+    p_extract.add_argument("--segments-trained", nargs='?', const='segments_trained', default=None, help="Directory to save top N best-matching segments per speaker for retraining (default: segments_trained/)")
+    p_extract.add_argument("--max-trained-segments", type=int, default=20, help="Maximum best-matching segments per speaker (default: 20)")
     p_extract.set_defaults(func=cmd_extract)
 
     # reassign subcommand

@@ -28,7 +28,7 @@ import soundfile as sf
 from tqdm import tqdm
 
 # Re-export from speaker module for backwards compatibility
-from speaker.embedding import extract_embedding, compute_pitch, compute_energy
+from speaker.embedding import extract_embedding, compute_pitch
 
 
 def extract_speaker_audio(wav_path: str, segments: list, speaker_name: str, output_path: str) -> bool:
@@ -754,9 +754,10 @@ def extract_missing_voiceprints(
                 print(f"[WARN] Failed to compute embedding for speaker {spk}")
                 continue
             
-            # Compute pitch and energy
-            pitch, pitch_std = compute_pitch(waveform, sample_rate)
-            energy = compute_energy(waveform)
+            # Compute pitch
+            pitch = compute_pitch(waveform, sample_rate)
+            if isinstance(pitch, tuple):
+                pitch = pitch[0]
             
             # Generate persistent speaker name
             existing_names = [n for n in existing_vp.keys() if n.startswith(f"{filename_prefix}_post_SPEAKER")]
@@ -766,8 +767,6 @@ def extract_missing_voiceprints(
             # Create voiceprint entry
             voiceprint_entry = {
                 "pitch_hz": round(pitch, 1) if pitch > 0 else 0.0,
-                "pitch_std": round(pitch_std, 1),
-                "energy_rms": round(energy, 4),
                 "total_speech_sec": round(total_dur, 1),
                 "embedding": embedding,
             }
@@ -835,8 +834,6 @@ def refine_voiceprint_from_segments(
         print(f"[INFO] Creating new voiceprint for '{speaker_name}'")
         voiceprints[speaker_name] = {
             "pitch_hz": 0.0,
-            "pitch_std": 0.0,
-            "energy_rms": 0.0,
             "total_speech_sec": 0.0,
         }
     else:
@@ -864,9 +861,7 @@ def refine_voiceprint_from_segments(
     sample_rates  = []
     all_durations = []
     all_pitches   = []
-    all_energies  = []
     pitch_durations = []
-    all_waveform_chunks = []  # For spectral/MFCC extraction
 
     print(f"[INFO] Loading {len(wav_files)} files...")
     for wav_file in tqdm(wav_files, desc=f"Loading {speaker_name}", unit="file"):
@@ -877,20 +872,17 @@ def refine_voiceprint_from_segments(
                 print(f"[SKIP] {wav_file.name} too short: {duration:.1f}s")
                 continue
 
-            pitch, pitch_std = compute_pitch(waveform, sr)
-            energy = compute_energy(waveform)
+            pitch = compute_pitch(waveform, sr)
+            if isinstance(pitch, tuple):
+                pitch = pitch[0]
 
             valid_files.append(wav_file)
             waveforms.append(waveform)
             sample_rates.append(sr)
             all_durations.append(duration)
-            all_energies.append(energy)
             if pitch > 0:
                 all_pitches.append(pitch)
                 pitch_durations.append(duration)
-            
-            # Collect waveform chunks for spectral/MFCC analysis
-            all_waveform_chunks.append(waveform.squeeze(0).numpy())
 
         except Exception as e:
             print(f"[WARN] Failed to load {wav_file.name}: {e}")
@@ -951,49 +943,23 @@ def refine_voiceprint_from_segments(
     else:
         avg_pitch = np.mean(all_pitches) if all_pitches else 0.0
 
-    avg_energy  = np.average(np.array(all_energies), weights=all_durations)
-    pitch_std   = np.std(all_pitches) if len(all_pitches) > 1 else 0.0
-
-    prev_pitch     = current.get("pitch_hz", 0)
-    prev_pitch_std = current.get("pitch_std", 0)
-    prev_energy    = current.get("energy_rms", 0)
-    new_duration   = prev_duration + total_duration
+    prev_pitch   = current.get("pitch_hz", 0)
+    new_duration = prev_duration + total_duration
 
     if prev_duration > 0 and total_duration > 0:
         prev_weight = prev_duration / new_duration
         new_weight  = total_duration / new_duration
         new_pitch   = (prev_pitch * prev_weight + avg_pitch * new_weight) if avg_pitch > 0 else prev_pitch
-        new_energy  = prev_energy * prev_weight + avg_energy * new_weight
     elif avg_pitch > 0:
         new_pitch  = avg_pitch
-        new_energy = avg_energy
     else:
         new_pitch  = prev_pitch
-        new_energy = prev_energy
-
-    new_pitch_std = pitch_std if pitch_std > 0 else prev_pitch_std
 
     voiceprint = {
         "pitch_hz": round(new_pitch, 1),
-        "pitch_std": round(new_pitch_std, 1),
-        "energy_rms": round(new_energy, 4),
         "total_speech_sec": round(new_duration, 1),
         "embedding": combined_emb
     }
-    
-    # Extract spectral and MFCC features from combined audio
-    if all_waveform_chunks:
-        from speaker.profiling import _extract_spectral_features, _extract_mfcc_stats
-        # Concatenate chunks for spectral analysis (limit to first 30s for efficiency)
-        combined_audio = np.concatenate(all_waveform_chunks)
-        max_samples = 30 * 16000  # 30 seconds max at 16kHz
-        if len(combined_audio) > max_samples:
-            combined_audio = combined_audio[:max_samples]
-        
-        spectral = _extract_spectral_features(combined_audio, 16000)
-        mfcc_stats = _extract_mfcc_stats(combined_audio, 16000)
-        voiceprint.update(spectral)
-        voiceprint.update(mfcc_stats)
     
     voiceprints[speaker_name] = voiceprint
 
