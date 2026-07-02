@@ -207,8 +207,8 @@ def is_clear_winner(matches: List[Tuple], voiceprints: Dict, cfg: Dict = None) -
         return True
     
     # Gap is small - check if best has significantly more training data
-    first_dur = voiceprints.get(matches[0][0], {}).get("total_speech_sec", 0)
-    second_dur = voiceprints.get(matches[1][0], {}).get("total_speech_sec", 0)
+    first_dur = voiceprints.get(matches[0][0], {}).get("segments_sec") or voiceprints.get(matches[0][0], {}).get("total_speech_sec", 0)
+    second_dur = voiceprints.get(matches[1][0], {}).get("segments_sec") or voiceprints.get(matches[1][0], {}).get("total_speech_sec", 0)
     
     if first_dur > second_dur * 2 and best_dist < embed_only_thresh:
         return True

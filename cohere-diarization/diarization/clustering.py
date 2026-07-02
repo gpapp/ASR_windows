@@ -308,8 +308,8 @@ def match_known_speakers_full(
             gap = second_dist - best_dist
             if gap < gap_threshold:
                 # When gap is small, prefer speaker with more training data
-                first_dur = known_speakers.get(matches[0][0], {}).get("total_speech_sec", 0)
-                second_dur = known_speakers.get(matches[1][0], {}).get("total_speech_sec", 0)
+                first_dur = known_speakers.get(matches[0][0], {}).get("segments_sec") or known_speakers.get(matches[0][0], {}).get("total_speech_sec", 0)
+                second_dur = known_speakers.get(matches[1][0], {}).get("segments_sec") or known_speakers.get(matches[1][0], {}).get("total_speech_sec", 0)
                 
                 # If best has significantly more data, use it despite small gap
                 if first_dur > second_dur * 2 and best_dist < embed_only_thresh:
