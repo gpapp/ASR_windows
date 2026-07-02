@@ -1107,12 +1107,21 @@ async def transcribe_file(
 
         if args and getattr(args, 'segments_trained', None) is not None and diarize_segments:
             import soundfile as sf
+            import hashlib
+            from collections import defaultdict
             trained_dir = Path(args.segments_trained)
             max_seg = args.max_trained_segments or 20
             audio_data, sr = sf.read(temp_wav)
             if len(audio_data.shape) > 1:
                 audio_data = audio_data.mean(axis=1)
-            from collections import defaultdict
+            _stem = p.stem
+            _hash_int = int(hashlib.md5(_stem.encode()).hexdigest(), 16)
+            _chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+            _result = []
+            for _ in range(6):
+                _hash_int, _idx = divmod(_hash_int, 32)
+                _result.append(_chars[_idx])
+            audio_hash = "".join(_result)
             spk_segs = defaultdict(list)
             for seg in diarize_segments:
                 spk_segs[seg["speaker"]].append(seg)
@@ -1122,14 +1131,15 @@ async def transcribe_file(
                 top_segs = sorted_segs[:max_seg]
                 spk_dir = trained_dir / spk
                 spk_dir.mkdir(parents=True, exist_ok=True)
-                for rank, seg in enumerate(top_segs, 1):
+                for seg in top_segs:
                     start_f = seg["start"]
                     end_f = seg["end"]
                     dur = end_f - start_f
                     if dur < 1.5:
                         continue
                     conf = int(float(seg.get("confidence", 0.5)) * 100)
-                    out_file = spk_dir / f"{rank:02d}_{int(start_f)}_{conf:02d}_{dur:02.0f}.flac"
+                    mins, secs = int(start_f // 60), int(start_f % 60)
+                    out_file = spk_dir / f"{audio_hash}_{mins:02d}-{secs:02d}_{conf:02d}_{dur:02.0f}.flac"
                     start_s = int(start_f * sr)
                     end_s = int(end_f * sr)
                     sf.write(str(out_file), audio_data[start_s:end_s], sr)
