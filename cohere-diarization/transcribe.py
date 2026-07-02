@@ -992,40 +992,6 @@ async def transcribe_file(
                     if old in speaker_profiles:
                         speaker_profiles[new] = speaker_profiles.pop(old)
         
-        # Extract top N best-matching segments per speaker for retraining
-        if args and getattr(args, 'segments_trained', None) is not None and diarize_segments:
-            import soundfile as sf
-            trained_dir = Path(args.segments_trained)
-            max_seg = args.max_trained_segments or 20
-            audio_data, sr = sf.read(temp_wav)
-            if len(audio_data.shape) > 1:
-                audio_data = audio_data.mean(axis=1)
-            from collections import defaultdict
-            spk_segs = defaultdict(list)
-            for seg in diarize_segments:
-                spk_segs[seg["speaker"]].append(seg)
-            trained_count = 0
-            for spk, segs in spk_segs.items():
-                sorted_segs = sorted(segs, key=lambda s: float(s.get("confidence", 0.5)), reverse=True)
-                top_segs = sorted_segs[:max_seg]
-                spk_dir = trained_dir / spk
-                spk_dir.mkdir(parents=True, exist_ok=True)
-                for rank, seg in enumerate(top_segs, 1):
-                    start_f = seg["start"]
-                    end_f = seg["end"]
-                    dur = end_f - start_f
-                    if dur < 1.5:
-                        continue
-                    conf = int(float(seg.get("confidence", 0.5)) * 100)
-                    out_file = spk_dir / f"{rank:02d}_{int(start_f)}_{conf:02d}_{dur:02.0f}.flac"
-                    start_s = int(start_f * sr)
-                    end_s = int(end_f * sr)
-                    sf.write(str(out_file), audio_data[start_s:end_s], sr)
-                    trained_count += 1
-                print(f"  - {spk}: {len(top_segs)} top-trained to {spk_dir}")
-            if trained_count:
-                print(f"[INFO] Extracted {trained_count} top-trained segments to {trained_dir}")
-        
         # Post-process unknown speakers if requested
         # Allow running even when `speaker_profiles` is empty so we can attempt
         # to extract voiceprints for unknowns that the server didn't embed.
@@ -1135,6 +1101,40 @@ async def transcribe_file(
                         print(f"[INFO] Updated voiceprints.json with post-processed speakers")
                     except Exception as e:
                         log.warn(f"Failed to save post-processed voiceprints: {e}")
+        
+
+        if args and getattr(args, 'segments_trained', None) is not None and diarize_segments:
+            import soundfile as sf
+            trained_dir = Path(args.segments_trained)
+            max_seg = args.max_trained_segments or 20
+            audio_data, sr = sf.read(temp_wav)
+            if len(audio_data.shape) > 1:
+                audio_data = audio_data.mean(axis=1)
+            from collections import defaultdict
+            spk_segs = defaultdict(list)
+            for seg in diarize_segments:
+                spk_segs[seg["speaker"]].append(seg)
+            trained_count = 0
+            for spk, segs in spk_segs.items():
+                sorted_segs = sorted(segs, key=lambda s: float(s.get("confidence", 0.5)), reverse=True)
+                top_segs = sorted_segs[:max_seg]
+                spk_dir = trained_dir / spk
+                spk_dir.mkdir(parents=True, exist_ok=True)
+                for rank, seg in enumerate(top_segs, 1):
+                    start_f = seg["start"]
+                    end_f = seg["end"]
+                    dur = end_f - start_f
+                    if dur < 1.5:
+                        continue
+                    conf = int(float(seg.get("confidence", 0.5)) * 100)
+                    out_file = spk_dir / f"{rank:02d}_{int(start_f)}_{conf:02d}_{dur:02.0f}.flac"
+                    start_s = int(start_f * sr)
+                    end_s = int(end_f * sr)
+                    sf.write(str(out_file), audio_data[start_s:end_s], sr)
+                    trained_count += 1
+                print(f"  - {spk}: {len(top_segs)} top-trained to {spk_dir}")
+            if trained_count:
+                print(f"[INFO] Extracted {trained_count} top-trained segments to {trained_dir}")
         
         if not diarize_segments:
             log.warn("Diarization returned no segments. Assuming single speaker for fallback.", file=p.name)
