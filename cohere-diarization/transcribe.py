@@ -447,7 +447,7 @@ class TranscriptionClient:
 
                 if self.config.known_speakers_file:
                     try:
-                        with open(self.config.known_speakers_file, 'r', encoding='utf-8') as f:
+                        with open(self.config.known_speakers_file, 'r', encoding='utf-8-sig') as f:
                             data = json.load(f)
                             known_spk = {}
                             for name, profile in data.items():
@@ -921,14 +921,15 @@ async def transcribe_file(
 
         # Update voiceprints.json with new speakers (those with embeddings)
         if speaker_profiles and diarize_segments:
-            voiceprints_path = Path("voiceprints.json")
+            _vp_arg = args.voiceprints if (args and getattr(args, 'voiceprints', None)) else None
+            voiceprints_path = Path(_vp_arg) if _vp_arg else Path("voiceprints.json")
             existing_vp = {}
             if voiceprints_path.exists():
                 try:
-                    with open(voiceprints_path, 'r', encoding='utf-8') as f:
+                    with open(voiceprints_path, 'r', encoding='utf-8-sig') as f:
                         existing_vp = json.load(f)
-                except:
-                    pass
+                except Exception as e:
+                    log.warn(f"Failed to load voiceprints for update: {e}")
             
             # Calculate total duration and speaker confidence from diarize_segments
             speaker_durations = {}
@@ -996,14 +997,15 @@ async def transcribe_file(
         # Allow running even when `speaker_profiles` is empty so we can attempt
         # to extract voiceprints for unknowns that the server didn't embed.
         if args and getattr(args, 'post_process_unknowns', False) and diarize_segments:
-            voiceprints_path = Path("voiceprints.json")
+            _vp_arg = args.voiceprints if (args and getattr(args, 'voiceprints', None)) else None
+            voiceprints_path = Path(_vp_arg) if _vp_arg else Path("voiceprints.json")
             existing_vp = {}
             if voiceprints_path.exists():
                 try:
-                    with open(voiceprints_path, 'r', encoding='utf-8') as f:
+                    with open(voiceprints_path, 'r', encoding='utf-8-sig') as f:
                         existing_vp = json.load(f)
-                except:
-                    pass
+                except Exception as e:
+                    log.warn(f"Failed to load voiceprints for post-process: {e}")
             
             # Identify unknown speakers (those without embeddings in current profiles)
             known_speakers = set(speaker_profiles.keys()) if speaker_profiles else set()
