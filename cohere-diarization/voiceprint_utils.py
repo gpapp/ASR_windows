@@ -958,6 +958,7 @@ def refine_voiceprint_from_segments(
     voiceprint = {
         "pitch_hz": round(new_pitch, 1),
         "total_speech_sec": round(new_duration, 1),
+        "segments_sec": round(total_duration, 1),
         "embedding": combined_emb
     }
     

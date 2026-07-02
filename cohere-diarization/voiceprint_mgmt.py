@@ -631,8 +631,8 @@ def cmd_mass_refine(args):
             continue
 
         if speaker_name in voiceprints:
-            existing_sec = voiceprints[speaker_name].get("total_speech_sec", 0.0)
-            if existing_sec > 0:
+            existing_seg_sec = voiceprints[speaker_name].get("segments_sec", -1.0)
+            if existing_seg_sec >= 0:
                 import soundfile as _sf
                 samples_dur = 0.0
                 for _w in wavs:
@@ -641,8 +641,8 @@ def cmd_mass_refine(args):
                         samples_dur += _info.duration
                     except Exception:
                         pass
-                if abs(samples_dur - existing_sec) < 1.0:
-                    print(f"[SKIP] {speaker_name}: samples ({samples_dur:.1f}s) match existing voiceprint ({existing_sec:.1f}s)")
+                if abs(samples_dur - existing_seg_sec) < 1.0:
+                    print(f"[SKIP] {speaker_name}: samples ({samples_dur:.1f}s) unchanged from last embed ({existing_seg_sec:.1f}s)")
                     continue
 
         print(f"\n[INFO] Processing {speaker_name} ({len(wavs)} segments)...")
