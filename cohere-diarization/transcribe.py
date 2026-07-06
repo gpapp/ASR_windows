@@ -978,6 +978,9 @@ async def transcribe_file(
             
             if updated:
                 try:
+                    from voiceprint_utils import save_voiceprints
+                    save_voiceprints(existing_vp, voiceprints_path)
+                except ImportError:
                     with open(voiceprints_path, 'w', encoding='utf-8') as f:
                         json.dump(existing_vp, f, indent=2, ensure_ascii=False)
                     print(f"[INFO] Updated voiceprints.json with {len(existing_vp)} speakers")
@@ -1098,6 +1101,9 @@ async def transcribe_file(
                 # Save updated voiceprints if any were added
                 if existing_vp: 
                     try:
+                        from voiceprint_utils import save_voiceprints
+                        save_voiceprints(existing_vp, voiceprints_path)
+                    except ImportError:
                         with open(voiceprints_path, 'w', encoding='utf-8') as f:
                             json.dump(existing_vp, f, indent=2, ensure_ascii=False)
                         print(f"[INFO] Updated voiceprints.json with post-processed speakers")
@@ -1172,6 +1178,9 @@ async def transcribe_file(
                 print(f"[INFO] Extracted {trained_count} top-trained segments to {trained_dir}")
             if vp_dirty and _vp_path.exists():
                 try:
+                    from voiceprint_utils import save_voiceprints
+                    save_voiceprints(_known_vp, _vp_path)
+                except ImportError:
                     import json as _json
                     with open(_vp_path, 'w', encoding='utf-8') as _f:
                         _json.dump(_known_vp, _f, indent=2, ensure_ascii=False)

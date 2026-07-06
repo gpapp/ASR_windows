@@ -200,11 +200,11 @@ def save_voiceprints(voiceprints: dict, path: Path):
             print("Please fix the JSON file manually (remove trailing junk or merge objects).\n")
             with open(path, "a", encoding="utf-8") as f:
                 f.write("\n\n/* MALFORMED ATTEMPTED OVERWRITE BELOW */\n")
-                json.dump(voiceprints, f, indent=2)
+                json.dump(voiceprints, f, indent=2, ensure_ascii=False)
             return
 
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(voiceprints, f, indent=2)
+        json.dump(voiceprints, f, indent=2, ensure_ascii=False)
 
 
 def identify_speakers_in_audio(
