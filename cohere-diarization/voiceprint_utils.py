@@ -186,8 +186,23 @@ def load_voiceprints(path: Path) -> dict:
 
 
 def save_voiceprints(voiceprints: dict, path: Path):
-    """Save voiceprints to JSON file."""
+    """Save voiceprints to JSON file. If file is malformed, appends instead of overwriting."""
     path = Path(path)
+    
+    # Check if existing file is malformed
+    if path.exists() and path.stat().st_size > 0:
+        try:
+            with open(path, "r", encoding="utf-8-sig") as f:
+                json.load(f)
+        except Exception as e:
+            print(f"\n[WARNING] {path.name} is malformed! Appending at end instead of overwriting.")
+            print(f"Error: {e}")
+            print("Please fix the JSON file manually (remove trailing junk or merge objects).\n")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write("\n\n/* MALFORMED ATTEMPTED OVERWRITE BELOW */\n")
+                json.dump(voiceprints, f, indent=2)
+            return
+
     with open(path, "w", encoding="utf-8") as f:
         json.dump(voiceprints, f, indent=2)
 
