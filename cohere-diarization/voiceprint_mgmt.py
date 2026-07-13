@@ -163,8 +163,8 @@ def cmd_extract(args):
                 speakers[spk] = []
             speakers[spk].append(seg)
 
-        # Drop speakers with less than 10s total detected speech
-        min_total_sec = 10.0
+        # Drop speakers with less than 60s total detected speech
+        min_total_sec = 60.0
         skipped = {
             spk: round(sum(s["end"] - s["start"] for s in segs), 1)
             for spk, segs in speakers.items()
@@ -221,6 +221,8 @@ def cmd_extract(args):
         extracted_count = 0
         audio_hash = generate_segment_hash(str(audio_path))
         for speaker_name, speaker_segments in speakers.items():
+            if speaker_name == "OVERLAP" or (speaker_name.startswith("SPEAKER") and speaker_name[7:].isdigit()):
+                continue
             speaker_dir = output_dir / speaker_name
             speaker_dir.mkdir(exist_ok=True)
 
@@ -251,6 +253,8 @@ def cmd_extract(args):
             max_seg = args.max_trained_segments
             trained_count = 0
             for speaker_name, speaker_segments in speakers.items():
+                if speaker_name == "OVERLAP" or (speaker_name.startswith("SPEAKER") and speaker_name[7:].isdigit()):
+                    continue
                 sorted_segs = sorted(speaker_segments, key=lambda s: s["confidence"], reverse=True)
                 top_segs = sorted_segs[:max_seg]
                 speaker_trained_dir = trained_dir / speaker_name
@@ -873,7 +877,7 @@ def main():
     p_extract_missing.add_argument("diarize", nargs="?", help="Diarization JSON file (optional - if not provided, will run diarization via server)")
     p_extract_missing.add_argument("--voiceprints", default="voiceprints.json", help="Voiceprints JSON file")
     p_extract_missing.add_argument("--output", help="Output voiceprints file (default: same as input)")
-    p_extract_missing.add_argument("--min-duration", type=float, default=30.0, help="Minimum speaker duration in seconds (default: 30)")
+    p_extract_missing.add_argument("--min-duration", type=float, default=60.0, help="Minimum speaker duration in seconds (default: 60)")
     p_extract_missing.add_argument("--min-confidence", type=float, default=0.5, help="Minimum average confidence (0-1) (default: 0.5)")
     p_extract_missing.add_argument("--server", "-s", default=None, help="Server URL (default: http://127.0.0.1:8000)")
     p_extract_missing.add_argument("--api-key", "-k", default=None, help="API key for authentication")

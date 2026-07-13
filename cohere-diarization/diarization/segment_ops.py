@@ -28,13 +28,16 @@ def collapse_same_speaker_segments(segments: list, max_gap: float = 0.0) -> list
 def absorb_islands(segments: list, min_island_dur: float = 1.0) -> list:
     """Absorb short segments sandwiched between the same speaker on both sides.
 
-    Mirrors the batch pipeline step 6 island-absorption logic.
+    OVERLAP segments are never absorbed — they represent genuine multi-speaker
+    activity even when brief.
     """
     changed = True
     while changed:
         changed = False
         for i in range(1, len(segments) - 1):
             seg = segments[i]
+            if seg.get("speaker") == "OVERLAP":
+                continue
             dur = seg["end"] - seg["start"]
             prev_spk = segments[i - 1]["speaker"]
             next_spk = segments[i + 1]["speaker"]
@@ -53,14 +56,20 @@ def eliminate_ghost_speakers(
 ) -> list:
     """Reassign speakers whose total speech is below the ghost threshold.
 
-    Mirrors the batch pipeline ghost-speaker elimination logic.
-    Tries 'alternatives' stored on each segment first, then falls back to
-    the nearest temporal neighbour.
+    OVERLAP segments are never reassigned. Their duration is counted toward
+    both speakers in the overlap pair when computing per-speaker totals,
+    preventing a speaker that appears mainly in overlaps from being incorrectly
+    classified as a ghost.
     """
     speaker_total: dict[str, float] = {}
     for seg in segments:
         spk = seg["speaker"]
-        speaker_total[spk] = speaker_total.get(spk, 0.0) + (seg["end"] - seg["start"])
+        dur = seg["end"] - seg["start"]
+        if spk == "OVERLAP":
+            for s in seg.get("speakers", []):
+                speaker_total[s] = speaker_total.get(s, 0.0) + dur
+        else:
+            speaker_total[spk] = speaker_total.get(spk, 0.0) + dur
 
     ghost_speakers = {spk for spk, total in speaker_total.items() if total < ghost_threshold_sec}
     if not ghost_speakers:

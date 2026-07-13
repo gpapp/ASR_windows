@@ -10,6 +10,7 @@ class DiarizeResult(BaseModel):
     start: float
     end: float
     speaker: str
+    speakers: Optional[list[str]] = None
 
 
 class DiarizeResponse(BaseModel):

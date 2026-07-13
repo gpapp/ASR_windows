@@ -32,7 +32,13 @@ from speaker.embedding import extract_embedding, compute_pitch
 
 
 def extract_speaker_audio(wav_path: str, segments: list, speaker_name: str, output_path: str) -> bool:
-    """Extract concatenated audio for a specific speaker from segments."""
+    """Extract concatenated audio for a specific speaker from segments.
+
+    OVERLAP segments are skipped — mixed-speaker audio would produce
+    a contaminated voiceprint embedding.
+    """
+    if speaker_name == "OVERLAP":
+        return False
     try:
         with wave.open(wav_path, 'rb') as orig:
             n_channels = orig.getnchannels()
@@ -653,7 +659,7 @@ def extract_missing_voiceprints(
     diarization_file: str,
     voiceprints_file: Path,
     output_file: Optional[Path] = None,
-    min_duration: float = 30.0,
+    min_duration: float = 60.0,
     min_confidence: float = 0.7,
 ) -> tuple[dict, dict]:
     """
@@ -665,7 +671,7 @@ def extract_missing_voiceprints(
         diarization_file: Path to diarization JSON output
         voiceprints_file: Path to voiceprints.json file
         output_file: Path to save updated voiceprints (defaults to voiceprints_file)
-        min_duration: Minimum speaker duration in seconds (default: 30.0)
+        min_duration: Minimum speaker duration in seconds (default: 60.0)
         min_confidence: Minimum average confidence (default: 0.7)
         
     Returns:
@@ -713,7 +719,7 @@ def extract_missing_voiceprints(
     
     # Identify unknown speakers (not in existing voiceprints)
     known_speakers = set(existing_vp.keys())
-    unknown_speakers = set(speaker_durations.keys()) - known_speakers
+    unknown_speakers = set(speaker_durations.keys()) - known_speakers - {"OVERLAP"}
     
     print(f"[INFO] Found {len(known_speakers)} known speakers: {sorted(known_speakers)}")
     print(f"[INFO] Found {len(unknown_speakers)} unknown speakers: {sorted(unknown_speakers)}")

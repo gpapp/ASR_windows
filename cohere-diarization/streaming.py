@@ -369,7 +369,7 @@ def _persist_new_speakers(
     voiceprints: dict,
     recording_ts: str,
     sr: int = 16000,
-    min_speech_sec: float = 30.0,
+    min_speech_sec: float = 60.0,
     min_confidence: float = 0.8,
 ):
     """

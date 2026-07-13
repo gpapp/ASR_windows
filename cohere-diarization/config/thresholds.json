@@ -53,6 +53,13 @@
     "mfcc12_std_per_unit": 3,
     "confidence_max_distance": 0.5
   },
+  "overlap": {
+    "proximity_ratio": 0.08,
+    "min_distance": 0.40,
+    "min_duration_sec": 0.5,
+    "max_speaker_gap": 1.0,
+    "max_clarity": 0.08
+  },
   "vad": {
     "default_threshold": 0.5,
     "min_speech_duration_ms": 250,

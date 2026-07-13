@@ -19,6 +19,7 @@ from speaker.audio import extract_fbank, generate_sliding_windows, refine_speake
 from speaker.vad import run_vad_onnx_direct, split_at_energy_dips
 from speaker.profiling import profile_speakers, relabel_by_pitch
 from .clustering import cap_clusters, greedy_merge_clusters, match_known_speakers_full
+from .overlap import detect_overlaps, build_overlap_segments
 from .segment_ops import collapse_same_speaker_segments, absorb_islands, eliminate_ghost_speakers
 
 log = structlog.get_logger()
@@ -96,28 +97,38 @@ class Diarizer:
             self._assign_labels_to_segments(
                 all_segments_meta, embeddable_indices, long_labels
             )
-            
-            # Map clusters to speaker names
+
+            # --- OVERLAP: detect overlapping speech windows ---
+            proximity_ratio = get("overlap", "proximity_ratio", 0.15)
+            min_distance = get("overlap", "min_distance", 0.30)
+            overlap_meta_indices = detect_overlaps(
+                raw_embeddings, cluster_centroids, embeddable_indices,
+                all_segments_meta, proximity_ratio, min_distance
+            )
+
+            # Map clusters to speaker names (produces OVERLAP segments when detected)
             merged_segments, speaker_map = self._map_to_speakers(
                 all_segments_meta, cluster_centroids, req
             )
-            
-            # Refinement stages
-            merged_segments = absorb_islands(merged_segments)
-            
-            merged_segments = self._refine_boundaries(
-                merged_segments, all_segments_meta, embeddable_indices,
+
+            # ── Split: process single-speaker segments separately ──────
+            ov_segments = [s for s in merged_segments if s.get("speaker") == "OVERLAP"]
+            non_ov = [s for s in merged_segments if s.get("speaker") != "OVERLAP"]
+
+            non_ov = absorb_islands(non_ov)
+
+            non_ov = self._refine_boundaries(
+                non_ov, all_segments_meta, embeddable_indices,
                 raw_embeddings, waveform_tensor
             )
-            
-            profiles = profile_speakers(waveform_tensor, merged_segments, sample_rate=16000)
-            merged_segments, profiles, pitch_remap = relabel_by_pitch(merged_segments, profiles)
-            
+
+            profiles = profile_speakers(waveform_tensor, non_ov, sample_rate=16000)
+            non_ov, profiles, pitch_remap = relabel_by_pitch(non_ov, profiles)
+
             # Inject cluster centroid embeddings into every speaker's profile
-            # Build reverse mapping: final speaker name → centroid embedding
             # speaker_map: raw_cluster_int → initial_speaker_name (e.g. SPEAKER1)
             # pitch_remap: initial_speaker_name → final_speaker_name (e.g. SPEAKER1 → SPEAKER3)
-            centroid_emb_map = {}  # initial_speaker_name → centroid_embedding
+            centroid_emb_map = {}
             for raw_cluster, init_name in speaker_map.items():
                 centroid_emb_map[init_name] = cluster_centroids[raw_cluster].tolist()
             for init_name, final_name in pitch_remap.items():
@@ -125,27 +136,42 @@ class Diarizer:
                     if final_name not in profiles:
                         profiles[final_name] = {}
                     profiles[final_name]["embedding"] = centroid_emb_map[init_name]
-            
+
             # Voiceprint matching
             if req.known_speakers:
-                merged_segments, profiles = match_known_speakers_full(
-                    merged_segments, all_segments_meta, embeddable_indices,
+                non_ov, profiles = match_known_speakers_full(
+                    non_ov, all_segments_meta, embeddable_indices,
                     raw_embeddings, cluster_centroids, profiles, req.known_speakers, req
                 )
-            
+
             loop.call_soon_threadsafe(queue.put_nowait, json.dumps({
                 "type": "progress", "step": "Clustering", "completed": 1, "total": 1
             }))
-            
-            # Ghost-speaker elimination
-            merged_segments = eliminate_ghost_speakers(merged_segments, profiles=profiles)
-            
+
+            # Ghost-speaker elimination (single-speaker segments only)
+            non_ov = eliminate_ghost_speakers(non_ov, profiles=profiles)
+
+            # ── Recombine with overlap segments ────────────────────────
+            merged_segments = sorted(non_ov + ov_segments, key=lambda x: x["start"])
+
+            # Resolve time conflicts (boundary refinement may have shifted
+            # single-speaker edges into overlap regions)
+            resolved = []
+            for seg in merged_segments:
+                if resolved and seg["start"] < resolved[-1]["end"]:
+                    mid = (seg["start"] + resolved[-1]["end"]) / 2.0
+                    resolved[-1]["end"] = mid
+                    seg["start"] = mid
+                if seg["end"] > seg["start"]:
+                    resolved.append(seg)
+            merged_segments = resolved
+
             # Compute confidence scores
             segment_confidences = self._compute_confidence(
                 merged_segments, all_segments_meta, cluster_centroids,
                 raw_embeddings, embeddable_indices, long_labels, req
             )
-            
+
             # Format final response
             final_data = self._format_response(merged_segments, segment_confidences)
             
@@ -362,38 +388,35 @@ class Diarizer:
                 seg["speaker_raw"] = all_segments_meta[embeddable_indices[nearest]]["speaker_raw"]
     
     def _map_to_speakers(self, all_segments_meta, cluster_centroids, req):
-        """Map raw cluster IDs to speaker names. Returns (merged_segments, speaker_map)."""
-        # Original logic: Map raw cluster int -> SPEAKER1, SPEAKER2, ... in first-appearance order
+        """Map raw cluster IDs to speaker names with overlap awareness.
+
+        After mapping raw cluster IDs → SPEAKER1… labels, merges contiguous
+        same-*merge-key* windows into segments.  Overlap windows (flagged by
+        ``detect_overlaps``) produce ``OVERLAP`` segments carrying a
+        ``"speakers": [A, B]`` list.
+        """
+        # Map raw cluster int -> SPEAKER1, SPEAKER2, … in first-appearance order
         speaker_map: dict[int, str] = {}
         for seg in sorted(all_segments_meta, key=lambda x: x["start"]):
             raw = seg["speaker_raw"]
             if raw not in speaker_map:
                 speaker_map[raw] = f"SPEAKER{len(speaker_map) + 1}"
             seg["speaker"] = speaker_map[raw]
-        
-        # Merge contiguous same-speaker windows
-        MAX_SPEAKER_GAP = 1.0  # seconds
-        all_segments_meta.sort(key=lambda x: x["start"])
-        merged_segments = []
-        current_segment = None
-        
+
+        # Resolve overlap-speaker raw IDs → speaker names
         for seg in all_segments_meta:
-            if current_segment is None:
-                current_segment = seg.copy()
-            elif (current_segment["speaker"] == seg["speaker"] and
-                  seg["start"] <= current_segment["end"] + MAX_SPEAKER_GAP):
-                current_segment["end"] = max(current_segment["end"], seg["end"])
-            else:
-                if seg["start"] < current_segment["end"]:
-                    mid = (seg["start"] + current_segment["end"]) / 2
-                    current_segment["end"] = mid
-                    seg = dict(seg, start=mid)
-                merged_segments.append(current_segment)
-                current_segment = seg.copy()
-        
-        if current_segment:
-            merged_segments.append(current_segment)
-        
+            if seg.get("is_overlap", False):
+                overs_raw = seg.get("overlap_speakers_raw")
+                if overs_raw is not None and len(overs_raw) == 2:
+                    seg["overlap_speakers"] = sorted([
+                        speaker_map[overs_raw[0]],
+                        speaker_map[overs_raw[1]],
+                    ])
+
+        max_gap = get("overlap", "max_speaker_gap", 1.0)
+        min_dur = get("overlap", "min_duration_sec", 0.3)
+        merged_segments = build_overlap_segments(all_segments_meta, max_gap, min_dur)
+
         return merged_segments, speaker_map
     
     def _refine_boundaries(self, merged_segments, all_segments_meta, embeddable_indices,
@@ -528,6 +551,9 @@ class Diarizer:
                 "speaker": seg["speaker"],
                 "confidence": round(float(segment_confidences[i]), 3) if i < len(segment_confidences) else 0.5
             }
+            # Add overlap speakers list if present
+            if seg.get("speaker") == "OVERLAP" and seg.get("speakers"):
+                seg_data["speakers"] = seg["speakers"]
             # Add alternatives if present
             if "alternatives" in seg and seg["alternatives"]:
                 seg_data["alternatives"] = seg["alternatives"]

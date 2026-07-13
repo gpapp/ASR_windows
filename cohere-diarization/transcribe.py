@@ -301,7 +301,13 @@ def rms_check(wav_path: str, threshold: float) -> bool:
 
 
 def extract_speaker_audio(wav_path: str, segments: list, speaker_name: str, output_path: str) -> bool:
-    """Extract concatenated audio for a specific speaker from segments."""
+    """Extract concatenated audio for a specific speaker from segments.
+
+    OVERLAP segments are skipped — mixed-speaker audio would produce
+    a contaminated voiceprint embedding.
+    """
+    if speaker_name == "OVERLAP":
+        return False
     try:
         with wave.open(wav_path, 'rb') as orig:
             n_channels = orig.getnchannels()
@@ -955,7 +961,7 @@ async def transcribe_file(
                     continue
 
                 total_dur = speaker_durations.get(name, 0.0)
-                if total_dur < 10.0:
+                if total_dur < 60.0:
                     continue
 
                 avg_conf = speaker_confidence_sum.get(name, 0.0) / max(1, speaker_counts.get(name, 1))
@@ -1012,7 +1018,7 @@ async def transcribe_file(
             
             # Identify unknown speakers (those without embeddings in current profiles)
             known_speakers = set(speaker_profiles.keys()) if speaker_profiles else set()
-            unknown_speakers = set(s["speaker"] for s in diarize_segments) - known_speakers
+            unknown_speakers = set(s["speaker"] for s in diarize_segments) - known_speakers - {"OVERLAP"}
             
             if unknown_speakers:
                 # Calculate stats for unknowns from diarize_segments
@@ -1034,7 +1040,7 @@ async def transcribe_file(
                 
                 for spk in unknown_speakers:
                     total_dur = speaker_durations.get(spk, 0.0)
-                    if total_dur < 30.0:
+                    if total_dur < 60.0:
                         continue
 
                     avg_conf = speaker_confidence_sum.get(spk, 0.0) / max(1, speaker_counts.get(spk, 1))
@@ -1145,6 +1151,8 @@ async def transcribe_file(
             trained_count = 0
             vp_dirty = False
             for spk, segs in spk_segs.items():
+                if spk == "OVERLAP" or (spk.startswith("SPEAKER") and spk[7:].isdigit()):
+                    continue
                 if spk in _known_vp:
                     existing_seg_sec = _known_vp[spk].get("segments_sec", -1.0)
                     if existing_seg_sec >= min_trained_sec:
@@ -1567,7 +1575,7 @@ Examples:
     parser.add_argument(
         "--post-process-unknowns",
         action="store_true",
-        help="Extract clean voiceprints for unknown speakers with substantial talk (>= 30s, >= 0.8 confidence)"
+        help="Extract clean voiceprints for unknown speakers with substantial talk (>= 60s, >= 0.8 confidence)"
     )
     parser.add_argument(
         "--segments-trained",
