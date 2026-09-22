@@ -19,6 +19,11 @@ log = structlog.get_logger()
 
 EMBEDDING_CACHE_MAX_SIZE = 5000
 
+# ponytail: shrink GPU arena after every run — DirectML arena otherwise only
+# releases on full session reload (reload_encoder_session / reload_embedding_session)
+GPU_SHRINK_RUN_OPTIONS = ort.RunOptions()
+GPU_SHRINK_RUN_OPTIONS.add_run_config_entry("memory.enable_memory_arena_shrinkage", "gpu:0")
+
 
 # ============================================================================
 # KV Cache Pool
@@ -160,13 +165,13 @@ class ModelState:
 def run_embedding(input_feed: dict) -> list[np.ndarray]:
     """Run embedding session with automatic CPU fallback on GPU OOM."""
     try:
-        return state.embedding_session.run(None, input_feed)
+        return state.embedding_session.run(None, input_feed, run_options=GPU_SHRINK_RUN_OPTIONS)
     except Exception as e:
         log.warning("embedding_inference_failed_reloading_cpu", error=str(e))
         from model_loader import reload_embedding_session
         reload_embedding_session(get_settings(), force_cpu=True)
         try:
-            return state.embedding_session.run(None, input_feed)
+            return state.embedding_session.run(None, input_feed, run_options=GPU_SHRINK_RUN_OPTIONS)
         except Exception as e2:
             log.error("embedding_inference_failed_after_reload", error=str(e2))
             raise

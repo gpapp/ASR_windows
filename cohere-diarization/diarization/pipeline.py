@@ -2,6 +2,7 @@
 Full diarization pipeline: VAD → embedding → clustering → matching → refinement.
 """
 
+import gc
 import json
 import asyncio
 import torch
@@ -12,7 +13,7 @@ import structlog
 from sklearn.cluster import AgglomerativeClustering
 
 from settings import Settings
-from model_state import ModelState
+from model_state import ModelState, GPU_SHRINK_RUN_OPTIONS
 from config import get, is_debug
 from api.schemas import DiarizePathsRequest
 from speaker.audio import extract_fbank, generate_sliding_windows, refine_speaker_boundaries
@@ -379,9 +380,12 @@ class Diarizer:
             batch_size = 32
             for i in range(0, len(batch_fbanks), batch_size):
                 audio_input = batch_fbanks[i:i+batch_size].astype(np.float32)
-                out = self.state.embedding_session.run(None, {"feats": audio_input})
+                out = self.state.embedding_session.run(None, {"feats": audio_input},
+                                                       run_options=GPU_SHRINK_RUN_OPTIONS)
                 computed_embeddings.append(out[0])
-            
+            out = None
+            gc.collect()
+
             computed_embeddings = np.concatenate(computed_embeddings, axis=0)
             
             # Store newly computed embeddings in the global cache
@@ -654,11 +658,14 @@ class Diarizer:
                         padded.append(fb.squeeze(0))
                     batch = torch.stack(padded).numpy().astype(np.float32)
                     input_name = self.state.embedding_session.get_inputs()[0].name
-                    out = self.state.embedding_session.run(None, {input_name: batch})[0]
+                    out = self.state.embedding_session.run(None, {input_name: batch},
+                                                           run_options=GPU_SHRINK_RUN_OPTIONS)[0]
                     for li, idx in enumerate(misses):
                         emb = out[li]
                         self.state.embedding_cache.put(hashes[idx], emb)
                         cached[idx] = emb
+                    out = None
+                    gc.collect()
                 for idx in range(len(fbanks)):
                     emb = np.asarray(cached[idx], dtype=np.float64).ravel()
                     nrm = float(np.linalg.norm(emb))

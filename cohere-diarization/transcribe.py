@@ -833,7 +833,8 @@ def refactor_and_detect_overlaps(diarize_segments: list[dict], min_duration: flo
     current = dict(sorted_segments[0])
 
     for seg in sorted_segments[1:]:
-        if seg['speaker'] == current['speaker'] and (seg['start'] - current['end']) <= merge_gap:
+        would_exceed = max(current['end'], seg['end']) - current['start'] > max_chunk_duration
+        if seg['speaker'] == current['speaker'] and (seg['start'] - current['end']) <= merge_gap and not would_exceed:
             current['end'] = max(current['end'], seg['end'])
             current['confidence'] = (current.get('confidence', 0.5) + seg.get('confidence', 0.5)) / 2
         else:

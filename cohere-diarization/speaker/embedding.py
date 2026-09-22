@@ -1,9 +1,11 @@
 """Speaker embedding extraction and utilities."""
+import gc
+
 import numpy as np
 import torch
 import onnxruntime as ort
 
-from model_state import run_embedding
+from model_state import run_embedding, GPU_SHRINK_RUN_OPTIONS
 from .audio import generate_sliding_windows, extract_fbank
 
 
@@ -49,9 +51,10 @@ def extract_embedding(waveform, sample_rate, embedding_session: ort.InferenceSes
 
     input_onnx = {embedding_session.get_inputs()[0].name: batch}
     if embedding_session is not None:
-        embeddings = embedding_session.run(None, input_onnx)[0]
+        embeddings = embedding_session.run(None, input_onnx, run_options=GPU_SHRINK_RUN_OPTIONS)[0]
     else:
         embeddings = run_embedding(input_onnx)[0]
+    gc.collect()
 
     return normalize_embedding(embeddings.mean(axis=0))
 
@@ -127,7 +130,8 @@ def batch_embed_files(
         # Ensure explicit float32 dtype for iGPU execution
         batch = (batch - batch.mean(dim=2, keepdim=True)).squeeze(1).numpy().astype(np.float32)  # CMN + [N, T, 80]
         raw_embs_all[block_start: block_start + len(block_fbanks)] = \
-            embedding_session.run(None, {input_name: batch})[0]
+            embedding_session.run(None, {input_name: batch}, run_options=GPU_SHRINK_RUN_OPTIONS)[0]
+    gc.collect()
 
     # L2-normalise
     norms    = np.linalg.norm(raw_embs_all, axis=1, keepdims=True)

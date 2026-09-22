@@ -18,7 +18,7 @@ from scipy import signal as scipy_signal
 import onnxruntime as ort
 
 from settings import get_settings
-from model_state import state, executor
+from model_state import state, executor, GPU_SHRINK_RUN_OPTIONS
 from model_loader import reload_encoder_session, reload_embedding_session
 from api.exceptions import TranscriptionError, AudioValidationError, TimeoutError
 
@@ -174,6 +174,97 @@ def clean_transcript(text: str) -> str:
 
 
 # ============================================================================
+# Long-audio decode windowing (ported from asr-mcp)
+# ============================================================================
+# A single encoder.run over a very long mel blows up attention memory O(T^2)
+# and the decoder truncates at max_new_tokens. Cut the mel into <=max_chunk
+# windows, snapping each cut to the quietest frame near the target
+# (energy minimum ~= VAD/silence boundary), decode each window separately,
+# and offset segment times back to the full-audio timeline.
+
+def _plan_window_bounds(mel: np.ndarray, window_frames: int, min_tail: int = 300, snap: int = 100) -> list[int]:
+    """Plan decode window boundaries for long mel, snapping cuts to quiet frames."""
+    total = mel.shape[1]  # cohere mel is [1, T, 128]
+    bounds = [0]
+    pos = 0
+    while total - pos > window_frames:
+        target = pos + window_frames
+        if total - target < min_tail:
+            break
+        lo = max(pos + window_frames // 2, target - snap)
+        energies = mel[0, lo:target].sum(axis=1)
+        cut = lo + int(np.argmin(energies))
+        if cut <= pos:
+            cut = target
+        bounds.append(cut)
+        pos = cut
+    bounds.append(total)
+    return bounds
+
+
+def _transcribe_windowed(
+    mel: np.ndarray,
+    language: str,
+    timeout_sec: int,
+    max_frames: int,
+) -> dict:
+    """Transcribe long mel in <=max_frames windows and merge results."""
+    bounds = _plan_window_bounds(mel, max_frames)
+    n_windows = len(bounds) - 1
+    log.info("windowing_long_audio", total_frames=int(mel.shape[1]), windows=n_windows)
+
+    segments_out = []
+    text_parts = []
+    tokens_total = 0
+    inference_total = 0.0
+    stage_total: dict = {}
+    errors = []
+    last = {}
+
+    for i in range(n_windows):
+        s, e = bounds[i], bounds[i + 1]
+        off = s * 0.01  # hop 160 / 16k = 10ms per frame
+        r = transcribe_audio_sync(
+            mel_spectrogram=mel[:, s:e, :],
+            language=language,
+            timeout_sec=timeout_sec,
+            _no_window=True,
+        )
+        last = r
+        if r.get("error"):
+            errors.append(f"window {i} ({off:.1f}s): {r['error']}")
+            log.error("window_transcription_failed", window=i, error=r["error"])
+            continue
+        if r.get("text"):
+            text_parts.append(r["text"].strip())
+        for seg in r.get("segments") or []:
+            segments_out.append({
+                "start": round(seg["start"] + off, 3),
+                "end": round(seg["end"] + off, 3),
+                "text": seg["text"],
+            })
+        tokens_total += r.get("tokens_generated", 0)
+        inference_total += r.get("inference_time_sec", 0.0)
+        for k, v in (r.get("stage_timings") or {}).items():
+            if isinstance(v, (int, float)):
+                stage_total[k] = stage_total.get(k, 0.0) + v
+
+    result = {
+        "text": " ".join(p for p in text_parts if p).strip(),
+        "segments": segments_out,
+        "tokens_generated": tokens_total,
+        "audio_duration_sec": mel.shape[1] * 0.01,
+        "inference_time_sec": inference_total,
+        "stage_timings": stage_total,
+        "past_kv_cache_ort": last.get("past_kv_cache_ort"),
+        "last_token_ids": last.get("last_token_ids"),
+    }
+    if errors:
+        result["error"] = "; ".join(errors)
+    return result
+
+
+# ============================================================================
 # ASR Inference
 # ============================================================================
 
@@ -183,7 +274,8 @@ def transcribe_audio_sync(
     timeout_sec: int = 120,
     mel_spectrogram: Optional[np.ndarray] = None,
     past_kv_cache_ort: Optional[dict] = None,
-    prefix_ids: Optional[list[int]] = None
+    prefix_ids: Optional[list[int]] = None,
+    _no_window: bool = False,
 ) -> dict:
     """
     Synchronous ASR transcription using Cohere Transcribe ONNX model.
@@ -263,7 +355,21 @@ def transcribe_audio_sync(
             shape=str(input_features.shape),
             duration_sec=audio_duration
         )
-        
+
+        # Long mel: windowed decode (skipped for streaming KV/prefix bridges
+        # and for the recursive per-window calls themselves).
+        max_frames = 12000  # 120s window, matches server chunk_sec / config.max_chunk_duration
+        if (
+            not _no_window
+            and past_kv_cache_ort is None
+            and prefix_ids is None
+            and input_features.shape[1] > max_frames
+        ):
+            return _transcribe_windowed(
+                input_features, language=language,
+                timeout_sec=timeout_sec, max_frames=max_frames,
+            )
+
         # ====================================================================
         # Step 2: Run encoder to get context vectors
         # ====================================================================
@@ -273,7 +379,7 @@ def transcribe_audio_sync(
         
         try:
             enc_start = time.perf_counter()
-            enc_outputs = encoder.run(None, enc_inputs)
+            enc_outputs = encoder.run(None, enc_inputs, run_options=GPU_SHRINK_RUN_OPTIONS)
             stage_timings["encoder_sec"] = time.perf_counter() - enc_start
             raw_encoder_hidden_state = enc_outputs[0]  # Shape: [1, T', 1024]
             log.debug("encoder_inference_complete", output_shape=str(raw_encoder_hidden_state.shape))
@@ -284,7 +390,7 @@ def transcribe_audio_sync(
             encoder = state.encoder
             try:
                 enc_start = time.perf_counter()
-                enc_outputs = encoder.run(None, enc_inputs)
+                enc_outputs = encoder.run(None, enc_inputs, run_options=GPU_SHRINK_RUN_OPTIONS)
                 stage_timings["encoder_sec"] = time.perf_counter() - enc_start
                 raw_encoder_hidden_state = enc_outputs[0]
                 log.info("encoder_inference_succeeded_after_reload")
