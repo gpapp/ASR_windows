@@ -35,7 +35,7 @@ class Settings(BaseSettings):
             provider_type = "CUDA"
         elif "TensorrtExecutionProvider" in available_providers:
             provider_type = "Tensorrt"
-        elif "DirectMLExecutionProvider" in available_providers:
+        elif "DMLExecutionProvider" in available_providers:
             provider_type = "DirectML"
         elif "OpenVINOExecutionProvider" in available_providers:
             provider_type = "OpenVINO"
