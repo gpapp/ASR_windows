@@ -16,7 +16,6 @@ from model_state import state, KVCachePool
 
 log = structlog.get_logger()
 
-
 # ============================================================================
 # iGPU Hardware Target Configuration
 # ============================================================================
@@ -35,7 +34,8 @@ def get_igpu_session_options(provider_type: str = "DirectML", settings: Settings
         Tuple of (providers_list, provider_options, session_options)
     """
     opts: ort.SessionOptions = ort.SessionOptions()
-    
+
+    log.info("IGPU", provider=provider_type)
     if provider_type.lower() == "openvino":
         # Optimizations for sequence generation models with KV caching
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -64,6 +64,14 @@ def get_igpu_session_options(provider_type: str = "DirectML", settings: Settings
         log.info("igpu_config_created", provider="OpenVINO")
         return providers, provider_options, opts
         
+    elif provider_type.lower() == "cuda":
+        # Global Session configuration optimized for DirectML stability       
+        opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL  
+        opts.enable_mem_pattern = False 
+        # Basic optimizations only to prevent invalid command errors and driver crashes
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC        
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        return providers, None, opts
     elif provider_type.lower() == "directml":
         # Global Session configuration optimized for DirectML stability       
         opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL  
@@ -71,7 +79,15 @@ def get_igpu_session_options(provider_type: str = "DirectML", settings: Settings
         # Basic optimizations only to prevent invalid command errors and driver crashes
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
         providers = ["DmlExecutionProvider", "CPUExecutionProvider"]
-        log.info("igpu_config_created", provider="DirectML")
+        return providers, None, opts
+    elif provider_type.lower() == "tensorrt":
+        ## CPU fallback with optimized threading for multi-core CPUs
+        providers = ["TensorrtExecutionProvider"]
+        opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        opts.enable_mem_pattern = False
+        opts.intra_op_num_threads = settings.cpu_threads
+        opts.inter_op_num_threads = 1
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         return providers, None, opts
     elif provider_type.lower() == "cpu":
         ## CPU fallback with optimized threading for multi-core CPUs
@@ -99,7 +115,6 @@ def ensure_model(settings: Settings) -> Path:
     needed = [
         "tokenizer.json",
         f"onnx/encoder_model{settings.encoder_model_type}.onnx",
-        f"onnx/encoder_model{settings.encoder_model_type}.onnx",
         f"onnx/encoder_model{settings.encoder_model_type}.onnx_data",
         f"onnx/encoder_model{settings.encoder_model_type}.onnx_data_1",
         f"onnx/decoder_model_merged{settings.decoder_model_type}.onnx",
@@ -115,7 +130,7 @@ def ensure_model(settings: Settings) -> Path:
     
     snapshot_download(
         repo_id=settings.model_repo,
-        allow_patterns=[f"decoder_model_merged{settings.decoder_model_type}.onnx*", f"encoder_model{settings.encoder_model_type}.onnx*", "tokenizer.json"],
+        allow_patterns=[f"onnx/decoder_model_merged{settings.decoder_model_type}.onnx*", f"onnx/encoder_model{settings.encoder_model_type}.onnx*", "tokenizer.json"],
         local_dir=str(settings.model_dir),
     )
     

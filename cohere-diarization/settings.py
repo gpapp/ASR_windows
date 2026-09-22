@@ -5,8 +5,9 @@ Application settings and logging configuration.
 import os
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Optional, ClassVar
 from functools import lru_cache
+import onnxruntime as ort
 
 import numpy as np
 from dotenv import load_dotenv
@@ -16,7 +17,6 @@ import structlog
 
 load_dotenv()
 
-
 # ============================================================================
 # Configuration
 # ============================================================================
@@ -24,8 +24,23 @@ load_dotenv()
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
     
-    # Model settings
+   # Model settings
     provider_type: str = "DirectML"  # Options: "DirectML", "OpenVINO", "CPU"
+    try:
+        log :ClassVar= structlog.get_logger()
+
+        available_providers: ClassVar  = ort.get_available_providers()
+        log.info("igpu_config_created", provider=provider_type, available_providers=available_providers)
+        if "CUDAExecutionProvider" in available_providers:
+            provider_type = "CUDA"
+        elif "TensorrtExecutionProvider" in available_providers:
+            provider_type = "Tensorrt"
+        elif "DirectMLExecutionProvider" in available_providers:
+            provider_type = "DirectML"
+        elif "OpenVINOExecutionProvider" in available_providers:
+            provider_type = "OpenVINO"
+    except ImportError:
+        provider_type = "cpu"
     model_repo: str = "onnx-community/cohere-transcribe-03-2026-ONNX"
     model_dir: Path = Path(__file__).parent.parent / "models/cohere-transcribe-onnx"
     encoder_model_type: str = "_q4"  # options: _fp16, _quantized, _q4, _q4f16, 
