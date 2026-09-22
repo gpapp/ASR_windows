@@ -153,10 +153,30 @@ def run_vad_chunked(waveform_tensor, vad_model, get_speech_timestamps, sample_ra
     return merged
 
 
-def run_vad_onnx_direct(waveform, vad_session, sample_rate=16000, threshold=0.5, min_speech_duration_ms=250):
+def merge_vad_sections(segments: list[dict], max_gap_sec: float = 0.1) -> list[dict]:
+    """Fuse VAD sections separated by <= max_gap_sec of silence (sorted)."""
+    if not segments:
+        return []
+    segs = sorted(segments, key=lambda x: x["start"])
+    merged = [dict(segs[0])]
+    for seg in segs[1:]:
+        if seg["start"] <= merged[-1]["end"] + max_gap_sec:
+            merged[-1]["end"] = max(merged[-1]["end"], seg["end"])
+        else:
+            merged.append(dict(seg))
+    return merged
+
+
+def run_vad_onnx_direct(waveform, vad_session, sample_rate=16000, threshold=0.5,
+                        min_speech_duration_ms=250, merge_close=True):
     """Runs VAD frame-by-frame on a 1D numpy array using the raw ONNX InferenceSession directly.
-    
+
     This is extremely fast and has zero external python dependencies or state wrappers.
+
+    Args:
+        merge_close: When True (default) fuse sections separated by <=0.1s
+            silence — the historical behaviour. When False return the raw
+            per-region sections uncollapsed, for boundary attribution.
     """
     # Initialize state
     state = np.zeros((2, 1, 128), dtype=np.float32)
@@ -219,13 +239,8 @@ def run_vad_onnx_direct(waveform, vad_session, sample_rate=16000, threshold=0.5,
     # Merge overlapping or close segments
     if not speech_segments:
         return []
-        
+
     speech_segments.sort(key=lambda x: x["start"])
-    merged = [speech_segments[0]]
-    for seg in speech_segments[1:]:
-        if seg["start"] <= merged[-1]["end"] + 0.1:
-            merged[-1]["end"] = max(merged[-1]["end"], seg["end"])
-        else:
-            merged.append(seg)
-            
-    return merged
+    if not merge_close:
+        return [dict(s) for s in speech_segments]
+    return merge_vad_sections(speech_segments, max_gap_sec=0.1)

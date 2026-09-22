@@ -66,5 +66,12 @@
     "chunk_duration": 30,
     "overlap": 5
   },
+  "boundary_refine": {
+    "enabled": true,
+    "min_gap_sec": 0.01,
+    "min_section_sec": 0.3,
+    "dip_ratio": 0.35,
+    "min_dip_sec": 0.12
+  },
   "debug": false
 }

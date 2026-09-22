@@ -16,13 +16,83 @@ from model_state import ModelState
 from config import get, is_debug
 from api.schemas import DiarizePathsRequest
 from speaker.audio import extract_fbank, generate_sliding_windows, refine_speaker_boundaries
-from speaker.vad import run_vad_onnx_direct, split_at_energy_dips
+from speaker.vad import run_vad_onnx_direct, split_at_energy_dips, merge_vad_sections
 from speaker.profiling import profile_speakers, relabel_by_pitch
 from .clustering import cap_clusters, greedy_merge_clusters, match_known_speakers_full
 from .overlap import detect_overlaps, build_overlap_segments
 from .segment_ops import collapse_same_speaker_segments, absorb_islands, eliminate_ghost_speakers
 
 log = structlog.get_logger()
+
+
+def _best_split(owners: list[int], weights: list[float]) -> int:
+    """Best cut index k (before section k) minimising weighted disagreements.
+
+    owners[i] = 0 for the left speaker, 1 for the right speaker.
+    Cost of cut k: right-owned sections left of k plus left-owned sections
+    right of k, weighted by embedding-distance margin (confident matches
+    dominate noise). All-one-side (same speaker) collapses to k = n.
+    """
+    n = len(owners)
+    if n == 0:
+        return 0
+    best_k, best_cost = 0, float("inf")
+    for k in range(n + 1):
+        cost = 0.0
+        for i in range(k):
+            if owners[i] == 1:
+                cost += weights[i]
+        for i in range(k, n):
+            if owners[i] == 0:
+                cost += weights[i]
+        if cost < best_cost - 1e-12:
+            best_cost = cost
+            best_k = k
+    return best_k
+
+
+def _gap_energy_cut(audio: np.ndarray, gap_start: float, gap_end: float,
+                    sample_rate: int = 16000, frame_ms: float = 20.0,
+                    dip_ratio: float = 0.35, min_dip_sec: float = 0.12) -> float:
+    """Centre of the quietest pause inside a gap; midpoint as last resort."""
+    mid = (gap_start + gap_end) / 2.0
+    if audio is None or len(audio) == 0:
+        return mid
+    s = max(0, int(gap_start * sample_rate))
+    e = min(len(audio), int(gap_end * sample_rate))
+    frame = max(1, int(frame_ms / 1000 * sample_rate))
+    if e - s < 2 * frame:
+        return mid
+    chunk = audio[s:e].astype(np.float64)
+    n = len(chunk) // frame
+    if n < 1:
+        return mid
+    rms = np.sqrt(np.mean(chunk[:n * frame].reshape(n, frame) ** 2, axis=1) + 1e-12)
+    max_e = float(rms.max())
+    if max_e < 1e-5:
+        return mid
+    quiet = rms < (max_e * dip_ratio)
+    runs = []
+    i = 0
+    while i < n:
+        if quiet[i]:
+            j = i
+            while j < n and quiet[j]:
+                j += 1
+            runs.append((i, j))
+            i = j
+        else:
+            i += 1
+    min_frames = max(1, int(round(min_dip_sec * 1000 / frame_ms)))
+    eligible = [r for r in runs if r[1] - r[0] >= min_frames]
+    if eligible:
+        centre = n / 2.0
+        best = max(eligible, key=lambda r: (r[1] - r[0], -abs((r[0] + r[1]) / 2.0 - centre)))
+        cut_frame = (best[0] + best[1]) // 2
+    else:
+        cut_frame = int(np.argmin(rms))
+    cut = s + cut_frame * frame + frame // 2
+    return float(min(max(cut / sample_rate, gap_start), gap_end))
 
 
 class Diarizer:
@@ -151,6 +221,15 @@ class Diarizer:
             # Ghost-speaker elimination (single-speaker segments only)
             non_ov = eliminate_ghost_speakers(non_ov, profiles=profiles)
 
+            # Exact turn-boundary refinement: uncollapsed VAD sections
+            # attributed to the adjacent speaker via voiceprints.
+            try:
+                non_ov = self._refine_turn_boundaries_exact(
+                    non_ov, waveform_tensor, profiles, req.known_speakers,
+                )
+            except Exception as e:
+                log.warning("exact_boundary_refinement_failed", error=str(e))
+
             # ── Recombine with overlap segments ────────────────────────
             merged_segments = sorted(non_ov + ov_segments, key=lambda x: x["start"])
 
@@ -200,17 +279,22 @@ class Diarizer:
         waveform_np = waveform_tensor.squeeze(0).numpy()
         
         log.info("vad_using_onnx_direct", duration=len(waveform_np) / 16000)
-        speech_ts = run_vad_onnx_direct(
+        # Raw uncollapsed sections first — kept for exact turn-boundary
+        # refinement later; the pipeline itself uses the fused/dip-split copy.
+        raw_sections = run_vad_onnx_direct(
             waveform_np,
             self.state.vad_session,
             sample_rate=16000,
             threshold=vad_thresh_val,
-            min_speech_duration_ms=vad_min_dur_val
+            min_speech_duration_ms=vad_min_dur_val,
+            merge_close=False,
         )
-            
+        self._raw_vad_sections = raw_sections
+        speech_ts = merge_vad_sections(raw_sections, max_gap_sec=0.1)
+
         # Post-process: Split long segments at local energy dips to avoid cross-speaker window contamination
         speech_ts = split_at_energy_dips(speech_ts, waveform_np, sample_rate=16000)
-            
+
         return speech_ts
     
     def _extract_features(self, waveform_tensor, speech_ts, queue, loop):
@@ -446,8 +530,190 @@ class Diarizer:
                 sample_rate=16000,
             )
             log.debug("boundary_refinement_done", n_segments=len(merged_segments))
-        
+
         return merged_segments
+
+    def _refine_turn_boundaries_exact(self, segments, waveform_tensor,
+                                      profiles, known_speakers=None):
+        """Exact turn boundaries from uncollapsed VAD sections + voiceprints.
+
+        For every gap between consecutive single-speaker segments: collect the
+        raw VAD sections spanning it, embed each one, attribute it to the
+        better-matching adjacent speaker (known voiceprint, else that
+        speaker's cluster-centroid embedding from profiles), find the
+        ownership split, then apply ONE shared cut per gap at the exact start
+        of the first section owned by the incoming speaker (gap end when the
+        gap belongs entirely to the left speaker). Sections owned by the left
+        speaker extend its end; the right speaker's start meets the same cut,
+        so the pair stays contiguous — no overlap, no uncovered gap.
+
+        Fallback chain per gap: energy-dip centre → midpoint. Requires raw
+        VAD sections (captured in _run_vad) and the embedding session.
+        """
+        if not get("boundary_refine", "enabled", True):
+            return segments
+        if len(segments) < 2 or not self.state.embedding_session:
+            return segments
+        segments = sorted(segments, key=lambda s: s["start"])
+
+        min_gap = float(get("boundary_refine", "min_gap_sec", 0.01))
+        min_section = float(get("boundary_refine", "min_section_sec", 0.3))
+        dip_ratio = float(get("boundary_refine", "dip_ratio", 0.35))
+        min_dip = float(get("boundary_refine", "min_dip_sec", 0.12))
+
+        gaps = []
+        for i in range(len(segments) - 1):
+            g0 = float(segments[i]["end"])
+            g1 = float(segments[i + 1]["start"])
+            if g1 - g0 > min_gap:
+                gaps.append((i, g0, g1))
+        if not gaps:
+            return segments
+
+        raw = getattr(self, "_raw_vad_sections", None)
+        if raw is None and self.state.vad_session is not None:
+            waveform_np = waveform_tensor.squeeze(0).numpy()
+            raw = run_vad_onnx_direct(
+                waveform_np, self.state.vad_session,
+                sample_rate=16000, threshold=self.settings.vad_threshold,
+                min_speech_duration_ms=self.settings.vad_min_speech_duration_ms,
+                merge_close=False,
+            )
+        if raw is None:
+            raw = []
+        raw = sorted(raw, key=lambda s: s["start"])
+        # Reference embeddings per speaker: known voiceprint → profiles centroid.
+        def _ref(name):
+            if known_speakers:
+                entry = known_speakers.get(name) or known_speakers.get(str(name).strip("[]"))
+                if entry and entry.get("embedding") is not None:
+                    v = np.asarray(entry["embedding"], dtype=np.float64).ravel()
+                    nrm = float(np.linalg.norm(v))
+                    if nrm > 1e-8:
+                        return v / nrm
+            if profiles:
+                entry = profiles.get(name)
+                if entry and entry.get("embedding") is not None:
+                    v = np.asarray(entry["embedding"], dtype=np.float64).ravel()
+                    nrm = float(np.linalg.norm(v))
+                    if nrm > 1e-8:
+                        return v / nrm
+            return None
+
+        # Collect gap sections (only when both refs exist).
+        gap_sections: dict[int, list] = {}
+        emb_jobs: list[tuple[int, dict]] = []  # (gap_idx, section)
+        for gi, (i, g0, g1) in enumerate(gaps):
+            ref_l = _ref(segments[i]["speaker"])
+            ref_r = _ref(segments[i + 1]["speaker"])
+            if ref_l is None or ref_r is None:
+                continue
+            secs = [
+                dict(s) for s in raw
+                if s["end"] > g0 and s["start"] < g1
+                and (s["end"] - s["start"]) >= min_section
+            ]
+            if secs:
+                gap_sections[gi] = secs
+                for s in secs:
+                    emb_jobs.append((gi, s))
+
+        # Embed all gap sections in one batched ONNX call (with cache).
+        embeddings: dict[int, list] = {}  # id(section dict) -> np vector
+        if emb_jobs:
+            import hashlib
+            waveform_np = waveform_tensor.squeeze(0).numpy()
+            fbanks, job_idx = [], []
+            for j, (gi, s) in enumerate(emb_jobs):
+                a = max(0, int(s["start"] * 16000))
+                b = min(len(waveform_np), int(s["end"] * 16000))
+                if b - a < int(min_section * 16000):
+                    continue
+                chunk = torch.from_numpy(waveform_np[a:b]).unsqueeze(0).float()
+                fb = extract_fbank(chunk, 16000)  # [1, T, 80]
+                fb = fb - fb.mean(dim=1, keepdim=True)  # CMN
+                fbanks.append(fb)
+                job_idx.append(j)
+            if fbanks:
+                hashes = [hashlib.md5(fb.numpy().tobytes()).hexdigest() for fb in fbanks]
+                cached = {}
+                misses = []
+                for idx, h in enumerate(hashes):
+                    hit = self.state.embedding_cache.get(h)
+                    if hit is not None:
+                        cached[idx] = hit
+                    else:
+                        misses.append(idx)
+                if misses:
+                    miss_fb = [fbanks[idx] for idx in misses]
+                    max_len = max(fb.shape[1] for fb in miss_fb)
+                    padded = []
+                    for fb in miss_fb:
+                        if fb.shape[1] < max_len:
+                            fb = torch.nn.functional.pad(fb, (0, 0, 0, max_len - fb.shape[1]))
+                        padded.append(fb.squeeze(0))
+                    batch = torch.stack(padded).numpy().astype(np.float32)
+                    input_name = self.state.embedding_session.get_inputs()[0].name
+                    out = self.state.embedding_session.run(None, {input_name: batch})[0]
+                    for li, idx in enumerate(misses):
+                        emb = out[li]
+                        self.state.embedding_cache.put(hashes[idx], emb)
+                        cached[idx] = emb
+                for idx in range(len(fbanks)):
+                    emb = np.asarray(cached[idx], dtype=np.float64).ravel()
+                    nrm = float(np.linalg.norm(emb))
+                    if nrm > 1e-8:
+                        emb = emb / nrm
+                    _, s = emb_jobs[job_idx[idx]]
+                    embeddings[id(s)] = emb
+
+        # Apply one shared cut per gap.
+        waveform_np = waveform_tensor.squeeze(0).numpy()
+        refined = 0
+        for gi, (i, g0, g1) in enumerate(gaps):
+            left, right = segments[i], segments[i + 1]
+            secs = gap_sections.get(gi, [])
+            ref_l = _ref(left["speaker"])
+            ref_r = _ref(right["speaker"])
+            owners, weights, valid = [], [], []
+            if secs and ref_l is not None and ref_r is not None:
+                for s in secs:
+                    emb = embeddings.get(id(s))
+                    if emb is None:
+                        continue
+                    sa = float(np.dot(emb, ref_l))
+                    sb = float(np.dot(emb, ref_r))
+                    owners.append(0 if sa >= sb else 1)
+                    weights.append(abs(sa - sb) + 1e-3)
+                    valid.append(s)
+            if valid:
+                k = _best_split(owners, weights)
+                if k < len(valid):
+                    cut = float(valid[k]["start"])
+                    cut = min(max(cut, g0), g1)
+                else:
+                    cut = g1
+                n_left = sum(1 for o in owners if o == 0)
+                log.info("boundary_refinement", gap_index=i,
+                         gap=round(g0, 3), gap_end=round(g1, 3),
+                         sections=len(valid), left_owned=n_left,
+                         right_owned=len(valid) - n_left, cut=round(cut, 3))
+            else:
+                cut = _gap_energy_cut(
+                    waveform_np, g0, g1,
+                    dip_ratio=dip_ratio, min_dip_sec=min_dip,
+                )
+                log.debug("boundary_fallback_energy", gap_index=i,
+                          gap=round(g0, 3), gap_end=round(g1, 3),
+                          cut=round(cut, 3))
+            left["end"] = float(cut)
+            right["start"] = float(cut)
+            refined += 1
+
+        if refined:
+            log.info("exact_boundary_refinement_done", gaps_closed=refined,
+                     total_gaps=len(gaps))
+        return segments
     
     def _compute_confidence(self, merged_segments, all_segments_meta, cluster_centroids,
                            raw_embeddings, embeddable_indices, long_labels, req):
