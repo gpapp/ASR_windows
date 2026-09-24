@@ -24,6 +24,40 @@ EMBEDDING_CACHE_MAX_SIZE = 5000
 GPU_SHRINK_RUN_OPTIONS = ort.RunOptions()
 GPU_SHRINK_RUN_OPTIONS.add_run_config_entry("memory.enable_memory_arena_shrinkage", "gpu:0")
 
+# Plain RunOptions with no GPU arena entry — safe for CPU/OpenVINO and for
+# DirectML configurations that don't register an arena allocator.
+CPU_RUN_OPTIONS = ort.RunOptions()
+
+_GPU_PROVIDERS = {"DmlExecutionProvider", "CUDAExecutionProvider", "TensorrtExecutionProvider"}
+
+# Per-session shrink support cache: id(session) -> bool
+# Starts as True for GPU sessions; flipped to False on first INVALID_ARGUMENT.
+_shrink_supported: dict[int, bool] = {}
+_shrink_lock = threading.Lock()
+
+
+def get_run_options(session: ort.InferenceSession) -> ort.RunOptions:
+    """Return GPU_SHRINK_RUN_OPTIONS for GPU sessions that support arena shrink,
+    otherwise CPU_RUN_OPTIONS.  Falls back permanently per session after the
+    first INVALID_ARGUMENT so subsequent calls are zero-cost."""
+    sid = id(session)
+    with _shrink_lock:
+        if sid not in _shrink_supported:
+            try:
+                providers = session.get_providers()
+                _shrink_supported[sid] = any(p in _GPU_PROVIDERS for p in providers)
+            except Exception:
+                _shrink_supported[sid] = False
+    return GPU_SHRINK_RUN_OPTIONS if _shrink_supported.get(sid, False) else CPU_RUN_OPTIONS
+
+
+def disable_shrink_for_session(session: ort.InferenceSession) -> None:
+    """Mark a session as not supporting GPU arena shrink.  Called on
+    INVALID_ARGUMENT so all future runs skip the shrink option."""
+    with _shrink_lock:
+        _shrink_supported[id(session)] = False
+        log.warning("gpu_arena_shrink_disabled", session_id=id(session))
+
 
 # ============================================================================
 # KV Cache Pool
@@ -164,14 +198,27 @@ class ModelState:
 
 def run_embedding(input_feed: dict) -> list[np.ndarray]:
     """Run embedding session with automatic CPU fallback on GPU OOM."""
+    sess = state.embedding_session
     try:
-        return state.embedding_session.run(None, input_feed, run_options=GPU_SHRINK_RUN_OPTIONS)
+        return sess.run(None, input_feed, run_options=get_run_options(sess))
+    except ort.capi.onnxruntime_pybind11_state.InvalidArgument as e:
+        if "memory_arena_shrink" in str(e) or "arena" in str(e).lower():
+            disable_shrink_for_session(sess)
+            return sess.run(None, input_feed, run_options=CPU_RUN_OPTIONS)
+        log.warning("embedding_inference_failed_reloading_cpu", error=str(e))
+        from model_loader import reload_embedding_session
+        reload_embedding_session(get_settings(), force_cpu=True)
+        try:
+            return state.embedding_session.run(None, input_feed, run_options=get_run_options(state.embedding_session))
+        except Exception as e2:
+            log.error("embedding_inference_failed_after_reload", error=str(e2))
+            raise
     except Exception as e:
         log.warning("embedding_inference_failed_reloading_cpu", error=str(e))
         from model_loader import reload_embedding_session
         reload_embedding_session(get_settings(), force_cpu=True)
         try:
-            return state.embedding_session.run(None, input_feed, run_options=GPU_SHRINK_RUN_OPTIONS)
+            return state.embedding_session.run(None, input_feed, run_options=get_run_options(state.embedding_session))
         except Exception as e2:
             log.error("embedding_inference_failed_after_reload", error=str(e2))
             raise

@@ -29,7 +29,7 @@ from tqdm import tqdm
 
 # Re-export from speaker module for backwards compatibility
 from speaker.embedding import extract_embedding, compute_pitch
-from model_state import GPU_SHRINK_RUN_OPTIONS
+from model_state import get_run_options, disable_shrink_for_session, CPU_RUN_OPTIONS
 
 
 def extract_speaker_audio(wav_path: str, segments: list, speaker_name: str, output_path: str) -> bool:
@@ -361,8 +361,16 @@ def identify_speakers_in_audio(
         # Ensure explicit float32 dtype for iGPU execution
         batch = batch.squeeze(1).numpy().astype(np.float32)  # [N, max_len, 80]
 
-        embeddings = embedding_session.run(None, {embedding_session.get_inputs()[0].name: batch},
-                                            run_options=GPU_SHRINK_RUN_OPTIONS)[0]
+        try:
+            embeddings = embedding_session.run(None, {embedding_session.get_inputs()[0].name: batch},
+                                                run_options=get_run_options(embedding_session))[0]
+        except Exception as _e:
+            if "arena" in str(_e).lower():
+                disable_shrink_for_session(embedding_session)
+                embeddings = embedding_session.run(None, {embedding_session.get_inputs()[0].name: batch},
+                                                    run_options=CPU_RUN_OPTIONS)[0]
+            else:
+                raise
 
         # Normalize
         norms = np.linalg.norm(embeddings, axis=1, keepdims=True)

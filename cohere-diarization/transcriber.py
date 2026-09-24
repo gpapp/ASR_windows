@@ -18,7 +18,7 @@ from scipy import signal as scipy_signal
 import onnxruntime as ort
 
 from settings import get_settings
-from model_state import state, executor, GPU_SHRINK_RUN_OPTIONS
+from model_state import state, executor, get_run_options, disable_shrink_for_session, CPU_RUN_OPTIONS
 from model_loader import reload_encoder_session, reload_embedding_session
 from api.exceptions import TranscriptionError, AudioValidationError, TimeoutError
 
@@ -379,7 +379,14 @@ def transcribe_audio_sync(
         
         try:
             enc_start = time.perf_counter()
-            enc_outputs = encoder.run(None, enc_inputs, run_options=GPU_SHRINK_RUN_OPTIONS)
+            try:
+                enc_outputs = encoder.run(None, enc_inputs, run_options=get_run_options(encoder))
+            except Exception as _arena_e:
+                if "arena" in str(_arena_e).lower():
+                    disable_shrink_for_session(encoder)
+                    enc_outputs = encoder.run(None, enc_inputs, run_options=CPU_RUN_OPTIONS)
+                else:
+                    raise
             stage_timings["encoder_sec"] = time.perf_counter() - enc_start
             raw_encoder_hidden_state = enc_outputs[0]  # Shape: [1, T', 1024]
             log.debug("encoder_inference_complete", output_shape=str(raw_encoder_hidden_state.shape))
@@ -390,7 +397,14 @@ def transcribe_audio_sync(
             encoder = state.encoder
             try:
                 enc_start = time.perf_counter()
-                enc_outputs = encoder.run(None, enc_inputs, run_options=GPU_SHRINK_RUN_OPTIONS)
+                try:
+                    enc_outputs = encoder.run(None, enc_inputs, run_options=get_run_options(encoder))
+                except Exception as _arena_e2:
+                    if "arena" in str(_arena_e2).lower():
+                        disable_shrink_for_session(encoder)
+                        enc_outputs = encoder.run(None, enc_inputs, run_options=CPU_RUN_OPTIONS)
+                    else:
+                        raise
                 stage_timings["encoder_sec"] = time.perf_counter() - enc_start
                 raw_encoder_hidden_state = enc_outputs[0]
                 log.info("encoder_inference_succeeded_after_reload")

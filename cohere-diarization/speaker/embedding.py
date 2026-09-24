@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import onnxruntime as ort
 
-from model_state import run_embedding, GPU_SHRINK_RUN_OPTIONS
+from model_state import run_embedding, get_run_options, disable_shrink_for_session, CPU_RUN_OPTIONS
 from .audio import generate_sliding_windows, extract_fbank
 
 
@@ -51,7 +51,14 @@ def extract_embedding(waveform, sample_rate, embedding_session: ort.InferenceSes
 
     input_onnx = {embedding_session.get_inputs()[0].name: batch}
     if embedding_session is not None:
-        embeddings = embedding_session.run(None, input_onnx, run_options=GPU_SHRINK_RUN_OPTIONS)[0]
+        try:
+            embeddings = embedding_session.run(None, input_onnx, run_options=get_run_options(embedding_session))[0]
+        except Exception as _e:
+            if "arena" in str(_e).lower():
+                disable_shrink_for_session(embedding_session)
+                embeddings = embedding_session.run(None, input_onnx, run_options=CPU_RUN_OPTIONS)[0]
+            else:
+                raise
     else:
         embeddings = run_embedding(input_onnx)[0]
     gc.collect()
@@ -129,8 +136,15 @@ def batch_embed_files(
         batch = torch.stack(padded, dim=0)                   # [N, 1, T, 80]
         # Ensure explicit float32 dtype for iGPU execution
         batch = (batch - batch.mean(dim=2, keepdim=True)).squeeze(1).numpy().astype(np.float32)  # CMN + [N, T, 80]
-        raw_embs_all[block_start: block_start + len(block_fbanks)] = \
-            embedding_session.run(None, {input_name: batch}, run_options=GPU_SHRINK_RUN_OPTIONS)[0]
+        try:
+            block_result = embedding_session.run(None, {input_name: batch}, run_options=get_run_options(embedding_session))[0]
+        except Exception as _e:
+            if "arena" in str(_e).lower():
+                disable_shrink_for_session(embedding_session)
+                block_result = embedding_session.run(None, {input_name: batch}, run_options=CPU_RUN_OPTIONS)[0]
+            else:
+                raise
+        raw_embs_all[block_start: block_start + len(block_fbanks)] = block_result
     gc.collect()
 
     # L2-normalise

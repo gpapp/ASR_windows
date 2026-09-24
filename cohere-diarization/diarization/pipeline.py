@@ -13,7 +13,7 @@ import structlog
 from sklearn.cluster import AgglomerativeClustering
 
 from settings import Settings
-from model_state import ModelState, GPU_SHRINK_RUN_OPTIONS
+from model_state import ModelState, get_run_options, disable_shrink_for_session, CPU_RUN_OPTIONS
 from config import get, is_debug
 from api.schemas import DiarizePathsRequest
 from speaker.audio import extract_fbank, generate_sliding_windows, refine_speaker_boundaries
@@ -380,8 +380,17 @@ class Diarizer:
             batch_size = 32
             for i in range(0, len(batch_fbanks), batch_size):
                 audio_input = batch_fbanks[i:i+batch_size].astype(np.float32)
-                out = self.state.embedding_session.run(None, {"feats": audio_input},
-                                                       run_options=GPU_SHRINK_RUN_OPTIONS)
+                sess = self.state.embedding_session
+                try:
+                    out = sess.run(None, {"feats": audio_input},
+                                   run_options=get_run_options(sess))
+                except Exception as _e:
+                    if "arena" in str(_e).lower():
+                        disable_shrink_for_session(sess)
+                        out = sess.run(None, {"feats": audio_input},
+                                       run_options=CPU_RUN_OPTIONS)
+                    else:
+                        raise
                 computed_embeddings.append(out[0])
             out = None
             gc.collect()
@@ -658,8 +667,17 @@ class Diarizer:
                         padded.append(fb.squeeze(0))
                     batch = torch.stack(padded).numpy().astype(np.float32)
                     input_name = self.state.embedding_session.get_inputs()[0].name
-                    out = self.state.embedding_session.run(None, {input_name: batch},
-                                                           run_options=GPU_SHRINK_RUN_OPTIONS)[0]
+                    sess = self.state.embedding_session
+                    try:
+                        out = sess.run(None, {input_name: batch},
+                                       run_options=get_run_options(sess))[0]
+                    except Exception as _e:
+                        if "arena" in str(_e).lower():
+                            disable_shrink_for_session(sess)
+                            out = sess.run(None, {input_name: batch},
+                                           run_options=CPU_RUN_OPTIONS)[0]
+                        else:
+                            raise
                     for li, idx in enumerate(misses):
                         emb = out[li]
                         self.state.embedding_cache.put(hashes[idx], emb)

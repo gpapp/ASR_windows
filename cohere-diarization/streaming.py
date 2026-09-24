@@ -15,7 +15,7 @@ import structlog
 from fastapi import WebSocket, WebSocketDisconnect
 
 from settings import get_settings
-from model_state import state, GPU_SHRINK_RUN_OPTIONS
+from model_state import state, get_run_options, disable_shrink_for_session, CPU_RUN_OPTIONS
 from config import get
 from transcriber import transcribe_audio_sync, clean_transcript
 from speaker.audio import extract_fbank, generate_sliding_windows
@@ -78,9 +78,18 @@ def _estimate_embedding_from_audio(
         batch = torch.stack(padded, dim=0)
         # Ensure explicit float32 dtype for iGPU execution
         batch = (batch - batch.mean(dim=2, keepdim=True)).squeeze(1).numpy().astype(np.float32)
-        embs = state.embedding_session.run(None, {
-            state.embedding_session.get_inputs()[0].name: batch
-        }, run_options=GPU_SHRINK_RUN_OPTIONS)[0]
+        sess = state.embedding_session
+        try:
+            embs = sess.run(None, {
+                sess.get_inputs()[0].name: batch
+            }, run_options=get_run_options(sess))[0]
+        except Exception as _e:
+            if "arena" in str(_e).lower():
+                disable_shrink_for_session(sess)
+                embs = sess.run(None, {sess.get_inputs()[0].name: batch},
+                                run_options=CPU_RUN_OPTIONS)[0]
+            else:
+                raise
         norms = np.linalg.norm(embs, axis=1, keepdims=True)
         embs = embs / np.maximum(norms, 1e-12)
         return embs.mean(axis=0)
@@ -190,8 +199,17 @@ def _process_speaker_window(
     bs = 32
     for i in range(0, len(batch), bs):
         audio_input = batch[i:i+bs].astype(np.float32)
-        out = state.embedding_session.run(None, {"feats": audio_input},
-                                           run_options=GPU_SHRINK_RUN_OPTIONS)
+        sess = state.embedding_session
+        try:
+            out = sess.run(None, {"feats": audio_input},
+                           run_options=get_run_options(sess))
+        except Exception as _e:
+            if "arena" in str(_e).lower():
+                disable_shrink_for_session(sess)
+                out = sess.run(None, {"feats": audio_input},
+                               run_options=CPU_RUN_OPTIONS)
+            else:
+                raise
         raw_embs.append(out[0])
     raw_embs = np.concatenate(raw_embs, axis=0)
     norms = np.linalg.norm(raw_embs, axis=1, keepdims=True)
