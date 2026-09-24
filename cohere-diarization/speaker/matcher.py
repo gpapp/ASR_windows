@@ -65,13 +65,14 @@ def compute_distance(
     cluster_energy: float,
     voiceprint: Dict,
     cfg: Dict = None,
-    cluster_features: Dict = None
+    cluster_features: Dict = None,
+    is_known_speaker: bool = False
 ) -> Dict[str, float]:
     """
-    Compute distance between a cluster and a voiceprint.
+    Compute multi-feature distance between a cluster and a voiceprint.
     
-    Returns dict with:
-    - emb_dist: cosine distance of embeddings
+    Returns:
+    - emb_dist: cosine distance (0-1)
     - pitch_dist: normalized pitch distance (0-1)
     - energy_dist: normalized energy distance (0-1)
     - spectral_dist: normalized spectral feature distance (0-1)
@@ -129,6 +130,14 @@ def compute_distance(
             weights[2] * min(energy_dist, 1.0)
         )
     
+    if is_known_speaker:
+        bias = cfg.get("known_speaker_margin_bias", 0.0)
+        if not bias:
+            from config import get as cfg_get
+            bias = cfg_get("second_pass", {}).get("known_speaker_margin_bias", 0.0) if cfg_get else 0.0
+        if bias > 0:
+            combined = max(0.0, combined - bias)
+
     # Confidence (higher is better)
     confidence = max(0, 1 - (combined / conf_max_dist))
     
@@ -166,9 +175,12 @@ def find_best_match(
         if "embedding" not in voiceprint:
             continue
         
+        is_known = not (name.startswith("Speaker ") or name.startswith("SPEAKER ") or name == "OVERLAP")
         dist_info = compute_distance(
             cluster_emb, cluster_pitch, cluster_energy, voiceprint,
-            cluster_features=cluster_features
+            cfg=cfg,
+            cluster_features=cluster_features,
+            is_known_speaker=is_known
         )
         
         matches.append((name, dist_info["combined"], dist_info["confidence"]))

@@ -19,7 +19,10 @@ from api.schemas import DiarizePathsRequest
 from speaker.audio import extract_fbank, generate_sliding_windows, refine_speaker_boundaries
 from speaker.vad import run_vad_onnx_direct, split_at_energy_dips, merge_vad_sections
 from speaker.profiling import profile_speakers, relabel_by_pitch
-from .clustering import cap_clusters, greedy_merge_clusters, match_known_speakers_full
+from .clustering import (
+    cap_clusters, greedy_merge_clusters, match_known_speakers_full,
+    collapse_unknown_speakers_second_pass,
+)
 from .overlap import detect_overlaps, build_overlap_segments
 from .segment_ops import (
     collapse_same_speaker_segments, absorb_islands,
@@ -234,6 +237,20 @@ class Diarizer:
                 min_speaker_dur=8.0,
                 protected_speakers=known_names,
             )
+
+            # Second-pass: re-profile and consolidate unknown speakers with larger margin for knowns
+            try:
+                waveform_np = waveform_tensor.squeeze(0).numpy()
+                non_ov, profiles = collapse_unknown_speakers_second_pass(
+                    non_ov,
+                    waveform_np,
+                    16000,
+                    known_speakers=req.known_speakers or {},
+                    profiles=profiles,
+                    embedding_session=self.state.embedding_session,
+                )
+            except Exception as e:
+                log.warning("second_pass_unknown_collapse_failed", error=str(e))
 
             # Exact turn-boundary refinement: uncollapsed VAD sections
             # attributed to the adjacent speaker via voiceprints.
