@@ -9,8 +9,20 @@ from model_state import run_embedding, get_run_options, disable_shrink_for_sessi
 from .audio import generate_sliding_windows, extract_fbank
 
 
-def extract_embedding(waveform, sample_rate, embedding_session: ort.InferenceSession):
+def extract_embedding(waveform, sample_rate, embedding_session: ort.InferenceSession = None, state=None):
     """Extract voice embedding from waveform using ONNX model."""
+    if embedding_session is None and state is not None:
+        embedding_session = state
+
+    if embedding_session is not None and hasattr(embedding_session, "embedding_session"):
+        embedding_session = embedding_session.embedding_session
+
+    if isinstance(waveform, np.ndarray):
+        waveform = torch.from_numpy(waveform).float()
+
+    if isinstance(waveform, torch.Tensor) and waveform.dim() == 1:
+        waveform = waveform.unsqueeze(0)
+
     windows, start_times = generate_sliding_windows(waveform, sample_rate, window_sec=3.0, stride_sec=1.5)
 
     if not windows:
