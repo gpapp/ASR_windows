@@ -321,7 +321,7 @@ class Diarizer:
             merge_close=False,
         )
         self._raw_vad_sections = raw_sections
-        speech_ts = merge_vad_sections(raw_sections, max_gap_sec=0.1)
+        speech_ts = merge_vad_sections(raw_sections, max_gap_sec=0.5)
 
         # Post-process: Split long segments at local energy dips to avoid cross-speaker window contamination
         speech_ts = split_at_energy_dips(speech_ts, waveform_np, sample_rate=16000)

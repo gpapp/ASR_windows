@@ -5,7 +5,7 @@ Segment post-processing operations.
 from config import is_debug
 
 
-def collapse_same_speaker_segments(segments: list, max_gap: float = 0.0) -> list:
+def collapse_same_speaker_segments(segments: list, max_gap: float = 1.5) -> list:
     """Collapse adjacent segments with the same speaker.
     
     Args:
