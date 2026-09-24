@@ -234,7 +234,6 @@ def match_known_speakers_full(
     
     # Build clusters dict for matcher module
     clusters = {}
-    all_cluster_features = {}
     for spk, emb_list in speaker_centroids.items():
         if not emb_list:
             continue
@@ -251,18 +250,9 @@ def match_known_speakers_full(
             "pitch_hz": prof.get("pitch_hz", 0) or 0,
             "energy_rms": prof.get("energy_rms", 0) or 0,
         }
-        
-        # Collect spectral and MFCC features
-        features = {"spectral_centroid": prof.get("spectral_centroid", 0) or 0,
-                    "spectral_rolloff": prof.get("spectral_rolloff", 0) or 0}
-        for i in range(13):
-            features[f"mfcc{i}_mean"] = prof.get(f"mfcc{i}_mean", 0) or 0
-            features[f"mfcc{i}_std"] = prof.get(f"mfcc{i}_std", 0) or 0
-        all_cluster_features[spk] = features
     
     # Use matcher module for distance computation and matching
-    match_results = match_clusters(clusters, known_speakers, 
-                                   all_cluster_features=all_cluster_features)
+    match_results = match_clusters(clusters, known_speakers)
     
     # Build all_matches for post-processing
     all_matches = {}  # spk -> [(name, distance, confidence), ...]
@@ -508,13 +498,9 @@ def collapse_unknown_speakers_second_pass(
             prof = profiles.get(spk, {})
             pitch = prof.get("pitch_hz", 0.0) or 0.0
             energy = prof.get("energy_rms", 0.0) or 0.0
-            features = {
-                k: v for k, v in prof.items()
-                if k.startswith("mfcc") or k.startswith("spectral")
-            }
 
             best_name, best_dist, second_dist, all_dists = find_best_match(
-                emb.tolist(), pitch, energy, reference_targets, cfg, features
+                emb.tolist(), pitch, energy, reference_targets, cfg
             )
 
             if not best_name or best_dist > accept_thresh:
