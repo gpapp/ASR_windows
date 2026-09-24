@@ -131,10 +131,10 @@ def compute_distance(
         )
     
     if is_known_speaker:
-        bias = cfg.get("known_speaker_margin_bias", 0.0)
+        bias = cfg.get("known_speaker_margin_bias", 0.0) if isinstance(cfg, dict) else 0.0
         if not bias:
             from config import get as cfg_get
-            bias = cfg_get("second_pass", {}).get("known_speaker_margin_bias", 0.0) if cfg_get else 0.0
+            bias = cfg_get("second_pass", "known_speaker_margin_bias", 0.0) if cfg_get else 0.0
         if bias > 0:
             combined = max(0.0, combined - bias)
 

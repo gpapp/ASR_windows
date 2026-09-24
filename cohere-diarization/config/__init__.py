@@ -13,12 +13,18 @@ def get_config() -> dict:
             _config = json.load(f)
     return _config
 
-def get(section: str, key: str = None, default: Any = None) -> Any:
-    """Get config value. Usage: get('diarization', 'max_clusters') or get('debug')"""
+def get(section: str, key: Any = None, default: Any = None) -> Any:
+    """Get config value. Usage: get('diarization', 'max_clusters') or get('debug') or get('second_pass', {})"""
     cfg = get_config()
     if key is None:
         return cfg.get(section, default)
-    return cfg.get(section, {}).get(key, default)
+    if not isinstance(key, str):
+        # key was passed as default value for section (e.g. get("second_pass", {}))
+        return cfg.get(section, key)
+    sec_dict = cfg.get(section, {})
+    if not isinstance(sec_dict, dict):
+        return default
+    return sec_dict.get(key, default)
 
 def is_debug() -> bool:
     return get_config().get("debug", False)

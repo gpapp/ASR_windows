@@ -433,7 +433,7 @@ def collapse_unknown_speakers_second_pass(
     cfg = cfg or {}
     sec_cfg = cfg.get("second_pass", {})
     if not sec_cfg and cfg_get:
-        sec_cfg = cfg_get("second_pass", {})
+        sec_cfg = cfg_get("second_pass") or {}
 
     if sec_cfg and not sec_cfg.get("enabled", True):
         return segments, profiles
