@@ -118,6 +118,87 @@ def eliminate_ghost_speakers(
     return segments
 
 
+def _nearest_midpoint_distance(segments: list, target_mid: float, speaker: str) -> float:
+    """Return the minimum audio midpoint distance from target_mid to any segment of speaker."""
+    best = float("inf")
+    for seg in segments:
+        if seg.get("speaker") == speaker:
+            mid = (seg["start"] + seg["end"]) / 2.0
+            d = abs(mid - target_mid)
+            if d < best:
+                best = d
+    return best
+
+
+def absorb_minority_speakers(
+    segments: list,
+    max_utterance_sec: float = 5.0,
+    min_speaker_dur: float = 8.0,
+    protected_speakers: set = None,
+) -> list:
+    """Reassign utterances of minority speakers to the temporally nearest main speaker.
+
+    A speaker is "main" if they have at least one utterance >= max_utterance_sec
+    OR a total duration >= min_speaker_dur. Everyone else is a minority speaker
+    and their utterances are absorbed.
+
+    OVERLAP segments are never absorbed.
+
+    Args:
+        protected_speakers: Set of speaker names that are NEVER absorbed regardless
+            of duration (e.g. matched known voiceprints). Pass None to skip protection.
+    """
+    if len(segments) < 2:
+        return segments
+
+    protected_speakers = protected_speakers or set()
+
+    speaker_totals: dict[str, float] = {}
+    speaker_longest: dict[str, float] = {}
+    for seg in segments:
+        spk = seg.get("speaker", "UNKNOWN")
+        if spk == "OVERLAP":
+            continue
+        dur = seg["end"] - seg["start"]
+        speaker_totals[spk] = speaker_totals.get(spk, 0.0) + dur
+        speaker_longest[spk] = max(speaker_longest.get(spk, 0.0), dur)
+
+    main = {
+        spk for spk in speaker_totals
+        if spk in protected_speakers
+        or speaker_longest.get(spk, 0.0) >= max_utterance_sec
+        or speaker_totals.get(spk, 0.0) >= min_speaker_dur
+    }
+
+    if not main or len(main) == len(speaker_totals):
+        return segments
+
+    minority = set(speaker_totals) - main
+
+    result = []
+    for seg in segments:
+        spk = seg.get("speaker", "UNKNOWN")
+        if spk == "OVERLAP" or spk not in minority:
+            result.append(seg)
+            continue
+
+        seg_mid = (seg["start"] + seg["end"]) / 2.0
+        best_alt = None
+        best_dist = float("inf")
+        for m_spk in main:
+            d = _nearest_midpoint_distance(segments, seg_mid, m_spk)
+            if d < best_dist:
+                best_dist = d
+                best_alt = m_spk
+
+        if best_alt:
+            seg = dict(seg)
+            seg["speaker"] = best_alt
+        result.append(seg)
+
+    return collapse_same_speaker_segments(result, max_gap=1.0)
+
+
 def merge_profiles(profiles: dict, target: str, source: str):
     """Merge source profile into target profile, deleting source."""
     if source not in profiles:
